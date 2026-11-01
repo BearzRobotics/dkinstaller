@@ -84,8 +84,8 @@ terminals and serial terminals send. The installer only needs lists,
 text fields, a password field, a progress view and message boxes, so that
 layer stays small.
 
-**OPEN:** confirm libvaxis's support for Zig 0.17.0, and pin it or record
-the decision to use our own layer.
+**Decided:** the installer uses its own layer (`src/ui/term.zig`), so there
+is no third-party dependency to pin. libvaxis was not tried on Zig 0.17.0.
 
 **Rendering rules,** whichever is used:
 
@@ -452,7 +452,7 @@ Each milestone is merged only when its acceptance criteria pass.
 
 ## 12. Open questions
 
-1. libvaxis on Zig 0.17.0, or our own terminal layer (4.1).
+1. ~~libvaxis on Zig 0.17.0, or our own terminal layer~~ (4.1): decided, our own.
 2. Writing `live/rootfs.size` in the ISO build (5.2.1).
 3. Where `lfs-dinit` reads the console keymap from (5.6, step 5).
 4. Offer "lock root, use sudo only" (5.4).

@@ -9,10 +9,10 @@ const usage =
     \\usage: dkrescue-install --dry-run --answers FILE [--probe FILE] [--ascii]
     \\
     \\  --dry-run          print the plan instead of running it (required until I2)
-    \\  --answers FILE     take every answer from FILE (INI)
+    \\  --answers FILE     take every answer from FILE (INI) instead of the screens
     \\  --probe FILE       use a recorded probe fixture instead of this machine
     \\  --yes-really-erase DISK   (not yet implemented)
-    \\  --ascii            ASCII box drawing (no effect before the screens exist)
+    \\  --ascii            ASCII box drawing
     \\
 ;
 
@@ -27,6 +27,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer err.flush() catch {};
 
     var dry_run = false;
+    var ascii = false;
     var answers_path: ?[]const u8 = null;
     var probe_path: ?[]const u8 = null;
     var i: usize = 1;
@@ -35,7 +36,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "--ascii")) {
-            // Accepted for forward compatibility.
+            ascii = true;
         } else if (std.mem.eql(u8, arg, "--answers") or std.mem.eql(u8, arg, "--probe")) {
             i += 1;
             if (i >= args.len) {
@@ -55,21 +56,20 @@ pub fn main(init: std.process.Init) !u8 {
         try err.print("dkrescue-install can only --dry-run for now: screens come in I1, execution in I2\n{s}", .{usage});
         return 2;
     }
-    const ans_path = answers_path orelse {
-        try err.print("--answers FILE is required until the screens exist (I1)\n{s}", .{usage});
-        return 2;
-    };
 
-    // Answers
-    const ans_text = Io.Dir.cwd().readFileAlloc(io, ans_path, arena, .limited(1 << 20)) catch |e| {
-        try err.print("can't read {s}: {s}\n", .{ ans_path, @errorName(e) });
-        return 1;
-    };
-    var diag: dk.answers.Diag = .{};
-    const answers = dk.answers.parse(arena, ans_text, &diag) catch {
-        try err.print("{s}:{d}: {s}\n", .{ ans_path, diag.line, diag.message });
-        return 1;
-    };
+    // Answers (from a file; otherwise from the screens, below)
+    var file_answers: ?dk.answers.Answers = null;
+    if (answers_path) |ans_path| {
+        const ans_text = Io.Dir.cwd().readFileAlloc(io, ans_path, arena, .limited(1 << 20)) catch |e| {
+            try err.print("can't read {s}: {s}\n", .{ ans_path, @errorName(e) });
+            return 1;
+        };
+        var diag: dk.answers.Diag = .{};
+        file_answers = dk.answers.parse(arena, ans_text, &diag) catch {
+            try err.print("{s}:{d}: {s}\n", .{ ans_path, diag.line, diag.message });
+            return 1;
+        };
+    }
 
     // Probe
     const probe: dk.probe.Probe = if (probe_path) |pp| blk: {
@@ -90,13 +90,46 @@ pub fn main(init: std.process.Init) !u8 {
     var entropy: [dk.files.ids_entropy]u8 = undefined;
     io.random(&entropy);
     const ids = try dk.files.idsFromBytes(arena, &entropy);
-    const result = try dk.plan.build(arena, probe, answers, ids);
-    const plan = switch (result) {
-        .plan => |p| p,
-        .refused => |why| {
-            try err.print("refused: {s}\n", .{why});
+    const plan: dk.plan.Plan = if (file_answers) |answers| blk: {
+        const result = try dk.plan.build(arena, probe, answers, ids);
+        break :blk switch (result) {
+            .plan => |p| p,
+            .refused => |why| {
+                try err.print("refused: {s}\n", .{why});
+                return 1;
+            },
+        };
+    } else blk: {
+        // The screens.
+        var missing: std.ArrayList([]const u8) = .empty;
+        for (dk.plan.required_programs) |prog| {
+            if (!onPath(io, prog)) try missing.append(arena, prog);
+        }
+        const env: dk.ui.Env = .{
+            .is_root = probe_path != null or std.os.linux.geteuid() == 0,
+            .missing = missing.items,
+            .dry_run = dry_run,
+            .ids = ids,
+        };
+        var terminal: dk.term.Terminal = undefined;
+        terminal.init(io) catch |e| {
+            try err.print("the screens need a terminal: {s}\n", .{@errorName(e)});
             return 1;
-        },
+        };
+        const sz = terminal.size();
+        var ui: dk.ui.Ui = .{
+            .gpa = init.gpa,
+            .arena = arena,
+            .screen = try dk.term.Screen.init(init.gpa, sz.w, sz.h, ascii),
+            .terminal = &terminal,
+        };
+        const outcome = dk.ui.run(&ui, probe, env);
+        terminal.deinit();
+        const done = (outcome catch |e| switch (e) {
+            error.Quit => return 130,
+            else => return e,
+        }) orelse return 130;
+        break :blk done.plan;
     };
 
     // Missing programs are a warning in a dry run (5.1 makes them an error

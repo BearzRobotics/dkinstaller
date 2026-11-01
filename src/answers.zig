@@ -29,6 +29,15 @@ const Allocator = std.mem.Allocator;
 /// How the disk is partitioned (manual `cfdisk` ends up as `existing`).
 pub const Partitioning = enum { auto, existing };
 
+/// A password as given: an answers file holds only hashes; the screens
+/// hold what was typed and pass it to `chpasswd` on standard input.
+pub const Password = union(enum) {
+    /// crypt(3) hash, `openssl passwd -6` format.
+    hash: []const u8,
+    /// Typed at the screens. Never printed or logged.
+    plain: []const u8,
+};
+
 /// Everything the user decides.
 pub const Answers = struct {
     /// Kernel name of the target disk, e.g. "nvme0n1".
@@ -44,10 +53,9 @@ pub const Answers = struct {
     set_esp_type: bool = false,
     set_bios_boot_type: bool = false,
     hostname: []const u8 = "dkrescue",
-    /// Password hashes in `openssl passwd -6` format.
-    root_hash: []const u8,
+    root_pw: Password,
     user: []const u8,
-    user_hash: []const u8,
+    user_pw: Password,
     timezone: []const u8 = "UTC",
     keymap: ?[]const u8 = null,
 };
@@ -114,9 +122,9 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
     var a: Answers = .{
         .disk = "",
         .partitioning = .auto,
-        .root_hash = "",
+        .root_pw = .{ .hash = "" },
         .user = "",
-        .user_hash = "",
+        .user_pw = .{ .hash = "" },
     };
     var have_root_hash = false;
     var have_user = false;
@@ -167,7 +175,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
                 a.hostname = value;
             } else if (std.mem.eql(u8, key, "root_hash")) {
                 if (!validHash(value)) return fail(diag, "root_hash is not a crypt hash (passwords are never plain text)");
-                a.root_hash = value;
+                a.root_pw = .{ .hash = value };
                 have_root_hash = true;
             } else if (std.mem.eql(u8, key, "user")) {
                 if (!validUsername(value)) return fail(diag, "invalid user name");
@@ -175,7 +183,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
                 have_user = true;
             } else if (std.mem.eql(u8, key, "user_hash")) {
                 if (!validHash(value)) return fail(diag, "user_hash is not a crypt hash (passwords are never plain text)");
-                a.user_hash = value;
+                a.user_pw = .{ .hash = value };
                 have_user_hash = true;
             } else if (std.mem.eql(u8, key, "timezone")) {
                 if (!validTimezone(value)) return fail(diag, "invalid timezone");

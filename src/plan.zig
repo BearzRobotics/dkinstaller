@@ -20,6 +20,13 @@ pub const rootfs_sfs = "/run/live/medium/live/rootfs.sfs";
 
 const MiB: u64 = 1024 * 1024;
 
+/// Programs the live disc must have (SPEC.md 6.3), checked before the first
+/// screen. `cfdisk` is only needed for manual partitioning.
+pub const required_programs = [_][]const u8{
+    "lsblk",     "blkid",      "wipefs",   "sfdisk",  "mount",   "umount", "mkfs.ext4",
+    "mkfs.vfat", "unsquashfs", "chpasswd", "useradd", "userdel", "visudo", "dklilo",
+};
+
 /// A command, run directly with no shell.
 pub const Command = struct {
     argv: []const []const u8,
@@ -159,6 +166,20 @@ const Builder = struct {
     }
 };
 
+fn pwText(pw: answers_mod.Password) []const u8 {
+    return switch (pw) {
+        .hash, .plain => |t| t,
+    };
+}
+
+/// Hashes need `chpasswd -e`; typed passwords don't.
+fn chpasswdArgv(pw: answers_mod.Password) []const []const u8 {
+    return switch (pw) {
+        .hash => &.{ "chpasswd", "-R", target, "-e" },
+        .plain => &.{ "chpasswd", "-R", target },
+    };
+}
+
 fn isEspType(t: ?[]const u8) bool {
     const s = t orelse return false;
     return std.ascii.eqlIgnoreCase(s, files.guid_esp) or std.ascii.eqlIgnoreCase(s, "0xef");
@@ -243,9 +264,9 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     try b.cmd("Remove the machine id (first boot makes a new one)", &.{ "rm", "-f", target ++ "/etc/machine-id" });
 
     // 6. Users
-    try b.cmdStdin("Set the root password", &.{ "chpasswd", "-R", target, "-e" }, try b.fmt("root:{s}\n", .{a.root_hash}), true);
+    try b.cmdStdin("Set the root password", chpasswdArgv(a.root_pw), try b.fmt("root:{s}\n", .{pwText(a.root_pw)}), true);
     try b.cmd("Create the user", &.{ "useradd", "-R", target, "-m", "-G", "wheel,video,render", "-s", "/bin/bash", a.user });
-    try b.cmdStdin("Set the user's password", &.{ "chpasswd", "-R", target, "-e" }, try b.fmt("{s}:{s}\n", .{ a.user, a.user_hash }), true);
+    try b.cmdStdin("Set the user's password", chpasswdArgv(a.user_pw), try b.fmt("{s}:{s}\n", .{ a.user, pwText(a.user_pw) }), true);
     try b.cmd("Remove the live disc's user", &.{ "userdel", "-R", target, "-r", "rescue" });
 
     // 7. sudo
@@ -412,9 +433,9 @@ fn testAnswers(disk: []const u8, part: answers_mod.Partitioning) Answers {
     return .{
         .disk = disk,
         .partitioning = part,
-        .root_hash = "$6$r$rootsecret",
+        .root_pw = .{ .hash = "$6$r$rootsecret" },
         .user = "dakota",
-        .user_hash = "$6$u$usersecret",
+        .user_pw = .{ .hash = "$6$u$usersecret" },
     };
 }
 
