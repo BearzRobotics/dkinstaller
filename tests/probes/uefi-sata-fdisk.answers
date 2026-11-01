@@ -1,0 +1,13 @@
+[install]
+disk = sda
+partitioning = existing
+
+[partitions]
+root = sda2
+esp = sda1
+set_esp_type = true
+
+[system]
+root_hash = $6$saltsalt$rootrootrootroot
+user = dakota
+user_hash = $6$saltsalt$useruseruseruser

@@ -1,0 +1,17 @@
+{
+  "firmware": "bios",
+  "efivars_rw": false,
+  "is_live": true,
+  "live_medium_source": "/dev/sr0",
+  "rootfs_size": 3221225472,
+  "kernel": "vmlinuz-6.12.8",
+  "lsblk": {
+    "blockdevices": [
+      {"name": "vda", "path": "/dev/vda", "type": "disk", "size": 21474836480, "model": null, "tran": null, "ro": false, "pttype": "dos", "mountpoints": [null],
+       "children": [
+         {"name": "vda1", "path": "/dev/vda1", "type": "part", "size": 21000000000, "fstype": "ext4", "uuid": "88888888-0000-0000-0000-000000000001", "partuuid": "0a1b2c3d-01", "parttype": "0x83", "mountpoints": [null]}
+       ]},
+      {"name": "sr0", "path": "/dev/sr0", "type": "rom", "size": 4000000000, "model": "DVD", "tran": "sata", "ro": true, "pttype": null, "mountpoints": ["/run/live/medium"]}
+    ]
+  }
+}

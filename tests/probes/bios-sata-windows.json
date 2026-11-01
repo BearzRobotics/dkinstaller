@@ -1,0 +1,18 @@
+{
+  "firmware": "bios",
+  "efivars_rw": false,
+  "is_live": true,
+  "live_medium_source": "/dev/sr0",
+  "rootfs_size": 3221225472,
+  "kernel": "vmlinuz-6.12.8",
+  "lsblk": {
+    "blockdevices": [
+      {"name": "sda", "path": "/dev/sda", "type": "disk", "size": 256060514304, "model": "WDC WD2500", "tran": "sata", "ro": false, "pttype": "dos", "mountpoints": [null],
+       "children": [
+         {"name": "sda1", "path": "/dev/sda1", "type": "part", "size": 104857600, "fstype": "ntfs", "label": "System Reserved", "parttype": "0x7", "mountpoints": [null]},
+         {"name": "sda2", "path": "/dev/sda2", "type": "part", "size": 255000000000, "fstype": "ntfs", "label": "Windows", "parttype": "0x7", "mountpoints": [null]}
+       ]},
+      {"name": "sr0", "path": "/dev/sr0", "type": "rom", "size": 4000000000, "model": "DVD", "tran": "sata", "ro": true, "pttype": null, "fstype": "iso9660", "label": "DKRESCUE", "mountpoints": ["/run/live/medium"]}
+    ]
+  }
+}

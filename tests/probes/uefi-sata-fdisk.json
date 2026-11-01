@@ -1,0 +1,18 @@
+{
+  "firmware": "uefi",
+  "efivars_rw": true,
+  "is_live": true,
+  "live_medium_source": "/dev/sr0",
+  "rootfs_size": 3221225472,
+  "kernel": "vmlinuz-6.12.8",
+  "lsblk": {
+    "blockdevices": [
+      {"name": "sda", "path": "/dev/sda", "type": "disk", "size": 64424509440, "model": "QEMU HARDDISK", "tran": "sata", "ro": false, "pttype": "gpt", "mountpoints": [null],
+       "children": [
+         {"name": "sda1", "path": "/dev/sda1", "type": "part", "size": 536870912, "fstype": "vfat", "label": "EFI", "uuid": "7E11-0A0A", "partuuid": "bbbbbbbb-0000-0000-0000-000000000001", "parttype": "0fc63daf-8483-4772-8e79-3d69d8477de4", "has_bootx64": true, "mountpoints": [null]},
+         {"name": "sda2", "path": "/dev/sda2", "type": "part", "size": 53687091200, "fstype": "ext4", "label": "old", "uuid": "99999999-0000-0000-0000-000000000002", "partuuid": "bbbbbbbb-0000-0000-0000-000000000002", "parttype": "0fc63daf-8483-4772-8e79-3d69d8477de4", "mountpoints": [null]}
+       ]},
+      {"name": "sr0", "path": "/dev/sr0", "type": "rom", "size": 4000000000, "model": "DVD", "tran": "sata", "ro": true, "pttype": null, "fstype": "iso9660", "label": "DKRESCUE", "mountpoints": ["/run/live/medium"]}
+    ]
+  }
+}

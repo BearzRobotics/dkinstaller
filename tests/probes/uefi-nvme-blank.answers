@@ -1,0 +1,11 @@
+[install]
+disk = nvme0n1
+partitioning = auto
+
+[system]
+hostname = dkrescue
+root_hash = $6$saltsalt$rootrootrootroot
+user = dakota
+user_hash = $6$saltsalt$useruseruseruser
+timezone = Europe/Berlin
+keymap = us
