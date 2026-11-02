@@ -315,6 +315,34 @@ pub const Terminal = struct {
         if (self.saved) |s| posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, s) catch {};
     }
 
+    /// Hands the terminal back (normal mode, main screen), for a shell or a
+    /// program that draws itself. `unpause` takes it again.
+    pub fn pause(self: *Terminal) void {
+        self.out.interface.writeAll("\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
+        self.out.interface.flush() catch {};
+        if (self.saved) |s| posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, s) catch {};
+    }
+
+    /// Back to raw mode and the alternate screen after `pause`.
+    pub fn unpause(self: *Terminal) void {
+        var raw = self.saved orelse return;
+        raw.iflag.ICRNL = false;
+        raw.iflag.IXON = false;
+        raw.iflag.INLCR = false;
+        raw.iflag.BRKINT = false;
+        raw.iflag.ISTRIP = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ISIG = false;
+        raw.lflag.IEXTEN = false;
+        raw.cc[@backingInt(linux.V.MIN)] = 1;
+        raw.cc[@backingInt(linux.V.TIME)] = 0;
+        posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, raw) catch {};
+        self.pending_len = 0;
+        self.out.interface.writeAll("\x1b[?1049h\x1b[2J") catch {};
+        self.out.interface.flush() catch {};
+    }
+
     /// The writer to render into.
     pub fn writer(self: *Terminal) *Io.Writer {
         return &self.out.interface;

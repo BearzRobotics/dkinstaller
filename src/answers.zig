@@ -108,6 +108,14 @@ pub fn validTimezone(tz: []const u8) bool {
     return true;
 }
 
+/// A keymap name `loadkeys` can find under /usr/share/keymaps: letters,
+/// digits and `. _ - +`, not starting with `-` (it would read as an option).
+pub fn validKeymap(name: []const u8) bool {
+    if (name.len == 0 or name[0] == '-') return false;
+    for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '_' and c != '-' and c != '+') return false;
+    return true;
+}
+
 fn parseBool(v: []const u8) ?bool {
     if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "1")) return true;
     if (std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no") or std.mem.eql(u8, v, "0")) return false;
@@ -189,6 +197,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
                 if (!validTimezone(value)) return fail(diag, "invalid timezone");
                 a.timezone = value;
             } else if (std.mem.eql(u8, key, "keymap")) {
+                if (!validKeymap(value)) return fail(diag, "invalid keymap name");
                 a.keymap = value;
             } else return fail(diag, "unknown key in [system]");
         } else return fail(diag, "key outside a known section");

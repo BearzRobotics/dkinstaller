@@ -248,7 +248,7 @@ area below a progress list. The steps, in order:
    `mkfs.vfat -F 32 -n ESP`, `mkfs.ext4 -L dkrescue`.
 2. **Mount** root at `/run/dkrescue-install/target`, and the ESP at
    `target/boot/efi`.
-3. **Copy the system:** `unsquashfs -f -d <target> /run/live/medium/live/rootfs.sfs`.
+3. **Copy the system:** `unsquashfs -percentage -f -d <target> /run/live/medium/live/rootfs.sfs`.
    This copies the disc's system, **not** the running overlay, so nothing
    from the live session reaches the installed system: not the live
    `fstab`, not files created while testing. Progress comes from
@@ -261,9 +261,10 @@ area below a progress list. The steps, in order:
    followed by the same `proc`, `sysfs`, `devpts`, `tmpfs`, `devtmpfs` and
    `cgroup2` lines as the base system's `fstab`.
 5. **Identity:** `/etc/hostname`; `/etc/hosts` with the new hostname;
-   `/etc/localtime` linked to the zone; the keymap written where the
-   system's boot scripts load it (**OPEN:** the file `lfs-dinit` reads the
-   console keymap from). `/etc/machine-id` is removed if present; the first
+   `/etc/localtime` linked to the zone; the keymap loaded at boot by a
+   service the installer writes, `/etc/dinit.d/keymap` (`loadkeys -q <map>`),
+   linked from `/etc/dinit.d/boot.d/keymap`, because lfs-dinit
+   (dkrescue-12.3) has none. `/etc/machine-id` is removed if present; the first
    boot creates one.
 6. **Users:** `chpasswd -R <target>` for root; `useradd -R <target> -m -G
    wheel,video,render -s /bin/bash <name>` and `chpasswd -R` for the user;
@@ -286,7 +287,8 @@ area below a progress list. The steps, in order:
      `BOOTX64.EFI` (another system's) is never replaced.
    - **BIOS:** `dklilo install-bios --yes <disk>`.
    - `dklilo check <target>/boot/dklilo.conf` must pass.
-9. **Finish:** `sync`, unmount the ESP and root, and show "Installation
+9. **Finish:** the log is copied to the target's `/var/log/dkrescue-install.log`
+   (6.4), then `sync`, unmount the ESP and root, and show "Installation
    complete" with the choice to reboot or return to the live system.
 
 ### 5.7 When a step fails
@@ -356,7 +358,7 @@ in the log or on screen: they're passed to `chpasswd` on its standard input.
 | `dkrescue-install --dry-run` | Runs the screens, then prints the plan instead of running it |
 | `dkrescue-install --answers FILE` | Takes every answer from `FILE` (INI format) and skips the screens, **except** the summary and its typed confirmation |
 | `dkrescue-install --answers FILE --yes-really-erase DISK` | Fully unattended, for tests. `DISK` must match the disk in `FILE` |
-| `--probe FILE` | Uses a recorded probe fixture (`tests/probes/*.json`) instead of reading the machine. For tests and `--dry-run`; never combined with execution |
+| `--probe FILE` | Uses a recorded probe fixture (`tests/probes/*.json`) instead of reading the machine. For tests and `--dry-run`; refused without `--dry-run` |
 | `--ascii` | ASCII box drawing |
 
 The answers file holds passwords as hashes (`openssl passwd -6` format),
@@ -454,7 +456,7 @@ Each milestone is merged only when its acceptance criteria pass.
 
 1. ~~libvaxis on Zig 0.17.0, or our own terminal layer~~ (4.1): decided, our own.
 2. Writing `live/rootfs.size` in the ISO build (5.2.1).
-3. Where `lfs-dinit` reads the console keymap from (5.6, step 5).
+3. ~~Where `lfs-dinit` reads the console keymap from~~ (5.6, step 5): it doesn't; the installer adds a `keymap` service. Untested on a booted system.
 4. Offer "lock root, use sudo only" (5.4).
 5. Repository: its own repository, or inside the DKRescue build repository.
 6. `dklilo install-bios` has no `--check` option. Add one to dklilo that

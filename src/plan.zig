@@ -15,6 +15,10 @@ const Answers = answers_mod.Answers;
 
 /// Where the target root is mounted while installing.
 pub const target = "/run/dkrescue-install/target";
+/// The install log while installing (SPEC.md 6.4).
+pub const log_path = "/run/dkrescue-install/install.log";
+/// Where the log is copied to on the target before it is unmounted.
+pub const target_log = target ++ "/var/log/dkrescue-install.log";
 /// Where the system image lives on the live medium.
 pub const rootfs_sfs = "/run/live/medium/live/rootfs.sfs";
 
@@ -96,7 +100,8 @@ pub const Plan = struct {
     }
 };
 
-fn writeQuoted(w: *Io.Writer, arg: []const u8) !void {
+/// Writes `arg` shell-quoted, as the dry run and the log show it.
+pub fn writeQuoted(w: *Io.Writer, arg: []const u8) !void {
     var plain = arg.len > 0;
     for (arg) |c| {
         if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "_@%+=:,./-", c) != null)) plain = false;
@@ -247,7 +252,7 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     }
 
     // 3. Copy the system
-    try b.cmd("Copy the system from the disc image", &.{ "unsquashfs", "-f", "-d", target, rootfs_sfs });
+    try b.cmd("Copy the system from the disc image", &.{ "unsquashfs", "-percentage", "-f", "-d", target, rootfs_sfs });
 
     // 4. fstab
     try b.file("Write fstab", target ++ "/etc/fstab", try files.fstab(arena, layout.root_uuid, layout.esp_uuid), 0o644);
@@ -259,8 +264,10 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
         "ln",                                                  "-sf",
         try b.fmt("../usr/share/zoneinfo/{s}", .{a.timezone}), target ++ "/etc/localtime",
     });
-    // OPEN (SPEC.md 5.6.5, 12.3): the console keymap is not written until
-    // the file lfs-dinit reads it from is known.
+    if (a.keymap) |km| {
+        try b.file("Write the console keymap service", target ++ "/etc/dinit.d/keymap", try files.keymapService(arena, km), 0o644);
+        try b.cmd("Start the keymap service at boot", &.{ "ln", "-sf", "../keymap", target ++ "/etc/dinit.d/boot.d/keymap" });
+    }
     try b.cmd("Remove the machine id (first boot makes a new one)", &.{ "rm", "-f", target ++ "/etc/machine-id" });
 
     // 6. Users
@@ -297,6 +304,7 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     try b.cmd("Check dklilo.conf", &.{ "dklilo", "check", target ++ "/boot/dklilo.conf" });
 
     // 9. Finish
+    try b.cmd("Copy the install log to the new system", &.{ "cp", log_path, target_log });
     try b.cmd("Flush to disk", &.{"sync"});
     if (layout.esp_dev != null) try b.cmd("Unmount the EFI System Partition", &.{ "umount", target ++ "/boot/efi" });
     try b.cmd("Unmount the root filesystem", &.{ "umount", target });
@@ -474,6 +482,22 @@ test "auto layout on a blank UEFI NVMe machine" {
         have_dklilo = true;
     };
     try std.testing.expect(have_dklilo);
+}
+
+test "a keymap becomes a dinit service linked into boot.d; none, no service" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try loadFixture(arena, "uefi-nvme-blank.json");
+    var a = testAnswers("nvme0n1", .auto);
+    a.keymap = "de";
+    const with = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    try std.testing.expect(contains(with, "write /run/dkrescue-install/target/etc/dinit.d/keymap"));
+    try std.testing.expect(contains(with, "loadkeys -q de"));
+    try std.testing.expect(contains(with, "ln -sf ../keymap /run/dkrescue-install/target/etc/dinit.d/boot.d/keymap"));
+    a.keymap = null;
+    const without = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    try std.testing.expect(!contains(without, "dinit.d/keymap"));
 }
 
 test "auto layout on BIOS installs the BIOS half" {

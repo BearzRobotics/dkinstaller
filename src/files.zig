@@ -73,6 +73,23 @@ pub fn hosts(arena: Allocator, hostname: []const u8) ![]u8 {
 /// `/etc/sudoers.d/00-wheel`.
 pub const sudoers_wheel = "%wheel ALL=(ALL:ALL) ALL\n";
 
+/// `/etc/dinit.d/keymap`: loads the console keymap at boot. lfs-dinit
+/// (dkrescue-12.3) loads none itself, so the installer adds this service;
+/// `boot.d/keymap` links to it. It is in `boot.d` (waits-for), so a failure
+/// here never stops the boot.
+pub fn keymapService(arena: Allocator, keymap: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena,
+        \\# Loads the console keymap chosen at install time (dkrescue-install).
+        \\
+        \\type = scripted
+        \\command = /usr/bin/loadkeys -q {s}
+        \\restart = false
+        \\
+        \\depends-on: rcboot
+        \\
+    , .{keymap});
+}
+
 /// `/boot/dklilo.conf`, in dklilo's syntax (docs/dklilo.conf.5.md): `image`
 /// starts an entry, `label`, `root` and `append` belong to it. `kernel` is
 /// the file name found under `/boot`.
@@ -144,6 +161,14 @@ test "sfdisk script and partition paths" {
     try std.testing.expect(std.mem.indexOf(u8, s, "size=1MiB, type=21686148-6449-6e6f-744e-656564454649, uuid=b") != null);
     try std.testing.expectEqualStrings("/dev/nvme0n1p3", try partitionPath(a, "nvme0n1", 3));
     try std.testing.expectEqualStrings("/dev/sda3", try partitionPath(a, "sda", 3));
+}
+
+test "keymap service" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const t = try keymapService(arena.allocator(), "de");
+    try std.testing.expect(std.mem.indexOf(u8, t, "command = /usr/bin/loadkeys -q de\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t, "depends-on: rcboot") != null);
 }
 
 test "dklilo.conf" {

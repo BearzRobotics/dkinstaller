@@ -13,6 +13,7 @@ const probe_mod = @import("../probe.zig");
 const answers_mod = @import("../answers.zig");
 const plan_mod = @import("../plan.zig");
 const files = @import("../files.zig");
+const execute = @import("../execute.zig");
 
 const Key = term.Key;
 const Attr = term.Attr;
@@ -376,6 +377,8 @@ pub const Env = struct {
     /// Dry run: missing programs are only a warning.
     dry_run: bool,
     ids: files.Ids,
+    /// `cfdisk` is on this machine (5.3.2); without it the choice is greyed out.
+    cfdisk: bool = false,
 };
 
 /// What the user decided.
@@ -388,6 +391,7 @@ const Scr = enum {
     checks,
     disk,
     partitioning,
+    cfdisk,
     root,
     esp,
     esp_type,
@@ -405,6 +409,8 @@ const Scr = enum {
 const Draft = struct {
     disk: ?Disk = null,
     partitioning: answers_mod.Partitioning = .auto,
+    /// Partition by hand with cfdisk first, then continue as with existing partitions.
+    manual: bool = false,
     root: ?Partition = null,
     esp: ?Partition = null,
     bios_boot: ?Partition = null,
@@ -441,13 +447,18 @@ fn timezoneError(s: []const u8) ?[]const u8 {
     return if (answers_mod.validTimezone(s)) null else "Not a valid zone name, for example Europe/Berlin.";
 }
 
+fn keymapError(s: []const u8) ?[]const u8 {
+    return if (answers_mod.validKeymap(s)) null else "Not a valid keymap name (letters, digits and . _ - +).";
+}
+
 fn nonEmpty(s: []const u8) ?[]const u8 {
     return if (s.len > 0) null else "This can't be empty.";
 }
 
 /// Runs the screens. Returns null if the user backed out of the first
 /// screen; error.Quit on Ctrl-C.
-pub fn run(ui: *Ui, p: Probe, env: Env) !?Done {
+pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
+    var p = p_in;
     var d: Draft = .{};
     var stack: std.ArrayList(Scr) = .empty;
     try stack.append(ui.arena, .checks);
@@ -465,7 +476,10 @@ pub fn run(ui: *Ui, p: Probe, env: Env) !?Done {
                 if (try screenDisk(ui, p, &d)) go = .partitioning;
             },
             .partitioning => {
-                if (try screenPartitioning(ui, p, &d)) go = if (d.partitioning == .auto) .hostname else .root;
+                if (try screenPartitioning(ui, p, env, &d)) go = if (d.manual) .cfdisk else if (d.partitioning == .auto) .hostname else .root;
+            },
+            .cfdisk => {
+                if (try screenCfdisk(ui, &p, &d)) go = .root;
             },
             .root => {
                 if (try screenRoot(ui, &d)) go = .esp;
@@ -508,7 +522,7 @@ pub fn run(ui: *Ui, p: Probe, env: Env) !?Done {
                 }
             },
             .keymap => {
-                if (try input(ui, "Console keymap", "Keymap for the text console, for example us or de.", d.keymap, .{ .validate = nonEmpty })) |v| {
+                if (try input(ui, "Console keymap", "Keymap for the text console, for example us or de.", d.keymap, .{ .validate = keymapError })) |v| {
                     d.keymap = v;
                     go = .summary;
                 }
@@ -618,21 +632,65 @@ fn screenDisk(ui: *Ui, p: Probe, d: *Draft) !bool {
     return true;
 }
 
-fn screenPartitioning(ui: *Ui, p: Probe, d: *Draft) !bool {
+fn screenPartitioning(ui: *Ui, p: Probe, env: Env, d: *Draft) !bool {
     _ = p;
     const disk = d.disk.?;
     const has_table = disk.table != null;
     const items = [_]Item{
         .{ .label = "Erase the disk and partition it automatically", .sub = "GPT: BIOS boot 1 MiB, ESP 512 MiB, root ext4 (the rest). Everything on the disk is lost." },
-        .{ .label = "Partition by hand with cfdisk", .sub = "Not available yet (milestone I4).", .enabled = false },
+        .{
+            .label = "Partition by hand with cfdisk",
+            .sub = if (env.cfdisk) "Runs cfdisk on the disk. This writes to the disk before the summary." else "cfdisk was not found.",
+            .sub_attr = if (env.cfdisk) warn else dim,
+            .enabled = env.cfdisk,
+        },
         .{
             .label = "Use the existing partitions",
             .sub = if (has_table) "For a disk partitioned with fdisk, gdisk, parted or similar. Nothing is created or resized." else "The disk has no partition table.",
             .enabled = has_table,
         },
     };
-    const pick = try menu(ui, ui.fmt("Partitioning /dev/{s}", .{disk.name}), "", &items, if (d.partitioning == .existing and has_table) 2 else 0) orelse return false;
-    d.partitioning = if (pick == 2) .existing else .auto;
+    const pick = try menu(ui, ui.fmt("Partitioning /dev/{s}", .{disk.name}), "", &items, if (d.manual) 1 else if (d.partitioning == .existing and has_table) 2 else 0) orelse return false;
+    d.manual = pick == 1;
+    d.partitioning = if (pick == 0) .auto else .existing;
+    return true;
+}
+
+/// 5.3.2: says that cfdisk writes right away, asks for the disk's name, runs
+/// cfdisk on the real terminal, then probes again so the choices that follow
+/// (5.3.3) see the new partitions.
+fn screenCfdisk(ui: *Ui, p: *Probe, d: *Draft) !bool {
+    const disk = d.disk.?;
+    const prompt = ui.fmt("cfdisk changes /dev/{s} as soon as you choose Write in it; nothing asks again after that. Anything on the disk that you delete or resize is lost. To start cfdisk, type the disk's name ({s}) and press Enter.", .{ disk.name, disk.name });
+    if (try input(ui, "Partition by hand", prompt, "", .{ .expect = disk.name, .mismatch = "That is not the disk's name." }) == null) return false;
+    const t = ui.terminal orelse return error.NeedsTerminal;
+    t.pause();
+    var failed = false;
+    if (std.process.spawn(t.io, .{ .argv = &.{ "cfdisk", disk.path } })) |child| {
+        var c = child;
+        const term_status = c.wait(t.io) catch null;
+        failed = term_status == null or !term_status.?.success();
+    } else |_| failed = true;
+    t.unpause();
+    ui.screen.invalidate();
+
+    const fresh = probe_mod.live(ui.arena, t.io) catch {
+        _ = try message(ui, "Partition by hand", &.{"The disk could not be read again after cfdisk. Quit and start the installer again."}, danger, "Enter or Esc: back");
+        return false;
+    };
+    p.* = fresh;
+    const nd = fresh.findDisk(disk.name) orelse return false;
+    d.disk = nd;
+    d.root = null;
+    d.esp = null;
+    d.bios_boot = null;
+    if (failed) {
+        _ = try message(ui, "Partition by hand", &.{"cfdisk did not exit cleanly. The disk was read again; check the partitions on the next screens."}, warn, "Enter: continue");
+    }
+    if (nd.table == null or nd.partitions.len == 0) {
+        _ = try message(ui, "Partition by hand", &.{"The disk has no partitions. Go back and run cfdisk again, or choose automatic partitioning."}, danger, "Enter or Esc: back");
+        return false;
+    }
     return true;
 }
 
@@ -826,6 +884,186 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
     const typed = try input(ui, "Confirm", prompt, "", .{ .expect = disk.name, .mismatch = "That is not the disk's name." });
     if (typed == null) return null;
     return .{ .answers = a, .plan = plan };
+}
+
+// --------------------------------------------------------------- install
+
+/// What the user chose when the install ended.
+pub const InstallEnd = enum { reboot, live, quit };
+
+const out_cols = 200;
+const out_rows = 40;
+
+/// What the progress screen shows while steps run.
+const Progress = struct {
+    ui: *Ui,
+    steps: []const plan_mod.Step,
+    cur: usize = 0,
+    text: []const u8 = "",
+    /// Percentage from a progress-only output line (unsquashfs), if any.
+    pct: ?u8 = null,
+    lines: [out_rows][out_cols]u8 = undefined,
+    lens: [out_rows]usize = @splat(0),
+    count: usize = 0,
+
+    fn onStart(ctx: ?*anyopaque, index: usize, _: plan_mod.Step, text: []const u8) void {
+        const self: *Progress = @ptrCast(@alignCast(ctx.?));
+        self.cur = index;
+        self.text = text;
+        self.pct = null;
+        self.draw();
+    }
+
+    fn onLine(ctx: ?*anyopaque, line: []const u8) void {
+        const self: *Progress = @ptrCast(@alignCast(ctx.?));
+        if (execute.isPercent(line)) {
+            self.pct = std.fmt.parseInt(u8, std.mem.trim(u8, line, " \t"), 10) catch null;
+        } else {
+            const slot = self.count % out_rows;
+            const n = @min(line.len, out_cols);
+            @memcpy(self.lines[slot][0..n], line[0..n]);
+            self.lens[slot] = n;
+            self.count += 1;
+        }
+        self.draw();
+    }
+
+    fn draw(self: *Progress) void {
+        const ui = self.ui;
+        const r = ui.frame("Installing", "Please wait. Nothing here can be interrupted safely.");
+        const s = &ui.screen;
+        const total = self.steps.len;
+        const done_frac = self.cur * 100 / @max(total, 1);
+        // The window of steps: two before, the current one, two after.
+        var y = r.y;
+        const first = self.cur -| 2;
+        const last = @min(total, self.cur + 3);
+        for (self.steps[first..last], first..) |st, i| {
+            const mark: []const u8 = if (i < self.cur) "[ok]" else if (i == self.cur) "[..]" else "[  ]";
+            const attr: Attr = if (i < self.cur) good else if (i == self.cur) bold else dim;
+            _ = s.text(r.x, y, mark, attr, 4);
+            _ = s.text(r.x + 5, y, st.desc, attr, @intCast(r.w - 5));
+            y += 1;
+        }
+        y += 1;
+        // Bar: the step count, and within a step the percentage if there is one.
+        const bar_w: i32 = @min(r.w - 12, 60);
+        const sub: usize = if (self.pct) |pc| pc else 0;
+        const frac = (done_frac * 10 + sub * 10 / @max(total, 1)) / 10;
+        const filled: i32 = @intCast(@as(usize, @intCast(bar_w)) * @min(frac, 100) / 100);
+        _ = s.text(r.x, y, "[", normal, 1);
+        for (0..@as(usize, @intCast(bar_w))) |i| {
+            s.put(r.x + 1 + @as(i32, @intCast(i)), y, if (@as(i32, @intCast(i)) < filled) '#' else '-', normal);
+        }
+        _ = s.text(r.x + 1 + bar_w, y, "]", normal, 1);
+        _ = s.text(r.x + 3 + bar_w, y, ui.fmt("{d}/{d}", .{ self.cur + 1, total }), normal, 8);
+        y += 2;
+        _ = s.text(r.x, y, ui.fmt("$ {s}", .{self.text}), dim, @intCast(r.w));
+        y += 1;
+        // The newest output lines that fit.
+        const room: usize = @intCast(@max(0, r.y + r.h - y));
+        const shown = @min(@min(room, self.count), out_rows);
+        var k: usize = 0;
+        while (k < shown) : (k += 1) {
+            const slot = (self.count - shown + k) % out_rows;
+            _ = s.text(r.x, y + @as(i32, @intCast(k)), self.lines[slot][0..self.lens[slot]], normal, @intCast(r.w));
+        }
+        ui.present() catch {};
+    }
+};
+
+/// Runs `plan` with the progress screen, then the failure (SPEC.md 5.7) or
+/// completion screen. Needs the real terminal.
+pub fn install(ui: *Ui, io: Io, plan: plan_mod.Plan, info: []const u8) !InstallEnd {
+    const t = ui.terminal.?;
+    const progress = try ui.gpa.create(Progress);
+    defer ui.gpa.destroy(progress);
+    progress.* = .{ .ui = ui, .steps = plan.steps };
+    var runner = try execute.Runner.init(ui.gpa, io, execute.log_path, .{
+        .ctx = progress,
+        .on_start = Progress.onStart,
+        .on_line = Progress.onLine,
+    });
+    defer runner.deinit();
+    runner.header(info);
+
+    const outcome = try runner.run(plan.steps);
+    switch (outcome) {
+        .ok => {
+            while (true) {
+                const r = ui.frame("Installation complete", "R: reboot   L: return to the live system");
+                _ = ui.screen.text(r.x, r.y, "DKRescue is installed.", good, @intCast(r.w));
+                _ = ui.screen.text(r.x, r.y + 2, ui.fmt("The log is at {s} on the new system.", .{plan_mod.target_log["/run/dkrescue-install/target".len..]}), normal, @intCast(r.w));
+                _ = ui.screen.text(r.x, r.y + 3, "Remove the installation medium before the computer restarts.", normal, @intCast(r.w));
+                switch (try ui.key()) {
+                    .char => |c| switch (c) {
+                        'r', 'R' => return .reboot,
+                        'l', 'L' => return .live,
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+        },
+        .failed => |f| {
+            while (true) {
+                const r = ui.frame("The installation stopped", "S: open a shell   Q: quit (unmounts the target)");
+                var y = r.y;
+                _ = ui.screen.text(r.x, y, ui.fmt("Step {d}: {s}", .{ f.index + 1, f.desc }), danger, @intCast(r.w));
+                y += 1;
+                _ = ui.screen.text(r.x, y, ui.fmt("$ {s}", .{f.text}), dim, @intCast(r.w));
+                y += 1;
+                _ = ui.screen.text(r.x, y, f.reason, danger, @intCast(r.w));
+                y += 2;
+                for (f.tail) |l| {
+                    if (y >= r.y + r.h - 3) break;
+                    _ = ui.screen.text(r.x, y, l, normal, @intCast(r.w));
+                    y += 1;
+                }
+                y = r.y + r.h - 2;
+                _ = ui.screen.text(r.x, y, ui.fmt("Log: {s}", .{execute.log_path}), normal, @intCast(r.w));
+                _ = ui.screen.text(r.x, y + 1, ui.fmt("Target mounted at {s}. Quit keeps a log copy in its /var/log.", .{plan_mod.target}), normal, @intCast(r.w));
+                switch (try ui.key()) {
+                    .char => |c| switch (c) {
+                        's', 'S' => {
+                            t.pause();
+                            std.debug.print("\nThe target is mounted at {s}. Type exit to return.\n", .{plan_mod.target});
+                            if (std.process.spawn(io, .{ .argv = &.{"/bin/sh"} })) |child| {
+                                var ch = child;
+                                _ = ch.wait(io) catch {};
+                            } else |_| {}
+                            t.unpause();
+                            ui.screen.invalidate();
+                        },
+                        'q', 'Q' => {
+                            runner.cleanup();
+                            return .quit;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+        },
+    }
+}
+
+/// For `--answers` without `--yes-really-erase`: the plan, then the typed
+/// confirmation (SPEC.md 7). Returns false if the user backed out.
+pub fn confirmPlan(ui: *Ui, disk: Disk, plan: plan_mod.Plan) !bool {
+    var lines: std.ArrayList(Line) = .empty;
+    try lines.append(ui.arena, .{ .text = ui.fmt("Disk: /dev/{s}  {s}  {s}", .{ disk.name, fmtSize(ui.arena, disk.size), disk.model orelse "" }), .attr = bold });
+    if (describeContents(ui.arena, disk)) |c| {
+        try lines.append(ui.arena, .{ .text = ui.fmt("Found on it (will be lost): {s}", .{c}), .attr = danger });
+    } else try lines.append(ui.arena, .{ .text = "(nothing found on it)", .attr = dim });
+    try lines.append(ui.arena, .{ .text = "" });
+    var w: Io.Writer.Allocating = .init(ui.arena);
+    try plan.writeDryRun(&w.writer);
+    var it = std.mem.splitScalar(u8, w.written(), '\n');
+    while (it.next()) |l| try lines.append(ui.arena, .{ .text = l, .attr = if (std.mem.startsWith(u8, l, "# ")) bold else normal });
+    if (!try viewer(ui, "Summary", lines.items, "Up/Down, PgUp/PgDn: scroll   Enter: continue   Esc: quit")) return false;
+    const prompt = ui.fmt("This will erase data on /dev/{s}. To go on, type the disk's name ({s}) and press Enter.", .{ disk.name, disk.name });
+    return (try input(ui, "Confirm", prompt, "", .{ .expect = disk.name, .mismatch = "That is not the disk's name." })) != null;
 }
 
 // ----------------------------------------------------------------- tests
