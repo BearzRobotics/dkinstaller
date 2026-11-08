@@ -167,12 +167,30 @@ strings <binary> | grep …                      # which options a program has
 
 Working files are in `~/dkrescue/iso-inspect/` and can be deleted.
 
-## 7. Not checked yet
+## 7. Found by the QEMU run (2026-11-08)
 
-- That the installer works end to end. No installation has been run: the
-  tests need the login in item 4.
-- That a system installed this way boots with SeaBIOS and with OVMF, and
-  that the `keymap` service works at boot.
+A test ISO (stock `dkrescue.iso` plus `dkrescue-install`, a fixed `dklilo`
+and `live/rootfs.size`) installed and booted with SeaBIOS and with OVMF;
+the guard disk was untouched. What the ISO build still has to do:
+
+- **Fix `/run/live` being hidden.** After boot, `/proc/self/mountinfo` lists
+  the disc at `/run/live/medium`, but a second tmpfs is mounted on `/run`
+  (`mode=775`) over the one the initrd moved in, so `/run/live` does not
+  exist for processes. The installer then refuses: "not running from the
+  live disc". The test works around it by mounting `/dev/sr0` at
+  `/run/live/medium`.
+- **Put `dkrescue-install` in the image** (`/usr/sbin`), and write
+  `live/rootfs.size` (section 1). The test used 4294967296.
+- **Take `dklilo` from commit `380a5b3` or later** (github.com/BearzRobotics/dklilo).
+  The image's `dklilo` fails `install-bios` on the installer's GPT layout
+  (BIOS boot partition at 1 MiB) and `check`/`config` cannot find the device
+  from `/proc/self/mountinfo`.
+- **Build the installer with `-Dcpu=baseline`.** A native build died with
+  "Illegal instruction" on QEMU's default CPU.
+
+## 8. Not checked yet
+
+- That the `keymap` service works at boot, and the `inject` failure test.
 - `CONFIG_VMD` and other drivers real hardware may need (5, I5).
 - Whether `dklilo isohybrid`/`mkiso-images` output changes anything for the
   installer (the ISO is GPT-hybrid with an EFI image, as expected).

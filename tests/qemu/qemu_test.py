@@ -80,10 +80,19 @@ def make_disks(work, with_seed):
     return target, guard, work / "seed.img"
 
 
+def kvm_usable():
+    """/dev/kvm can exist yet fail to open (WSL without nested virtualization)."""
+    try:
+        os.close(os.open("/dev/kvm", os.O_RDWR))
+        return True
+    except OSError:
+        return False
+
+
 def qemu_argv(firmware, work, drives, iso=None):
     argv = ["qemu-system-x86_64", "-m", "2048", "-smp", "2", "-nographic",
             "-serial", "mon:stdio", "-no-reboot"]
-    argv += ["-accel", "kvm"] if os.access("/dev/kvm", os.W_OK) else ["-accel", "tcg"]
+    argv += ["-accel", "kvm" if kvm_usable() else "tcg"]
     if firmware == "uefi":
         vars_copy = pathlib.Path(work) / "OVMF_VARS.fd"
         if not vars_copy.exists():
@@ -112,8 +121,11 @@ def login(child):
     if pw:
         child.expect("assword: ")
         child.sendline(pw)
-    child.expect(r"[#$] ")
-    child.sendline("PS1='READY> '; stty -echo")
+    # The live prompt is coloured and ends "#" + escape code, no trailing space.
+    child.expect(r"[#$]")
+    time.sleep(1)
+    # Split the string so the echoed command does not itself match READY> .
+    child.sendline("PS1='READ'\"Y> \"; stty -echo")
     child.expect("READY> ")
 
 
@@ -130,6 +142,10 @@ def boot_live(args, work, extra_env=""):
     child = spawn(argv, pathlib.Path(work) / "serial.log")
     login(child)
     run(child, "mkdir -p /mnt/seed && mount -o ro /dev/vdc /mnt/seed")
+    # Test ISOs may carry the binary at their root instead of in the squashfs.
+    # WORKAROUND: on the current dkrescue ISO /run/live is hidden after boot
+    # (docs/ISO-REQUIREMENTS.md), so mount the disc where the installer looks.
+    run(child, "mkdir -p /run/live/medium && mount -o ro /dev/sr0 /run/live/medium && cp /run/live/medium/dkrescue-install /usr/sbin/; [ -x /run/live/medium/dklilo ] && cp /run/live/medium/dklilo /usr/sbin/dklilo; true")
     return child, guard, before
 
 
