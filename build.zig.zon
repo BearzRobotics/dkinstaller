@@ -1,6 +1,6 @@
 .{
     .name = .dkrescue_install,
-    .version = "0.0.1",
+    .version = "0.0.2",
     .fingerprint = 0x270add8a4470dc74,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
@@ -9,5 +9,6 @@
         "build.zig.zon",
         "src",
         "SPEC.md",
+        "LICENSE",
     },
 }
