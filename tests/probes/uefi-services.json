@@ -155,16 +155,23 @@
    "in_usr": false
   },
   {
-   "name": "cupsd",
-   "label": "Printing",
+   "name": "bluetoothd",
+   "label": "Bluetooth",
    "enabled": false,
-   "in_usr": true
+   "in_usr": true,
+   "missing_dep": "avahi-daemon"
   },
   {
    "name": "tty1",
    "label": "console",
    "enabled": true,
    "in_usr": false
+  },
+  {
+   "name": "cupsd",
+   "label": "Printing",
+   "enabled": false,
+   "in_usr": true
   }
  ]
 }

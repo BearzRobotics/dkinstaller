@@ -245,7 +245,10 @@ Each step's command is shown as it runs, with its output in a scrolling
 area below a progress list. The steps, in order:
 
 1. **Partition and format** (automatic layout): `wipefs -a`, `sfdisk`,
-   `mkfs.vfat -F 32 -n ESP`, `mkfs.ext4 -L dkrescue`.
+   `udevadm settle` (when udevadm exists: udev removes and re-adds the
+   partition nodes after `sfdisk`, and `mkfs` right after could find
+   `/dev/vda2` missing, as seen in QEMU), `mkfs.vfat -F 32 -n ESP`,
+   `mkfs.ext4 -L dkrescue`.
 2. **Mount** root at `/run/dkrescue-install/target`, and the ESP at
    `target/boot/efi`.
 3. **Copy the system:** `unsquashfs -percentage -f -d <target> /run/live/medium/live/rootfs.sfs`.
@@ -268,12 +271,15 @@ area below a progress list. The steps, in order:
    boot creates one.
 6. **Users:** `chpasswd -R <target>` for root; `useradd -R <target> -m -G
    wheel,video,render -s /bin/bash <name>` and `chpasswd -R` for the user;
-   `userdel -R <target> -r rescue` removes the live disc's user.
+   `userdel -R <target> -r <live user>` removes the live disc's user (read
+   from the live `/etc/passwd`: the first login with uid 1000-59999 and a
+   `/home/` directory; `rescue` on the rescue image, `live` on dkde).
 7. **sudo:** `/etc/sudoers.d/00-wheel` is replaced with
    `%wheel ALL=(ALL:ALL) ALL`. The live disc's password-free policy says in
    its own comment that it must not reach an installed system; this is
    where that's enforced. `visudo -c -f` checks the new file before it's
    kept.
+7a. **Configuration** (5.8-5.10): extra packages, services, SSH, network.
 8. **Bootloader:**
    - `/boot/dklilo.conf` is written with `root=PARTUUID=<root>` (works
      without an initramfs, since ext4, NVMe, AHCI and VMD are built into the
@@ -288,7 +294,7 @@ area below a progress list. The steps, in order:
    - **BIOS:** `dklilo install-bios --yes <disk>`.
    - `dklilo check <target>/boot/dklilo.conf` must pass.
 9. **Finish:** the log is copied to the target's `/var/log/dkrescue-install.log`
-   (6.4), then `sync`, unmount the ESP and root, and show "Installation
+   (6.4), SELinux mode and labelling (5.8), then `sync`, unmount the ESP and root, and show "Installation
    complete" with the choice to reboot or return to the live system.
 
 ### 5.7 When a step fails
@@ -316,7 +322,10 @@ its `/etc/dinit.d`, `/usr/lib/dinit.d` and `boot.d` are read).
 - **Services.** Every dinit service of the image with the first comment line
   (or `description =`) of its file as the label, ticked when linked in
   `/etc/dinit.d/boot.d`. Servers that listen on the network are marked.
-  Services needed to boot are shown but not switchable. Enabling does what
+  Services needed to boot are shown but not switchable. A service whose
+  `depends-on`/`depends-ms`/`waits-for` names a service the image lacks
+  (the dkde image's `cupsd` needs `avahi-daemon`) can't be enabled: dinit
+  stops the boot with "could not load dependency" (seen in QEMU). Enabling does what
   dkbuild's image step does: `ln -sfn ../NAME boot.d/NAME` (service in
   `/etc/dinit.d`) or `ln -sfn /usr/lib/dinit.d/NAME boot.d/NAME`; disabling
   removes the link. Only differences from the image become steps.
@@ -501,6 +510,13 @@ sections: `[network]`, `[services]`, `[ssh]`, `[packages]`; optional
 - **QEMU, interactive**, once per milestone: the screens at 80×24 on the
   kernel console, over `-serial`, and with `--ascii`.
 - **Real hardware**, before a release: one UEFI and one BIOS machine.
+
+`tests/qemu/config_test.py` installs the dkde ISO in QEMU with an answers file
+covering services, SSH, network, NTP, firewall, SELinux mode, timezone and
+domain, checks the new system from the live session, runs `--chroot-run`,
+then boots the installed disk (on AHCI: the kernel has no initrd and no
+virtio-blk) and checks sshd's effective config and the running services.
+SELinux labelling, a working repository disc and WiFi are not covered.
 
 ## 9. Code conventions and documentation
 

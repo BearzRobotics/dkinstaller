@@ -1239,12 +1239,12 @@ fn serviceItems(ui: *Ui, p: Probe, d: *Draft) ![]const Item {
     const mode: ?answers_mod.NetMode = if (d.network) |n| n.mode else null;
     for (p.services, 0..) |sv, i| {
         const net_svc = netService(sv.name);
-        const note: []const u8 = if (net_svc and mode == .@"manual-shell") "   (set by hand)" else if (net_svc and mode == .manual) "   (off: manual network)" else if (sv.network) "   (network server)" else if (sv.core) "   (needed)" else "";
+        const note: []const u8 = if (net_svc and mode == .@"manual-shell") "   (set by hand)" else if (net_svc and mode == .manual) "   (off: manual network)" else if (sv.network) "   (network server)" else if (sv.missing_dep != null) "   (missing dependency)" else if (sv.core) "   (needed)" else "";
         const shown = if (net_svc and mode == .manual) false else d.svc_on[i];
         try items.append(ui.arena, .{
             .label = ui.fmt("[{c}] {s}{s}", .{ @as(u8, if (shown) 'x' else ' '), sv.name, note }),
             .detail = sv.label,
-            .enabled = !sv.core and !(net_svc and (mode == .manual or mode == .@"manual-shell")),
+            .enabled = !sv.core and (sv.enabled or sv.missing_dep == null) and !(net_svc and (mode == .manual or mode == .@"manual-shell")),
         });
     }
     try items.append(ui.arena, .{ .label = "Done", .detail = "keep these choices" });
@@ -2029,4 +2029,43 @@ test "not root is fatal on the checks screen" {
     const t = try ui.screen.toText(gpa);
     defer gpa.free(t);
     try std.testing.expect(std.mem.indexOf(u8, t, "can't continue") != null);
+}
+
+fn downs(comptime n: usize) [n]Key {
+    return @splat(.down);
+}
+
+test "full flow with services, ssh and network screens: manual network, key paste, confirm" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try loadFixture(arena, "uefi-services.json");
+    // checks, disk, auto, hostname, domain "lab.test", root pw x2, user, user pw x2, timezone, keymap,
+    // network: Manual (nothing) = 3rd item (Guided, Copy, Manual), then the services list: Done is
+    // after the 11 services; ssh: Set up SSH, enable yes, root no, password yes, no key;
+    // other: ntp, firewall, selinux as the image has them; summary; confirm.
+    const keys = [_]Key{ .enter, .enter, .enter, .enter } ++ testKeys("lab.test") ++ [_]Key{.enter} ++
+        testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
+        testKeys("dakota") ++ [_]Key{.enter} ++
+        testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++
+        [_]Key{ .enter, .enter } ++
+        downs(2) ++ [_]Key{.enter} ++
+        downs(11) ++ [_]Key{.enter} ++
+        [_]Key{ .down, .enter, .enter, .enter, .enter, .enter } ++
+        [_]Key{ .enter, .enter, .enter } ++
+        [_]Key{.enter} ++
+        testKeys("nvme0n1") ++ [_]Key{.enter};
+    var ui = try testUi(gpa, arena, &keys);
+    defer ui.screen.deinit(gpa);
+    const done = (try run(&ui, p, .{ .is_root = true, .dry_run = true, .ids = test_ids })).?;
+    try std.testing.expectEqualStrings("lab.test", done.answers.domain.?);
+    try std.testing.expectEqual(answers_mod.NetMode.manual, done.answers.network.?.mode);
+    try std.testing.expect(done.answers.ssh != null);
+    try std.testing.expectEqual(answers_mod.RootLogin.no, done.answers.ssh.?.root_login);
+    try std.testing.expectEqual(@as(usize, 0), done.answers.services_enable.len);
+    var w: Io.Writer.Allocating = .init(arena);
+    try done.plan.writeDryRun(&w.writer);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "left unconfigured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "PermitRootLogin no") != null);
 }

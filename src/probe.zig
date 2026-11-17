@@ -227,6 +227,10 @@ pub const Service = struct {
     network: bool = false,
     /// Needed to boot or log in: not offered for switching off.
     core: bool = false,
+    /// A service this one depends on (depends-on, depends-ms, waits-for) is not
+    /// in the image: enabling it would stop dinit at boot ("could not load
+    /// dependency"). Null when all are there.
+    missing_dep: ?[]const u8 = null,
 
     /// Where `boot.d/<name>` points when enabled (dkbuild's image step).
     pub fn linkTarget(self: Service, arena: Allocator) ![]const u8 {
@@ -289,6 +293,24 @@ pub fn firstOrdinaryUser(text: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The first `depends-on`/`depends-ms`/`waits-for` name in `text` that is not
+/// among `services`; null if all are there.
+pub fn missingDependency(text: []const u8, services: []const Service) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        for ([_][]const u8{ "depends-on", "depends-ms", "waits-for" }) |key| {
+            if (!std.mem.startsWith(u8, l, key)) continue;
+            var rest = std.mem.trim(u8, l[key.len..], " \t");
+            if (rest.len == 0 or (rest[0] != ':' and rest[0] != '=')) continue;
+            rest = std.mem.trim(u8, rest[1..], " \t");
+            if (rest.len == 0) continue;
+            if (findService(services, rest) == null) return rest;
+        }
+    }
+    return null;
+}
+
 /// Reads /etc/dinit.d and /usr/lib/dinit.d (files only) and boot.d.
 pub fn readServices(arena: Allocator, io: Io) Allocator.Error![]const Service {
     var out: std.ArrayList(Service) = .empty;
@@ -324,6 +346,10 @@ pub fn readServices(arena: Allocator, io: Io) Allocator.Error![]const Service {
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lt);
+    for (out.items) |*sv| {
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ if (sv.in_usr) "/usr/lib/dinit.d" else "/etc/dinit.d", sv.name });
+        if (readSmall(arena, io, path)) |t| sv.missing_dep = missingDependency(t, out.items);
+    }
     return out.items;
 }
 
@@ -742,6 +768,7 @@ fn fixtureServices(arena: Allocator, v: ?json.Value) ![]const Service {
             .in_usr = flag(o.get("in_usr")),
             .network = inList(&network_services, name),
             .core = inList(&core_services, name) or std.mem.startsWith(u8, name, "tty"),
+            .missing_dep = str(o.get("missing_dep")),
         });
     }
     return out.items;
@@ -856,4 +883,10 @@ test "parseLsblk reads nested partitions" {
 test "the live user is the first ordinary login" {
     try std.testing.expectEqualStrings("live", firstOrdinaryUser("root:x:0:0::/root:/bin/sh\ngreetd:x:995:995::/var/lib/greetd:/bin/nologin\nlive:x:1000:1000::/home/live:/bin/bash\n").?);
     try std.testing.expect(firstOrdinaryUser("root:x:0:0::/root:/bin/sh\nnobody:x:65534:65534::/:/bin/false\n") == null);
+}
+
+test "a service whose dependency is not in the image is detected" {
+    const svcs = [_]Service{ .{ .name = "dbus" }, .{ .name = "cupsd" } };
+    try std.testing.expectEqualStrings("avahi-daemon", missingDependency("type = process\ndepends-on: dbus\ndepends-on: avahi-daemon\n", &svcs).?);
+    try std.testing.expect(missingDependency("depends-on = dbus\nwaits-for: cupsd\nafter: nothing\n", &svcs) == null);
 }

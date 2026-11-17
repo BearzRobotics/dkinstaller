@@ -37,7 +37,7 @@ firewall = false
 selinux = enforcing
 
 [services]
-enable = cupsd
+enable = bluetoothd
 disable = greetd
 
 [ssh]
@@ -116,10 +116,11 @@ def main():
     run("mkdir -p /mnt/seed && mount -o ro /dev/vdc /mnt/seed && cp /mnt/seed/dkrescue-install /usr/sbin/dkrescue-install && chmod +x /usr/sbin/dkrescue-install")
     run("IF=$(ls /sys/class/net | grep -v '^lo$' | head -1); sed \"s/@IFACE@/$IF/\" /mnt/seed/answers.ini > /tmp/answers.ini; echo IFACE=$IF")
     out = run("grep -c . /tmp/answers.ini")
-    child.sendline("dkrescue-install --answers /tmp/answers.ini --yes-really-erase vda --repo /mnt/seed/repo > /tmp/install.out 2>&1; echo EXIT=$?")
+    child.sendline("dkrescue-install --answers /tmp/answers.ini --yes-really-erase vda --repo /mnt/seed/repo 2>&1 | tee /tmp/install.out; echo EXIT=${PIPESTATUS[0]}")
     child.expect(r"EXIT=(\d+)", timeout=q.INSTALL_TIMEOUT)
     code = child.match.group(1)
-    run("tail -n 12 /tmp/install.out")
+    child.expect("READY> ")  # the prompt after the install, so run() stays in step
+    run("true")
     install_out = run("cat /tmp/install.out", 60)
     check("install exits 0 (apk failure is only a warning)", code == "0", f"exit {code}: {install_out[-600:]}")
     check("the failed apk step is reported as a warning", "warning: Install 1 extra package" in install_out, install_out[-400:])
@@ -135,8 +136,8 @@ def main():
     check("hostname and hosts with the domain", "qemutest" in file("/etc/hostname") and "qemutest.lab.test qemutest" in file("/etc/hosts"))
     check("timezone link", "zoneinfo/Europe/Berlin" in run("readlink /mnt/t/etc/localtime"))
     boot = run("ls /mnt/t/etc/dinit.d/boot.d")
-    check("cupsd enabled, greetd disabled, firewalld disabled, chronyd enabled, sshd enabled",
-          "cupsd" in boot and "greetd" not in boot and "firewalld" not in boot and "chronyd" in boot and "sshd" in boot, boot)
+    check("bluetoothd enabled, greetd disabled, firewalld disabled, chronyd enabled, sshd enabled",
+          "bluetoothd" in boot and "greetd" not in boot and "firewalld" not in boot and "chronyd" in boot and "sshd" in boot, boot)
     check("network services left as the image has them (guided)", "networkmanager" in boot, boot)
     dropin = file("/etc/ssh/sshd_config.d/10-dkinstall.conf")
     check("sshd drop-in", "PermitRootLogin no" in dropin and "PasswordAuthentication no" in dropin, dropin)
@@ -160,12 +161,21 @@ def main():
     mounts = run("grep -c 'dkrescue-install/target/\\(proc\\|sys\\|dev\\|run\\)' /proc/mounts; true")
     check("bind mounts cleaned up afterwards", mounts.strip().splitlines()[-1].strip() == "0", mounts)
     check("the shell's change persisted in the target", "from-shell" in run("cat /run/dkrescue-install/target/etc/shell-ran"))
+    # Test setup only: the installed system has no serial getty enabled (the live
+    # image gets its serial login from the live init), the kernel command line has no
+    # console=ttyS0, and QEMU -nographic has no other console. Not something the installer does.
+    run("ln -sfn ../ttyS0 /run/dkrescue-install/target/etc/dinit.d/boot.d/ttyS0")
+    run("sed -i 's/\"ro quiet\"/\"ro console=tty0 console=ttyS0,115200\"/' /run/dkrescue-install/target/boot/dklilo.conf")
     run("umount /run/dkrescue-install/target")
     child.sendline("poweroff")
     child.expect(pexpect.EOF, timeout=120)
 
     # Boot the installed disk and look from inside.
-    argv = q.qemu_argv(args.firmware, work, [target])
+    # The installed kernel has no initrd: it needs the disk on a controller it has built in
+    # (AHCI/NVMe, per SPEC.md 5.6), not virtio-blk.
+    argv = q.qemu_argv(args.firmware, work, [])
+    argv += ["-drive", f"file={target},format=raw,if=none,id=sys", "-device", "ich9-ahci,id=ahci",
+             "-device", "ide-hd,drive=sys,bus=ahci.0,bootindex=1"]
     argv += ["-nic", "user,model=virtio-net-pci"]
     child = q.spawn(argv, work / "boot.log")
     try:
@@ -178,12 +188,15 @@ def main():
         child.sendline("PS1='READ'\"Y> \"; stty -echo")
         child.expect("READY> ")
         check("installed system boots to a login", True)
-        eff = run("sshd -T -f /etc/ssh/sshd_config 2>&1 | grep -E '^(permitrootlogin|passwordauthentication)'")
+        eff = run("/usr/sbin/sshd -T -f /etc/ssh/sshd_config 2>&1 | grep --color=never -iE '^(permitrootlogin|passwordauthentication)'").lower()
         check("sshd reads the drop-in (effective config)", "permitrootlogin no" in eff and "passwordauthentication no" in eff, eff)
+        run("test -r /etc/hostname")
         check("shell-test file persisted", "from-shell" in run("cat /etc/shell-ran"))
-        svc = run("dinitctl list 2>&1 | grep -E 'sshd|chronyd|cupsd|firewalld|greetd'; true")
+        svc = run("dinitctl list 2>&1 | grep --color=never -E 'sshd|chronyd|bluetoothd|firewalld|greetd'; true")
         print("     services in the booted system:\n" + "\n".join("       " + l for l in svc.strip().splitlines()))
-        check("sshd started in the installed system", "sshd" in svc and "STARTED" in svc.split("sshd")[1][:40] if "sshd" in svc else False, svc)
+        # dinitctl list shows {+} for a started service, {X}/blank for stopped ones.
+        check("sshd started in the installed system", any("{+}" in l and "sshd" in l and "keys" not in l for l in svc.splitlines()), svc)
+        check("firewalld and greetd are not started (disabled), as chosen", not any("{+}" in l and ("firewalld" in l or "greetd" in l) for l in svc.splitlines()), svc)
         check("hostname in the booted system", "qemutest" in run("hostname"))
         child.sendline("poweroff")
     except (pexpect.TIMEOUT, pexpect.EOF) as e:

@@ -491,6 +491,7 @@ fn planConfig(b: *Builder, p: Probe, a: Answers) BuildError!void {
         const svc = probe_mod.findService(p.services, c.name) orelse return b.refuse("no such service in the image: {s}", .{c.name});
         if (!c.on and svc.core) return b.refuse("{s} is needed to boot and can't be switched off", .{c.name});
         if (c.on == svc.enabled) continue;
+        if (c.on) if (svc.missing_dep) |dep| return b.refuse("{s} can't be enabled: it needs {s}, which the image does not have (dinit would stop at boot)", .{ c.name, dep });
         const link = try b.fmt("{s}/etc/dinit.d/boot.d/{s}", .{ target, c.name });
         if (c.on) {
             if (!boot_d) try b.cmd("Create /etc/dinit.d/boot.d", &.{ "mkdir", "-p", target ++ "/etc/dinit.d/boot.d" });
@@ -760,12 +761,26 @@ fn espBootx64(_: Probe, disk: Disk, esp_dev: []const u8) bool {
     return part.has_bootx64 orelse true;
 }
 
+/// udev removes and re-adds the partition nodes while the kernel re-reads a
+/// new table; formatting straight after `sfdisk` can find /dev/vda2 missing
+/// (seen in QEMU on the dkde image). Wait for udev when it is there.
+fn waitForDevices(b: *Builder) !void {
+    const paths = [_][]const u8{ "/usr/sbin/udevadm", "/sbin/udevadm", "/usr/bin/udevadm", "/bin/udevadm" };
+    try b.steps.append(b.arena, .{
+        .desc = "Wait for the new partition devices to settle",
+        .action = .{ .command = .{ .argv = try b.arena.dupe([]const u8, &.{ "udevadm", "settle", "--timeout=30" }) } },
+        .when = .{ .any_of = &paths },
+        .soft = true,
+    });
+}
+
 fn planAuto(b: *Builder, disk: Disk, ids: files.Ids) BuildError!Layout {
     const arena = b.arena;
     const esp_dev = try files.partitionPath(arena, disk.name, 2);
     const root_dev = try files.partitionPath(arena, disk.name, 3);
     try b.cmd("Erase all signatures on the disk", &.{ "wipefs", "-a", disk.path });
     try b.cmdStdin("Write the partition table", &.{ "sfdisk", disk.path }, try files.sfdiskScript(arena, ids), false);
+    try waitForDevices(b);
     try b.cmd("Format the EFI System Partition", &.{ "mkfs.vfat", "-F", "32", "-n", "ESP", "-i", ids.esp_vol_id, esp_dev });
     try b.cmd("Format the root filesystem", &.{ "mkfs.ext4", "-L", "dkrescue", "-U", ids.root_fs_uuid, root_dev });
     return .{
@@ -1090,6 +1105,15 @@ test "services: enable and disable as the image does; core and unknown are refus
     try std.testing.expect(contains((try buildSvc(arena, a)).refused, "needed to boot"));
     a.services_disable = &.{"nonesuch"};
     try std.testing.expect(contains((try buildSvc(arena, a)).refused, "no such service"));
+}
+
+test "a service with a missing dependency is refused" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var a = svcAnswers();
+    a.services_enable = &.{"bluetoothd"};
+    try std.testing.expect(contains((try buildSvc(arena, a)).refused, "needs avahi-daemon"));
 }
 
 test "firewall and NTP use the image's own services" {
