@@ -76,6 +76,21 @@ pub const Probe = struct {
     /// from the image so that the plan can stay pure (SPEC.md 5.6.8).
     kernel: ?[]const u8,
     disks: []const Disk,
+    /// A package repository medium found (or chosen with `--repo`), if any.
+    repo: ?Repo = null,
+    /// The live system's own login (removed from the new system): "rescue" on
+    /// the rescue image, "live" on the dkde image; read from its /etc/passwd.
+    live_user: []const u8 = "rescue",
+    /// The dinit services of the system image (the live system is the image).
+    services: []const Service = &.{},
+    /// The image has /etc/selinux/config.
+    selinux: bool = false,
+    /// Network interfaces of the live system (not `lo`).
+    net_ifaces: []const NetIface = &.{},
+    /// Which network stack the image has (the target is a copy of it).
+    net_stack: NetStack = .none,
+    /// Connection files of the live NetworkManager (the session's own setup).
+    live_connections: []const []const u8 = &.{},
 
     /// Looks a disk up by kernel name or device path.
     pub fn findDisk(self: Probe, name_or_path: []const u8) ?Disk {
@@ -145,6 +160,420 @@ pub fn ineligible(p: Probe, disk: Disk, check_size: bool) ?Ineligible {
     if (disk.read_only) return .read_only;
     if (check_size) if (p.rootfs_size) |rs| if (disk.size < minDiskSize(rs)) return .too_small;
     return null;
+}
+
+// ---------------------------------------------------------------- network
+
+pub const NetIface = struct {
+    name: []const u8,
+    wireless: bool = false,
+};
+
+/// NetworkManager (dkde), dhcpcd + wpa_supplicant (rescue's base-net), or neither.
+pub const NetStack = enum { networkmanager, dhcpcd, none };
+
+/// The services that make up the network stack.
+pub const net_service_names = [_][]const u8{ "networkmanager", "wpa_supplicant", "dhcpcd" };
+
+pub const nm_connections_dir = "/etc/NetworkManager/system-connections";
+
+fn detectStack(io: Io, services: []const Service) NetStack {
+    if (findService(services, "networkmanager") != null or exists(io, "/usr/sbin/NetworkManager") or exists(io, "/usr/bin/NetworkManager")) return .networkmanager;
+    if (findService(services, "dhcpcd") != null or exists(io, "/usr/sbin/dhcpcd") or exists(io, "/sbin/dhcpcd")) return .dhcpcd;
+    return .none;
+}
+
+fn readNetIfaces(arena: Allocator, io: Io) Allocator.Error![]const NetIface {
+    var out: std.ArrayList(NetIface) = .empty;
+    var d = Io.Dir.cwd().openDir(io, "/sys/class/net", .{ .iterate = true }) catch return out.items;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |e| {
+        if (std.mem.eql(u8, e.name, "lo")) continue;
+        const wl = try std.fmt.allocPrint(arena, "/sys/class/net/{s}/wireless", .{e.name});
+        try out.append(arena, .{ .name = try arena.dupe(u8, e.name), .wireless = exists(io, wl) });
+    }
+    std.mem.sort(NetIface, out.items, {}, struct {
+        fn lt(_: void, a: NetIface, b: NetIface) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    return out.items;
+}
+
+fn readConnections(arena: Allocator, io: Io) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var d = Io.Dir.cwd().openDir(io, nm_connections_dir, .{ .iterate = true }) catch return out.items;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind == .file and e.name[0] != '.') try out.append(arena, try arena.dupe(u8, e.name));
+    }
+    return out.items;
+}
+
+// ---------------------------------------------------------------- services
+
+/// One dinit service of the image.
+pub const Service = struct {
+    name: []const u8,
+    /// First comment line or `description =` of the service file; may be empty.
+    label: []const u8 = "",
+    /// Linked from /etc/dinit.d/boot.d: started at boot.
+    enabled: bool = false,
+    /// The file is in /usr/lib/dinit.d rather than /etc/dinit.d.
+    in_usr: bool = false,
+    /// Listens on the network (a server): shown marked, never changed by default.
+    network: bool = false,
+    /// Needed to boot or log in: not offered for switching off.
+    core: bool = false,
+
+    /// Where `boot.d/<name>` points when enabled (dkbuild's image step).
+    pub fn linkTarget(self: Service, arena: Allocator) ![]const u8 {
+        return if (self.in_usr) std.fmt.allocPrint(arena, "/usr/lib/dinit.d/{s}", .{self.name}) else std.fmt.allocPrint(arena, "../{s}", .{self.name});
+    }
+};
+
+const network_services = [_][]const u8{
+    "sshd",   "firewalld", "cupsd",  "cups",    "httpd",  "nginx",  "smbd",   "nmbd",       "samba",  "nfsd",    "rpcbind", "avahi-daemon",
+    "avahi",  "named",     "bind",   "dhcpd",   "dnsmasq", "vsftpd", "exim",   "postfix",    "dovecot", "mariadb", "mysqld",  "postgresql",
+    "redis",  "ntpd",      "chronyd", "incusd", "incus",  "sddm",   "libvirtd", "docker",    "containerd", "mosquitto", "snmpd", "telnetd",
+    "bluetoothd", "tailscaled", "wpa_supplicant", "networkmanager",
+};
+
+/// Services the system needs to boot and log in.
+const core_services = [_][]const u8{ "boot", "udevd", "udev-trigger", "udev-settle", "modules", "syslogd", "dbus", "seatd", "loginready", "rcboot", "single", "recovery", "system", "early-filesystems", "early-devices", "fsck", "mount-all", "remount-rootfs", "hostname", "cgroups", "tmpfiles", "filesystems", "late-filesystems", "rootrw", "rootfscheck", "auxfscheck", "dbus-prepare", "sshd-keys", "hwclock" };
+
+fn inList(list: []const []const u8, name: []const u8) bool {
+    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// The label of a dinit service file: its first plain comment line (not a
+/// `#!` line) or a `description =` line.
+pub fn serviceLabel(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var n: usize = 0;
+    while (lines.next()) |raw| : (n += 1) {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, l, "description")) {
+            if (std.mem.indexOfScalar(u8, l, '=')) |eq| return std.mem.trim(u8, l[eq + 1 ..], " \t");
+        }
+        if (l.len > 1 and l[0] == '#' and l[1] != '!') {
+            const t = std.mem.trim(u8, l[1..], " #\t");
+            if (t.len > 0) return t;
+        }
+        if (n > 12) break;
+    }
+    return "";
+}
+
+/// The first ordinary login (uid 1000-59999 with a /home directory) in /etc/passwd.
+pub fn liveUser(arena: Allocator, io: Io) []const u8 {
+    const text = readSmall(arena, io, "/etc/passwd") orelse return "rescue";
+    return firstOrdinaryUser(text) orelse "rescue";
+}
+
+pub fn firstOrdinaryUser(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |l| {
+        var f = std.mem.splitScalar(u8, l, ':');
+        const name = f.next() orelse continue;
+        _ = f.next();
+        const uid = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue;
+        _ = f.next();
+        _ = f.next();
+        const home = f.next() orelse continue;
+        if (uid >= 1000 and uid < 60000 and std.mem.startsWith(u8, home, "/home/")) return name;
+    }
+    return null;
+}
+
+/// Reads /etc/dinit.d and /usr/lib/dinit.d (files only) and boot.d.
+pub fn readServices(arena: Allocator, io: Io) Allocator.Error![]const Service {
+    var out: std.ArrayList(Service) = .empty;
+    const dirs = [_]struct { path: []const u8, usr: bool }{ .{ .path = "/etc/dinit.d", .usr = false }, .{ .path = "/usr/lib/dinit.d", .usr = true } };
+    for (dirs) |dd| {
+        var d = Io.Dir.cwd().openDir(io, dd.path, .{ .iterate = true }) catch continue;
+        defer d.close(io);
+        var it = d.iterate();
+        while (it.next(io) catch null) |e| {
+            if (e.kind != .file and e.kind != .sym_link) continue;
+            if (e.name.len == 0 or e.name[0] == '.') continue;
+            if (std.mem.endsWith(u8, e.name, ".sh") or std.mem.endsWith(u8, e.name, ".md")) continue;
+            var dup = false;
+            for (out.items) |o| if (std.mem.eql(u8, o.name, e.name)) {
+                dup = true;
+            };
+            if (dup) continue;
+            const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dd.path, e.name });
+            const label = if (readSmall(arena, io, path)) |t| try arena.dupe(u8, serviceLabel(t)) else "";
+            const link = try std.fmt.allocPrint(arena, "/etc/dinit.d/boot.d/{s}", .{e.name});
+            try out.append(arena, .{
+                .name = try arena.dupe(u8, e.name),
+                .label = label,
+                .enabled = exists(io, link),
+                .in_usr = dd.usr,
+                .network = inList(&network_services, e.name),
+                .core = inList(&core_services, e.name) or std.mem.startsWith(u8, e.name, "tty"),
+            });
+        }
+    }
+    std.mem.sort(Service, out.items, {}, struct {
+        fn lt(_: void, a: Service, b: Service) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    return out.items;
+}
+
+pub fn findService(services: []const Service, name: []const u8) ?Service {
+    for (services) |s| if (std.mem.eql(u8, s.name, name)) return s;
+    return null;
+}
+
+/// NTP daemons in the order the installer prefers them.
+pub const ntp_services = [_][]const u8{ "chronyd", "ntpd", "openntpd", "ntpsec" };
+
+/// The NTP service the image has, if any.
+pub fn ntpService(services: []const Service) ?Service {
+    for (ntp_services) |n| if (findService(services, n)) |s| return s;
+    return null;
+}
+
+// ---------------------------------------------------------------- repository
+
+/// Where the repository disc is looked for when `--repo` is not given.
+pub const repo_mounts = [_][]const u8{ "/mnt/cdrom", "/mnt/repo", "/media/cdrom", "/run/live/medium-repo", "/run/live/medium" };
+/// Where the installer mounts a repository device itself (read-only).
+pub const repo_mount_point = "/mnt/cdrom";
+/// Index file names, newest format first.
+pub const repo_indexes = [_][]const u8{ "Packages.adb", "APKINDEX.tar.gz" };
+/// Package-set list names, in the order tried.
+pub const repo_set_files = [_][]const u8{ "packages-sets.txt", "sets.txt" };
+
+/// A named group of packages offered on the packages screen.
+pub const PackageSet = struct {
+    name: []const u8,
+    description: []const u8,
+    packages: []const []const u8,
+};
+
+/// A package repository on a mounted medium: `<root>/apks/<arch>/` or
+/// `<root>/data/apks/<arch>/` (what `dkbuild discs` writes) with an index.
+pub const Repo = struct {
+    /// Mount point (or directory) of the medium.
+    root: []const u8,
+    /// The `apks/<arch>` directory, absolute.
+    dir: []const u8,
+    /// `dir` relative to `root`, e.g. "data/apks/x86_64".
+    rel_dir: []const u8,
+    /// "Packages.adb" or "APKINDEX.tar.gz".
+    index: []const u8,
+    /// Directory holding the signing key(s), absolute; null if none was found.
+    key_dir: ?[]const u8 = null,
+    /// Key files (`*.pub`) in `key_dir`, absolute.
+    keys: []const []const u8 = &.{},
+    /// From `packages-sets.txt` / `sets.txt`; empty when the medium has none.
+    sets: []const PackageSet = &.{},
+    /// The installer mounted `mounted_dev` itself, so the plan unmounts it.
+    mounted_dev: ?[]const u8 = null,
+
+    /// What `apk --repository` takes: the index file for Packages.adb, the
+    /// directory for an APKINDEX.tar.gz repository.
+    pub fn apkArg(self: Repo, arena: Allocator) ![]const u8 {
+        if (std.mem.eql(u8, self.index, "Packages.adb")) return std.fmt.allocPrint(arena, "{s}/{s}", .{ self.dir, self.index });
+        return self.dir;
+    }
+};
+
+pub const RepoError = error{ RepoMissing, RepoNoLayout, OutOfMemory };
+
+/// The architecture directory name apk uses on this build.
+pub fn repoArch() []const u8 {
+    return switch (@import("builtin").cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "aarch64",
+        else => @tagName(@import("builtin").cpu.arch),
+    };
+}
+
+fn isDir(io: Io, path: []const u8) bool {
+    var d = Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    d.close(io);
+    return true;
+}
+
+fn indexIn(io: Io, dir: []const u8, arena: Allocator) ?[]const u8 {
+    for (repo_indexes) |name| {
+        const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name }) catch return null;
+        Io.Dir.cwd().access(io, p, .{}) catch continue;
+        return name;
+    }
+    return null;
+}
+
+/// `name | description | pkg pkg ...` per line; `#` starts a comment.
+/// Lines without three fields or without packages are ignored.
+pub fn parseSets(arena: Allocator, text: []const u8) Allocator.Error![]const PackageSet {
+    var out: std.ArrayList(PackageSet) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var f = std.mem.splitScalar(u8, line, '|');
+        const name = std.mem.trim(u8, f.next() orelse continue, " \t");
+        const desc = std.mem.trim(u8, f.next() orelse continue, " \t");
+        const pk = std.mem.trim(u8, f.rest(), " \t");
+        if (name.len == 0 or pk.len == 0) continue;
+        var pkgs: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeAny(u8, pk, " \t");
+        while (it.next()) |t| try pkgs.append(arena, try arena.dupe(u8, t));
+        try out.append(arena, .{ .name = try arena.dupe(u8, name), .description = try arena.dupe(u8, desc), .packages = pkgs.items });
+    }
+    return out.items;
+}
+
+/// Looks for a repository under `root` (a mounted medium, or the `apks/<arch>`
+/// directory itself). Null if the layout is not there.
+pub fn repoAt(arena: Allocator, io: Io, root_in: []const u8, arch: []const u8) Allocator.Error!?Repo {
+    const root = std.mem.trimEnd(u8, root_in, "/");
+    const rels = [_][]const u8{
+        try std.fmt.allocPrint(arena, "apks/{s}", .{arch}),
+        try std.fmt.allocPrint(arena, "data/apks/{s}", .{arch}),
+        "", // `root` is the apks/<arch> directory itself
+    };
+    for (rels) |rel| {
+        const dir = if (rel.len == 0) try arena.dupe(u8, root) else try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, rel });
+        const idx = indexIn(io, dir, arena) orelse continue;
+        var repo: Repo = .{ .root = try arena.dupe(u8, root), .dir = dir, .rel_dir = rel, .index = idx };
+        // Sets file.
+        for (repo_set_files) |sf| {
+            const sp = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, sf });
+            if (readSmall(arena, io, sp)) |t| {
+                repo.sets = try parseSets(arena, t);
+                break;
+            }
+        }
+        // Keys: next to the packages, or in keys/ of the medium (dkbuild discs).
+        const key_dirs = [_][]const u8{
+            dir,
+            try std.fmt.allocPrint(arena, "{s}/keys", .{root}),
+            try std.fmt.allocPrint(arena, "{s}/keys", .{dir}),
+        };
+        for (key_dirs) |kd| {
+            var keys: std.ArrayList([]const u8) = .empty;
+            var d = Io.Dir.cwd().openDir(io, kd, .{ .iterate = true }) catch continue;
+            defer d.close(io);
+            var it = d.iterate();
+            while (it.next(io) catch null) |e| {
+                if ((e.kind == .file or e.kind == .sym_link) and std.mem.endsWith(u8, e.name, ".pub"))
+                    try keys.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ kd, e.name }));
+            }
+            if (keys.items.len > 0) {
+                std.mem.sort([]const u8, keys.items, {}, struct {
+                    fn lt(_: void, a: []const u8, b: []const u8) bool {
+                        return std.mem.lessThan(u8, a, b);
+                    }
+                }.lt);
+                repo.key_dir = kd;
+                repo.keys = keys.items;
+                break;
+            }
+        }
+        return repo;
+    }
+    return null;
+}
+
+/// The repository to use: `explicit` (`--repo PATH`) must exist and hold the
+/// layout; otherwise the first of `repo_mounts` that does. Null if none.
+pub fn findRepo(arena: Allocator, io: Io, explicit: ?[]const u8, arch: []const u8) RepoError!?Repo {
+    if (explicit) |path| {
+        if (!isDir(io, path)) return error.RepoMissing;
+        return (try repoAt(arena, io, path, arch)) orelse error.RepoNoLayout;
+    }
+    for (repo_mounts) |m| {
+        if (!isDir(io, m)) continue;
+        if (try repoAt(arena, io, m, arch)) |r| return r;
+    }
+    return null;
+}
+
+/// Where public key files are looked for (mounted media, one level of
+/// sub-directories too: /media/<label>/).
+pub const key_roots = [_][]const u8{ "/mnt/cdrom", "/mnt/repo", "/mnt/usb", "/media", "/run/media" };
+
+/// `*.pub` files directly in `roots` and one directory below them.
+pub fn findPubFiles(arena: Allocator, io: Io, roots: []const []const u8) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (roots) |root| {
+        var d = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
+        defer d.close(io);
+        var it = d.iterate();
+        while (it.next(io) catch null) |e| {
+            const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, e.name });
+            if (e.kind == .file and std.mem.endsWith(u8, e.name, ".pub")) {
+                try out.append(arena, path);
+            } else if (e.kind == .directory) {
+                var sub = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                var it2 = sub.iterate();
+                while (it2.next(io) catch null) |e2| {
+                    if (e2.kind == .file and std.mem.endsWith(u8, e2.name, ".pub"))
+                        try out.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, e2.name }));
+                }
+            }
+        }
+    }
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return out.items;
+}
+
+/// The first public key line in a key file (skips blanks and comments).
+pub fn firstKeyLine(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const l = std.mem.trim(u8, raw, " \t\r");
+        if (l.len > 0 and l[0] != '#') return l;
+    }
+    return null;
+}
+
+/// A block device that might hold a repository: not the target disk, not the
+/// live medium, not mounted, with a filesystem a medium would have.
+pub const RepoCandidate = struct {
+    path: []const u8,
+    fstype: []const u8,
+    label: ?[]const u8,
+    size: u64,
+};
+
+fn mediumFs(fs: ?[]const u8) bool {
+    const f = fs orelse return false;
+    for ([_][]const u8{ "iso9660", "vfat", "ext4", "exfat" }) |m| if (std.mem.eql(u8, f, m)) return true;
+    return false;
+}
+
+/// Lists the devices the user may be offered (`target_disk` is never one).
+pub fn repoCandidates(arena: Allocator, p: Probe, target_disk: []const u8) Allocator.Error![]const RepoCandidate {
+    var out: std.ArrayList(RepoCandidate) = .empty;
+    for (p.disks) |d| {
+        if (std.mem.eql(u8, d.name, target_disk) or std.mem.eql(u8, d.path, target_disk)) continue;
+        if (std.mem.startsWith(u8, d.name, "zram") or std.mem.startsWith(u8, d.name, "ram") or std.mem.startsWith(u8, d.name, "loop")) continue;
+        if (p.holdsLiveMedium(d)) continue;
+        if (!d.mounted and mediumFs(d.fstype)) try out.append(arena, .{ .path = d.path, .fstype = d.fstype.?, .label = d.label, .size = d.size });
+        for (d.partitions) |q| {
+            if (q.mounted or !mediumFs(q.fstype)) continue;
+            if (p.live_medium_source) |src| if (std.mem.eql(u8, src, q.path)) continue;
+            try out.append(arena, .{ .path = q.path, .fstype = q.fstype.?, .label = q.label, .size = q.size });
+        }
+    }
+    return out.items;
 }
 
 // ---------------------------------------------------------------- lsblk
@@ -269,7 +698,53 @@ pub fn fromFixture(arena: Allocator, text: []const u8) !Probe {
         .rootfs_size = if (o.get("rootfs_size")) |v| num(v) else null,
         .kernel = str(o.get("kernel")),
         .disks = try parseLsblk(arena, lsblk_text),
+        .services = try fixtureServices(arena, o.get("services")),
+        .selinux = if (o.get("selinux")) |v| flag(v) else false,
+        .live_user = str(o.get("live_user")) orelse "rescue",
+        .net_ifaces = try fixtureIfaces(arena, o.get("net_ifaces")),
+        .net_stack = if (str(o.get("net_stack"))) |t| (std.meta.stringToEnum(NetStack, t) orelse .none) else .none,
+        .live_connections = try fixtureStrings(arena, o.get("live_connections")),
     };
+}
+
+fn fixtureStrings(arena: Allocator, v: ?json.Value) ![]const []const u8 {
+    const val = v orelse return &.{};
+    if (val != .array) return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (val.array.items) |it| if (it == .string) try out.append(arena, it.string);
+    return out.items;
+}
+
+fn fixtureIfaces(arena: Allocator, v: ?json.Value) ![]const NetIface {
+    const val = v orelse return &.{};
+    if (val != .array) return &.{};
+    var out: std.ArrayList(NetIface) = .empty;
+    for (val.array.items) |it| {
+        if (it != .object) continue;
+        const name = str(it.object.get("name")) orelse continue;
+        try out.append(arena, .{ .name = name, .wireless = flag(it.object.get("wireless")) });
+    }
+    return out.items;
+}
+
+fn fixtureServices(arena: Allocator, v: ?json.Value) ![]const Service {
+    const val = v orelse return &.{};
+    if (val != .array) return &.{};
+    var out: std.ArrayList(Service) = .empty;
+    for (val.array.items) |it| {
+        if (it != .object) continue;
+        const o = it.object;
+        const name = str(o.get("name")) orelse continue;
+        try out.append(arena, .{
+            .name = name,
+            .label = str(o.get("label")) orelse "",
+            .enabled = flag(o.get("enabled")),
+            .in_usr = flag(o.get("in_usr")),
+            .network = inList(&network_services, name),
+            .core = inList(&core_services, name) or std.mem.startsWith(u8, name, "tty"),
+        });
+    }
+    return out.items;
 }
 
 // ---------------------------------------------------------------- live
@@ -317,6 +792,7 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         rootfs_size = std.fmt.parseInt(u64, std.mem.trim(u8, t, " \n\r\t"), 10) catch null;
     }
 
+    const services = try readServices(arena, io);
     const sfs = "/run/live/medium/live/rootfs.sfs";
     const is_live = exists(io, sfs);
     return .{
@@ -327,6 +803,12 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         .rootfs_size = rootfs_size,
         .kernel = if (is_live) findKernel(arena, io, sfs) else null,
         .disks = try parseLsblk(arena, lsblk.stdout),
+        .live_user = liveUser(arena, io),
+        .services = services,
+        .selinux = exists(io, "/etc/selinux/config"),
+        .net_ifaces = try readNetIfaces(arena, io),
+        .net_stack = detectStack(io, services),
+        .live_connections = try readConnections(arena, io),
     };
 }
 
@@ -369,4 +851,9 @@ test "parseLsblk reads nested partitions" {
     try std.testing.expectEqual(@as(u32, 1), disks[0].partitions[0].number);
     try std.testing.expect(disks[0].partitions[0].mounted);
     try std.testing.expectEqualStrings("Windows", disks[0].partitions[0].label.?);
+}
+
+test "the live user is the first ordinary login" {
+    try std.testing.expectEqualStrings("live", firstOrdinaryUser("root:x:0:0::/root:/bin/sh\ngreetd:x:995:995::/var/lib/greetd:/bin/nologin\nlive:x:1000:1000::/home/live:/bin/bash\n").?);
+    try std.testing.expect(firstOrdinaryUser("root:x:0:0::/root:/bin/sh\nnobody:x:65534:65534::/:/bin/false\n") == null);
 }

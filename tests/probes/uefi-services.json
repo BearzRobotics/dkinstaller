@@ -1,0 +1,170 @@
+{
+ "firmware": "uefi",
+ "efivars_rw": true,
+ "is_live": true,
+ "live_medium_source": "/dev/sdb1",
+ "rootfs_size": 3221225472,
+ "kernel": "vmlinuz-6.12.8",
+ "lsblk": {
+  "blockdevices": [
+   {
+    "name": "nvme0n1",
+    "path": "/dev/nvme0n1",
+    "type": "disk",
+    "size": 107374182400,
+    "model": "Samsung SSD 970",
+    "tran": "nvme",
+    "ro": false,
+    "pttype": null,
+    "mountpoints": [
+     null
+    ]
+   },
+   {
+    "name": "sdb",
+    "path": "/dev/sdb",
+    "type": "disk",
+    "size": 16106127360,
+    "model": "USB Flash",
+    "tran": "usb",
+    "ro": false,
+    "pttype": "dos",
+    "mountpoints": [
+     null
+    ],
+    "children": [
+     {
+      "name": "sdb1",
+      "path": "/dev/sdb1",
+      "type": "part",
+      "size": 16000000000,
+      "fstype": "iso9660",
+      "label": "DKRESCUE",
+      "parttype": "0x83",
+      "mountpoints": [
+       "/run/live/medium"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "sdc",
+    "path": "/dev/sdc",
+    "type": "disk",
+    "size": 500107862016,
+    "model": "Data disk",
+    "tran": "sata",
+    "ro": false,
+    "pttype": "gpt",
+    "mountpoints": [
+     null
+    ],
+    "children": [
+     {
+      "name": "sdc1",
+      "path": "/dev/sdc1",
+      "type": "part",
+      "size": 500000000000,
+      "fstype": "ext4",
+      "label": "data",
+      "mountpoints": [
+       "/mnt/data"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "sdd",
+    "path": "/dev/sdd",
+    "type": "disk",
+    "size": 2147483648,
+    "model": "Tiny",
+    "tran": "usb",
+    "ro": false,
+    "pttype": null,
+    "mountpoints": [
+     null
+    ]
+   }
+  ]
+ },
+ "selinux": true,
+ "net_stack": "networkmanager",
+ "net_ifaces": [
+  {
+   "name": "eth0"
+  },
+  {
+   "name": "eth1"
+  },
+  {
+   "name": "wlan0",
+   "wireless": true
+  }
+ ],
+ "live_connections": [
+  "Wired connection 1.nmconnection"
+ ],
+ "services": [
+  {
+   "name": "udevd",
+   "label": "device manager",
+   "enabled": true,
+   "in_usr": false
+  },
+  {
+   "name": "dbus",
+   "label": "message bus",
+   "enabled": true,
+   "in_usr": false
+  },
+  {
+   "name": "networkmanager",
+   "label": "NetworkManager",
+   "enabled": true,
+   "in_usr": false
+  },
+  {
+   "name": "wpa_supplicant",
+   "label": "WiFi",
+   "enabled": true,
+   "in_usr": false
+  },
+  {
+   "name": "dhcpcd",
+   "label": "DHCP client",
+   "enabled": false,
+   "in_usr": false
+  },
+  {
+   "name": "sshd",
+   "label": "OpenSSH server",
+   "enabled": false,
+   "in_usr": false
+  },
+  {
+   "name": "firewalld",
+   "label": "Firewall",
+   "enabled": true,
+   "in_usr": false
+  },
+  {
+   "name": "chronyd",
+   "label": "NTP client",
+   "enabled": false,
+   "in_usr": false
+  },
+  {
+   "name": "cupsd",
+   "label": "Printing",
+   "enabled": false,
+   "in_usr": true
+  },
+  {
+   "name": "tty1",
+   "label": "console",
+   "enabled": true,
+   "in_usr": false
+  }
+ ]
+}

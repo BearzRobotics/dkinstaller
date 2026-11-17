@@ -62,7 +62,12 @@ pub fn hostnameFile(arena: Allocator, hostname: []const u8) ![]u8 {
 }
 
 /// `/etc/hosts`.
-pub fn hosts(arena: Allocator, hostname: []const u8) ![]u8 {
+pub fn hosts(arena: Allocator, hostname: []const u8, domain: ?[]const u8) ![]u8 {
+    if (domain) |d| return std.fmt.allocPrint(
+        arena,
+        "127.0.0.1  localhost\n127.0.1.1  {s}.{s} {s}\n::1        localhost\n",
+        .{ hostname, d, hostname },
+    );
     return std.fmt.allocPrint(
         arena,
         "127.0.0.1  localhost\n127.0.1.1  {s}\n::1        localhost\n",
@@ -180,7 +185,7 @@ test "dklilo.conf" {
     try std.testing.expect(std.mem.indexOf(u8, s, "nomodeset") != null);
 }
 
-fn uuidFromBytes(arena: Allocator, b: *const [16]u8) ![]u8 {
+pub fn uuidFromBytes(arena: Allocator, b: *const [16]u8) ![]u8 {
     var x = b.*;
     x[6] = (x[6] & 0x0f) | 0x40;
     x[8] = (x[8] & 0x3f) | 0x80;

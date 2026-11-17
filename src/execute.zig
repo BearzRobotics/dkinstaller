@@ -25,6 +25,20 @@ pub const Observer = struct {
     on_line: ?*const fn (ctx: ?*anyopaque, line: []const u8) void = null,
     /// A step finished successfully.
     on_done: ?*const fn (ctx: ?*anyopaque, index: usize) void = null,
+    /// A soft step (`Step.soft`) failed. Return true to go on, false to stop
+    /// the install as for any failure. Without it the install goes on.
+    on_soft_fail: ?*const fn (ctx: ?*anyopaque, failure: Failure) bool = null,
+    /// A `shell` step: let the user configure the target by hand. Without it
+    /// (unattended) the step is skipped and the log says so.
+    on_shell: ?*const fn (ctx: ?*anyopaque) void = null,
+};
+
+/// A soft step that failed; kept for the final screen and the log.
+pub const Warning = struct {
+    desc: []const u8,
+    reason: []const u8,
+    /// The last lines of output (may be empty).
+    tail: []const []const u8,
 };
 
 /// Why the install stopped (SPEC.md 5.7).
@@ -57,6 +71,10 @@ pub const Runner = struct {
     /// Mount points made by this run, newest last.
     mounted: std.ArrayList([]const u8) = .empty,
     tail: std.ArrayList([]const u8) = .empty,
+    /// Soft failures so far (owned by `gpa`, freed by `deinit`).
+    warnings: std.ArrayList(Warning) = .empty,
+    /// Output lines worth showing at the end: key fingerprints (`SHA256:`).
+    notes: std.ArrayList([]const u8) = .empty,
 
     /// Opens (truncating) the log at `path`; its directory is created.
     pub fn init(gpa: Allocator, io: Io, path: []const u8, observer: Observer) !Runner {
@@ -72,6 +90,15 @@ pub const Runner = struct {
         if (self.log) |f| f.close(self.io);
         for (self.mounted.items) |m| self.gpa.free(m);
         self.mounted.deinit(self.gpa);
+        for (self.warnings.items) |w| {
+            self.gpa.free(w.desc);
+            self.gpa.free(w.reason);
+            for (w.tail) |l| self.gpa.free(l);
+            self.gpa.free(w.tail);
+        }
+        self.warnings.deinit(self.gpa);
+        for (self.notes.items) |n| self.gpa.free(n);
+        self.notes.deinit(self.gpa);
         self.arena.deinit();
     }
 
@@ -85,8 +112,15 @@ pub const Runner = struct {
             self.logPrint("\n== {d}/{d} {s}   [{s}]\n", .{ i + 1, steps.len, step.desc, self.stamp(&sb) });
             self.logPrint("$ {s}\n", .{text});
             switch (step.action) {
-                .write_file => |w| self.logBlock(w.contents),
+                .write_file => |w| if (w.secret) self.logPrint("    | (contents hidden)\n", .{}) else self.logBlock(w.contents),
                 .command => |c| if (c.stdin) |in| if (!c.secret_stdin) self.logBlock(in),
+                .shell, .note => {},
+            }
+            if (!conditionHolds(self.io, step.when)) {
+                self.logPrint("-- skipped: its condition does not hold (not needed on this system)\n", .{});
+                self.sync();
+                if (self.observer.on_done) |f| f(self.observer.ctx, i);
+                continue;
             }
             self.sync();
             if (self.observer.on_start) |f| f(self.observer.ctx, i, step, text);
@@ -94,8 +128,34 @@ pub const Runner = struct {
             const reason: ?[]const u8 = switch (step.action) {
                 .command => |c| try self.runCommand(c),
                 .write_file => |w| self.writeFile(w),
+                .note => null,
+                .shell => blk: {
+                    if (self.observer.on_shell) |f| {
+                        f(self.observer.ctx);
+                        self.logPrint("-- the user's shell session ended\n", .{});
+                    } else self.logPrint("-- skipped: unattended, no shell is opened (network configuration is left to the user)\n", .{});
+                    break :blk null;
+                },
             };
             if (reason) |why| {
+                if (step.soft) {
+                    self.logPrint("-- warning: {s} (the install goes on)\n", .{why});
+                    const failure: Failure = .{
+                        .index = i,
+                        .desc = step.desc,
+                        .text = text,
+                        .reason = why,
+                        .tail = self.tail.items,
+                    };
+                    self.addWarning(failure);
+                    const go_on = if (self.observer.on_soft_fail) |f| f(self.observer.ctx, failure) else true;
+                    if (go_on) {
+                        self.sync();
+                        if (self.observer.on_done) |f| f(self.observer.ctx, i);
+                        continue;
+                    }
+                    self.logPrint("-- stopped at the user's request\n", .{});
+                }
                 self.logPrint("-- failed: {s}\n", .{why});
                 self.logRemaining(steps[i + 1 ..]);
                 self.sync();
@@ -113,6 +173,18 @@ pub const Runner = struct {
             if (self.observer.on_done) |f| f(self.observer.ctx, i);
         }
         return .ok;
+    }
+
+    fn addWarning(self: *Runner, f: Failure) void {
+        const desc = self.gpa.dupe(u8, f.desc) catch return;
+        const reason = self.gpa.dupe(u8, f.reason) catch return;
+        const tail = self.gpa.alloc([]const u8, f.tail.len) catch return;
+        var n: usize = 0;
+        for (f.tail) |l| {
+            tail[n] = self.gpa.dupe(u8, l) catch break;
+            n += 1;
+        }
+        self.warnings.append(self.gpa, .{ .desc = desc, .reason = reason, .tail = tail[0..n] }) catch {};
     }
 
     /// The steps that did not run, as the commands to finish by hand.
@@ -163,6 +235,8 @@ pub const Runner = struct {
         const a = self.arena.allocator();
         switch (step.action) {
             .write_file => |w| return std.fmt.allocPrint(a, "write {s} (mode {o:0>4})", .{ w.path, w.mode }),
+            .shell => return a.dupe(u8, "shell in the new system (chroot)"),
+            .note => return a.dupe(u8, "(nothing to run)"),
             .command => |c| {
                 var aw: Io.Writer.Allocating = .init(a);
                 for (c.argv, 0..) |arg, i| {
@@ -250,6 +324,9 @@ pub const Runner = struct {
             return;
         }
         self.logPrint("{s}\n", .{text});
+        if (std.mem.indexOf(u8, text, "SHA256:") != null) {
+            if (self.gpa.dupe(u8, std.mem.trim(u8, text, " \t"))) |n| self.notes.append(self.gpa, n) catch self.gpa.free(n) else |_| {}
+        }
         if (self.observer.on_line) |f| f(self.observer.ctx, text);
         const a = self.arena.allocator();
         const copy = a.dupe(u8, text) catch return;
@@ -332,6 +409,131 @@ pub const Runner = struct {
         }
     }
 };
+
+/// Binds /proc /sys /dev /run into the target, runs `chroot target argv...`
+/// with the terminal, and unbinds again, also when the command fails. Returns
+/// an error text for the caller to show, or null.
+pub fn chrootRun(gpa: Allocator, io: Io, argv: []const []const u8) ?[]const u8 {
+    const binds = [_]struct { src: []const u8, opt: []const u8 }{
+        .{ .src = "/proc", .opt = "--rbind" }, .{ .src = "/sys", .opt = "--rbind" },
+        .{ .src = "/dev", .opt = "--rbind" },  .{ .src = "/run", .opt = "--bind" },
+    };
+    var done: usize = 0;
+    var problem: ?[]const u8 = null;
+    for (binds) |bd| {
+        const dst = std.fmt.allocPrint(gpa, "{s}{s}", .{ plan_mod.target, bd.src }) catch return "out of memory";
+        defer gpa.free(dst);
+        Io.Dir.cwd().createDirPath(io, dst) catch {};
+        var child = std.process.spawn(io, .{ .argv = &.{ "mount", bd.opt, bd.src, dst } }) catch {
+            problem = "can't run mount";
+            break;
+        };
+        const term = child.wait(io) catch {
+            problem = "mount failed";
+            break;
+        };
+        if (!term.success()) {
+            problem = "can't bind-mount /proc /sys /dev /run into the target";
+            break;
+        }
+        done += 1;
+    }
+    if (problem == null) {
+        var full: std.ArrayList([]const u8) = .empty;
+        defer full.deinit(gpa);
+        full.append(gpa, "chroot") catch return "out of memory";
+        full.append(gpa, plan_mod.target) catch return "out of memory";
+        full.appendSlice(gpa, argv) catch return "out of memory";
+        if (std.process.spawn(io, .{ .argv = full.items })) |c| {
+            var child = c;
+            _ = child.wait(io) catch {};
+        } else |_| problem = "can't run chroot";
+    }
+    // Unbind in reverse, whatever happened.
+    while (done > 0) {
+        done -= 1;
+        const dst = std.fmt.allocPrint(gpa, "{s}{s}", .{ plan_mod.target, binds[done].src }) catch continue;
+        defer gpa.free(dst);
+        if (std.process.spawn(io, .{ .argv = &.{ "umount", "-R", dst } })) |c| {
+            var child = c;
+            _ = child.wait(io) catch {};
+        } else |_| {}
+    }
+    return problem;
+}
+
+/// What the shell banner says: the config files of the network stack present,
+/// and how to enable a dinit service the way the image does.
+pub fn shellBanner(arena: Allocator, stack: probe_mod.NetStack) ![]const u8 {
+    const stack_text: []const u8 = switch (stack) {
+        .networkmanager =>
+        \\  NetworkManager:  /etc/NetworkManager/NetworkManager.conf
+        \\                   /etc/NetworkManager/system-connections/   (keyfiles, mode 0600)
+        \\                   nmcli, nmtui          wpa_supplicant for WiFi
+        \\
+        ,
+        .dhcpcd =>
+        \\  dhcpcd:          /etc/dhcpcd.conf       (interface blocks, static lines)
+        \\  wpa_supplicant:  /etc/wpa_supplicant/wpa_supplicant.conf
+        \\
+        ,
+        .none => "  (no network stack found in the image)\n",
+    };
+    return std.fmt.allocPrint(arena,
+        \\
+        \\== Shell in the new system (chroot {s}) ==
+        \\Useful here:
+        \\{s}  ip addr, ip route          /etc/hosts  /etc/hostname  /etc/resolv.conf
+        \\
+        \\Enable a service at boot the way the image does:
+        \\  ln -sfn ../NAME /etc/dinit.d/boot.d/NAME            (service in /etc/dinit.d)
+        \\  ln -sfn /usr/lib/dinit.d/NAME /etc/dinit.d/boot.d/NAME
+        \\Disable it:  rm /etc/dinit.d/boot.d/NAME
+        \\Edit a file with ${{EDITOR:-vi}}. Type exit to return to the installer.
+        \\
+        \\
+    , .{ plan_mod.target, stack_text });
+}
+
+/// Mounts the finished install again (root, and the ESP if there is one),
+/// runs `chrootRun`, and unmounts. For the final screen's shell.
+pub fn shellInInstalled(gpa: Allocator, io: Io, plan: plan_mod.Plan, argv: []const []const u8) ?[]const u8 {
+    const t = plan_mod.target;
+    Io.Dir.cwd().createDirPath(io, t) catch {};
+    if (!runQuiet(io, &.{ "mount", plan.root_dev, t })) return "can't mount the new system";
+    var esp_mounted = false;
+    if (plan.esp_dev) |esp| esp_mounted = runQuiet(io, &.{ "mount", esp, t ++ "/boot/efi" });
+    const r = chrootRun(gpa, io, argv);
+    _ = runQuiet(io, &.{"sync"});
+    if (esp_mounted) _ = runQuiet(io, &.{ "umount", t ++ "/boot/efi" });
+    _ = runQuiet(io, &.{ "umount", t });
+    return r;
+}
+
+fn runQuiet(io: Io, argv: []const []const u8) bool {
+    var child = std.process.spawn(io, .{ .argv = argv }) catch return false;
+    const term = child.wait(io) catch return false;
+    return term.success();
+}
+
+/// Whether a step's condition holds now (an empty condition always does).
+pub fn conditionHolds(io: Io, c: plan_mod.Condition) bool {
+    for (c.exists) |p| if (!pathExists(io, p)) return false;
+    if (c.any_of.len > 0) {
+        var any = false;
+        for (c.any_of) |p| if (pathExists(io, p)) {
+            any = true;
+        };
+        if (!any) return false;
+    }
+    for (c.none_of) |p| if (pathExists(io, p)) return false;
+    return true;
+}
+
+fn pathExists(io: Io, path: []const u8) bool {
+    Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
+}
 
 /// True for a line that is only a percentage, as `unsquashfs -percentage` prints.
 pub fn isPercent(line: []const u8) bool {

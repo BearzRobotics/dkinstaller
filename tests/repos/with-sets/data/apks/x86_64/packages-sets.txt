@@ -1,0 +1,4 @@
+# sets
+network-tools | Network utilities | curl wget nmap
+dev | Compilers | gcc make
+broken line

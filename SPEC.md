@@ -1,6 +1,6 @@
 # dkrescue-install — Specification
 
-Status: **Draft v0.1**. Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.1** (program version 0.0.3). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -42,7 +42,7 @@ halfway, the log shows exactly where, and the rest can be finished by hand.
 - btrfs as the root filesystem (needs an initramfs or `BTRFS_FS` built in;
   see 5.6).
 - A graphical installer.
-- Network installs. Everything comes from the disc.
+- Network installs. The install is offline: the system comes from the live medium, and extra packages (5.8) from the live medium or a mounted package repository (a disc or USB stick). Nothing is downloaded. (WiFi and DHCP settings written to the new system, 5.9, are configuration, not a download.)
 
 ## 3. Constraints
 
@@ -53,7 +53,7 @@ DKRescue's CONSTRAINTS.md applies, and these follow from it:
   screen (5.5) is confirmed by typing the disk's name.
 - **The live disc is never offered as a target,** nor is any disk with a
   mounted partition.
-- **Offline.** Everything comes from the live medium.
+- **Offline.** Everything comes from the live medium, or from a package repository medium the user has mounted (5.8).
 - **Static.** On musl, `dkrescue-install` is one statically linked binary.
 - **Runs on baseline x86-64**, like everything else on the disc.
 
@@ -304,6 +304,123 @@ choices are:
 There's no automatic undo: after partitioning, there's nothing to undo to.
 The installer never retries a step that changes a disk on its own.
 
+### 5.8 Optional configuration screens (0.0.3)
+
+After the keymap, each screen can be skipped and each starts at "as the
+image has it". Everything goes through the plan: the dry run lists it, and
+nothing is written before the summary is confirmed. A screen only appears
+when the image has what it configures (the live system is the image, so
+its `/etc/dinit.d`, `/usr/lib/dinit.d` and `boot.d` are read).
+
+- **Network** (5.9).
+- **Services.** Every dinit service of the image with the first comment line
+  (or `description =`) of its file as the label, ticked when linked in
+  `/etc/dinit.d/boot.d`. Servers that listen on the network are marked.
+  Services needed to boot are shown but not switchable. Enabling does what
+  dkbuild's image step does: `ln -sfn ../NAME boot.d/NAME` (service in
+  `/etc/dinit.d`) or `ln -sfn /usr/lib/dinit.d/NAME boot.d/NAME`; disabling
+  removes the link. Only differences from the image become steps.
+- **SSH.** sshd on/off, root login (`no` default, `prohibit-password`,
+  `yes`), password login, and a key for the new user: pasted, read from a
+  `*.pub` file on a mounted medium (`/mnt/cdrom`, `/media/*`, or a device
+  the screen mounts read-only at `/mnt/cdrom`; never the target disk), or
+  generated (ed25519, the fingerprint is shown on the last screen). A
+  pasted or read key is checked with `ssh-keygen -l -f` before it is
+  accepted. Settings go in `/etc/ssh/sshd_config.d/10-dkinstall.conf`;
+  `sshd_config` is not rewritten except to add
+  `Include /etc/ssh/sshd_config.d/*.conf` when it has none. Host keys are made
+  with `ssh-keygen -A -f TARGET`. `authorized_keys` is written mode 0600 in a
+  0700 `.ssh`, chowned inside a chroot. Password login off with sshd on and
+  no key is a lockout: the screen asks for confirmation, the plan refuses it
+  unless `allow_lockout` is set.
+- **Other:** NTP (the image's chronyd/ntpd/openntpd/ntpsec service), firewall
+  (firewalld) and SELinux mode (`permissive` default, `enforcing`,
+  `disabled`: `SELINUX=` in `/etc/selinux/config`, with `sed`).
+- **Timezone** is checked against the live system's `/usr/share/zoneinfo`
+  when it exists. **Hostname** is followed by an optional **domain**;
+  `/etc/hosts` gets `host.domain host`.
+
+SELinux labelling: when `/etc/selinux/config` and
+`/etc/selinux/targeted/contexts/files/file_contexts` exist in the new system
+and `setfiles` exists, the last steps run `setfiles -F -r TARGET -e ... 
+file_contexts TARGET` (skipping `/proc /sys /dev /run /tmp` and the ESP).
+With the policy but no `setfiles`, the installer writes `/.autorelabel`.
+Without the policy the steps are skipped silently (the dry run says they run
+only if the policy exists). A labelling failure is a warning, never an
+error: the system boots permissive. The kernel command line is not touched
+(SELinux is the kernel's default security module; `/etc/selinux/config`
+decides the mode).
+
+Steps can be **conditional** (they run only if paths exist when reached) and
+**soft** (a failure is logged and shown as a warning at the end; the screens
+ask whether to go on, unattended runs go on). SELinux, repository packages
+and network files use them.
+
+### 5.9 Network
+
+First choice: **Guided**, **Copy the live session's connection** (offered when the live
+NetworkManager has a connection file), **Manual: configure nothing, network
+services off**, **Manual: configure by hand now**, or **Skip** (nothing is
+written; the system's own default, DHCP on wired interfaces).
+
+- *Guided*: per interface (from `/sys/class/net`, not `lo`): DHCP,
+  static IPv4/IPv6 (`address/prefix`, gateway, validated) or disabled; DNS
+  servers and a search domain; WiFi (scan with `nmcli`, else `iw`; hidden
+  network; passphrase typed in a password field; optional test connect on
+  the live system). The format follows the stack in the image:
+  NetworkManager keyfiles `dk-IFACE.nmconnection` / `wifi-SSID.nmconnection`
+  in `/etc/NetworkManager/system-connections` (mode 0600; `[connection]`,
+  `[ipv4]`/`[ipv6]` `method`, `address1=`, `dns=`, `[wifi]`,
+  `[wifi-security] key-mgmt=wpa-psk psk=`), or, with dhcpcd, lines appended to
+  `dhcpcd.conf` (`static ip_address`, `routers`, `domain_name_servers`,
+  `noipv4 noipv6` for disabled) and a `network={}` block in
+  `wpa_supplicant.conf`. A DHCP interface without DNS needs no file.
+  The WiFi passphrase is never in the dry run, the summary or the log
+  (`write` steps with `secret`, `tee` with hidden stdin). SSID and passphrase
+  may not contain `"` or `\`.
+- *Copy*: `cp -p` of the chosen live connection file into the target.
+- *Manual (nothing)*: no files; the network services present
+  (networkmanager, wpa_supplicant, dhcpcd) are disabled through the same
+  mechanism as the Services screen, which shows them as "off: manual
+  network". The dry run says so and the summary warns that the system has no
+  network until configured (and that an enabled sshd has nothing to listen
+  on).
+- *Manual (by hand now)*: after the other configuration and before the
+  bootloader a `shell` step pauses the screens and offers a shell in the new
+  system (`chroot TARGET /bin/bash -l`, with `/proc /sys /dev /run` bound in
+  and always unbound afterwards), or `$EDITOR` on a chosen file, with a
+  banner listing the config files of the stack, `ip`, `nmcli` and how to
+  enable a service the way the image does. The installer does not touch the
+  network services in this mode (the Services screen shows them as "set by
+  hand"). Unattended runs (`mode = manual-shell`) only record the intent: the
+  step is logged as skipped.
+- On the last screen, **S** opens the same shell in the installed system
+  (the installer mounts it again and unmounts it afterwards), in every
+  install, before the reboot.
+
+### 5.10 Extra packages from a repository medium (0.0.3)
+
+A repository medium has `apks/<arch>/` or `data/apks/<arch>/` (what
+`dkbuild discs` writes) with `Packages.adb` or `APKINDEX.tar.gz`; the
+public key is `*.pub` next to the packages, in `keys/` of the medium, or in
+`apks/<arch>/keys/`; sets are in `packages-sets.txt` or `sets.txt` next to
+the index (`name | description | pkg pkg ...`, `#` comments).
+
+Detection: `--repo PATH` (the medium's mount point, or the arch directory;
+an error if it is missing or has no layout), else the first of
+`/mnt/cdrom /mnt/repo /media/cdrom /run/live/medium-repo /run/live/medium`
+that has the layout. If none is mounted, the *Package repository* screen
+lists block devices (iso9660, vfat, ext4, exfat; not the target disk, not
+the live medium, not mounted) and mounts the chosen one read-only at
+`/mnt/cdrom`. The *Additional packages* screen ticks sets, or takes
+package names when the medium has no set list, and asks whether to keep
+the repository: if so a commented-out line is appended to the new
+system's `/etc/apk/repositories` with an explanation. The step runs after
+the system copy and before the bootloader:
+`apk --root TARGET --no-network --no-progress --repositories-file /dev/null
+--repository INDEX --keys-dir KEYDIR add PKG...`, after copying the key
+into `TARGET/etc/apk/keys`. An apk failure is a soft failure.
+
 ## 6. Architecture
 
 ```
@@ -359,10 +476,15 @@ in the log or on screen: they're passed to `chpasswd` on its standard input.
 | `dkrescue-install --answers FILE` | Takes every answer from `FILE` (INI format) and skips the screens, **except** the summary and its typed confirmation |
 | `dkrescue-install --answers FILE --yes-really-erase DISK` | Fully unattended, for tests. `DISK` must match the disk in `FILE` |
 | `--probe FILE` | Uses a recorded probe fixture (`tests/probes/*.json`) instead of reading the machine. For tests and `--dry-run`; refused without `--dry-run` |
+| `--repo PATH` | A package repository medium (5.10) |
+| `--chroot-run CMD` | Runs `CMD` in the new system mounted at the install target, with `/proc /sys /dev /run` bound in (for tests and repairs) |
 | `--ascii` | ASCII box drawing |
 
 The answers file holds passwords as hashes (`openssl passwd -6` format),
-never in plain text.
+never in plain text. The one exception is the WiFi passphrase (`[network]
+wifi_psk`), which has no hash form; it is never printed or logged. Optional
+sections: `[network]`, `[services]`, `[ssh]`, `[packages]`; optional
+`[system]` keys `domain`, `ntp`, `firewall`, `selinux` (see src/answers.zig).
 
 ## 8. Testing
 

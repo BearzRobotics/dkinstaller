@@ -7,7 +7,7 @@ const dk = @import("dkinstall");
 
 const usage =
     \\usage: dkrescue-install [--dry-run] [--answers FILE [--yes-really-erase DISK]]
-    \\                        [--probe FILE] [--ascii]
+    \\                        [--probe FILE] [--repo PATH] [--ascii]
     \\
     \\  (no options)       the interactive installer
     \\  --dry-run          print the plan instead of running it
@@ -16,6 +16,13 @@ const usage =
     \\  --yes-really-erase DISK
     \\                     with --answers: no screens at all, for tests; DISK must
     \\                     be the disk named in FILE
+    \\  --chroot-run CMD   run CMD with sh in the new system mounted at the install target
+    \\                     (/proc /sys /dev /run bound in, unbound afterwards); for tests
+    \\                     and repairs: the same helper as the install's shell
+    \\  --repo PATH       package repository medium (a mount point holding apks/<arch>/
+    \\                     or data/apks/<arch>/ with an index); without it /mnt/cdrom,
+    \\                     /mnt/repo, /media/cdrom, /run/live/medium-repo and
+    \\                     /run/live/medium are tried
     \\  --probe FILE       use a recorded probe fixture (only with --dry-run)
     \\  --ascii            ASCII box drawing
     \\
@@ -54,6 +61,8 @@ pub fn main(init: std.process.Init) !u8 {
     var answers_path: ?[]const u8 = null;
     var probe_path: ?[]const u8 = null;
     var erase_disk: ?[]const u8 = null;
+    var repo_path: ?[]const u8 = null;
+    var chroot_cmd: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg: []const u8 = args[i];
@@ -61,7 +70,7 @@ pub fn main(init: std.process.Init) !u8 {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "--ascii")) {
             ascii = true;
-        } else if (std.mem.eql(u8, arg, "--answers") or std.mem.eql(u8, arg, "--probe") or std.mem.eql(u8, arg, "--yes-really-erase")) {
+        } else if (std.mem.eql(u8, arg, "--answers") or std.mem.eql(u8, arg, "--probe") or std.mem.eql(u8, arg, "--repo") or std.mem.eql(u8, arg, "--chroot-run") or std.mem.eql(u8, arg, "--yes-really-erase")) {
             i += 1;
             if (i >= args.len) {
                 try err.print("{s} needs a value\n{s}", .{ arg, usage });
@@ -71,6 +80,10 @@ pub fn main(init: std.process.Init) !u8 {
                 answers_path = args[i];
             } else if (std.mem.eql(u8, arg, "--probe")) {
                 probe_path = args[i];
+            } else if (std.mem.eql(u8, arg, "--chroot-run")) {
+                chroot_cmd = args[i];
+            } else if (std.mem.eql(u8, arg, "--repo")) {
+                repo_path = args[i];
             } else erase_disk = args[i];
         } else {
             try err.print("unknown argument: {s}\n{s}", .{ arg, usage });
@@ -95,6 +108,18 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
+    if (chroot_cmd) |cmd| {
+        if (std.os.linux.geteuid() != 0) {
+            try err.print("--chroot-run must run as root\n", .{});
+            return 1;
+        }
+        if (dk.execute.chrootRun(init.gpa, io, &.{ "/bin/sh", "-c", cmd })) |why| {
+            try err.print("{s}\n", .{why});
+            return 1;
+        }
+        return 0;
+    }
+
     // Answers (from a file; otherwise from the screens, below)
     var file_answers: ?dk.answers.Answers = null;
     if (answers_path) |ans_path| {
@@ -114,7 +139,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // Probe
-    const probe: dk.probe.Probe = if (probe_path) |pp| blk: {
+    var probe: dk.probe.Probe = if (probe_path) |pp| blk: {
         const t = Io.Dir.cwd().readFileAlloc(io, pp, arena, .limited(8 << 20)) catch |e| {
             try err.print("can't read {s}: {s}\n", .{ pp, @errorName(e) });
             return 1;
@@ -127,6 +152,18 @@ pub fn main(init: std.process.Init) !u8 {
         try err.print("can't probe this machine: {s}\n", .{@errorName(e)});
         return 1;
     };
+
+    // A repository medium: --repo must be usable; otherwise whatever is mounted.
+    if (dk.probe.findRepo(arena, io, repo_path, dk.probe.repoArch())) |r| {
+        probe.repo = r;
+    } else |e| {
+        try err.print("--repo {s}: {s}\n", .{ repo_path orelse "", switch (e) {
+            error.RepoMissing => "no such directory",
+            error.RepoNoLayout => "no apks/<arch>/ (or data/apks/<arch>/) with Packages.adb or APKINDEX.tar.gz in it",
+            error.OutOfMemory => "out of memory",
+        } });
+        return 1;
+    }
 
     var entropy: [dk.files.ids_entropy]u8 = undefined;
     io.random(&entropy);
@@ -222,7 +259,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const info = try dk.execute.describeRun(arena, probe, run_answers.?);
     if (have_term) {
-        const end = dk.ui.install(&ui, io, plan, info) catch |e| {
+        const end = dk.ui.install(&ui, io, plan, info, probe.net_stack) catch |e| {
             terminal.deinit();
             have_term = false;
             try err.print("install error: {s}; log: {s}\n", .{ @errorName(e), dk.execute.log_path });
@@ -257,6 +294,10 @@ pub fn main(init: std.process.Init) !u8 {
     runner.header(info);
     switch (try runner.run(plan.steps)) {
         .ok => {
+            for (runner.warnings.items) |w| {
+                try out_w.interface.print("warning: {s}: {s}\n", .{ w.desc, w.reason });
+                for (w.tail) |l| try out_w.interface.print("    {s}\n", .{l});
+            }
             try out_w.interface.print("Installation complete.\n", .{});
             try out_w.interface.flush();
             return 0;
@@ -282,6 +323,7 @@ fn openTerminal(terminal: *dk.term.Terminal, ui: *dk.ui.Ui, gpa: std.mem.Allocat
         .arena = arena,
         .screen = try dk.term.Screen.init(gpa, sz.w, sz.h, ascii),
         .terminal = terminal,
+        .io = io,
     };
 }
 

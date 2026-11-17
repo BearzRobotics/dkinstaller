@@ -39,6 +39,8 @@ pub const Ui = struct {
     /// Scripted keys, for tests. Used when `terminal` is null.
     script: []const Key = &.{},
     script_i: usize = 0,
+    /// For the few things the screens run themselves (mounting a repository).
+    io: ?Io = null,
 
     fn key(self: *Ui) !Key {
         try self.present();
@@ -403,6 +405,12 @@ const Scr = enum {
     user_pw,
     timezone,
     keymap,
+    network,
+    services,
+    ssh,
+    other,
+    repo_pick,
+    packages,
     summary,
 };
 
@@ -423,6 +431,16 @@ const Draft = struct {
     user_pw: []const u8 = "",
     timezone: []const u8 = "UTC",
     keymap: []const u8 = "us",
+    packages: []const []const u8 = &.{},
+    keep_repo: bool = false,
+    /// Per probe service: switched on at boot (starts as the image has it).
+    svc_on: []bool = &.{},
+    ssh: ?answers_mod.Ssh = null,
+    ntp: ?bool = null,
+    firewall: ?bool = null,
+    selinux: ?answers_mod.SelinuxMode = null,
+    domain: ?[]const u8 = null,
+    network: ?answers_mod.Network = null,
 };
 
 fn isEspType(t: ?[]const u8) bool {
@@ -437,6 +455,11 @@ fn isBiosBootType(t: ?[]const u8) bool {
 
 fn hostnameError(s: []const u8) ?[]const u8 {
     return if (answers_mod.validHostname(s)) null else "Not a valid hostname (letters, digits, hyphens and dots; no leading or trailing hyphen).";
+}
+
+fn domainError(s: []const u8) ?[]const u8 {
+    if (s.len == 0) return null;
+    return if (answers_mod.validHostname(s)) null else "Not a valid domain name.";
 }
 
 fn userError(s: []const u8) ?[]const u8 {
@@ -499,7 +522,11 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
             .hostname => {
                 if (try input(ui, "Hostname", "Name for this computer.", d.hostname, .{ .validate = hostnameError })) |v| {
                     d.hostname = v;
-                    go = .root_pw;
+                    // The domain is optional: empty means none. Esc comes back here.
+                    if (try input(ui, "Domain", "Domain name of this network, for example example.org. Leave empty for none. /etc/hosts gets host.domain.", d.domain orelse "", .{ .validate = domainError })) |dom| {
+                        d.domain = if (dom.len == 0) null else dom;
+                        go = .root_pw;
+                    }
                 }
             },
             .root_pw => {
@@ -517,15 +544,37 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
             },
             .timezone => {
                 if (try input(ui, "Timezone", "A zone name from /usr/share/zoneinfo, for example UTC or Europe/Berlin.", d.timezone, .{ .validate = timezoneError })) |v| {
-                    d.timezone = v;
-                    go = .keymap;
+                    if (zoneMissing(ui, v)) {
+                        _ = try message(ui, "Timezone", &.{ui.fmt("There is no zone {s} in /usr/share/zoneinfo.", .{v})}, warn, "Enter: back");
+                    } else {
+                        d.timezone = v;
+                        go = .keymap;
+                    }
                 }
             },
             .keymap => {
                 if (try input(ui, "Console keymap", "Keymap for the text console, for example us or de.", d.keymap, .{ .validate = keymapError })) |v| {
                     d.keymap = v;
-                    go = .summary;
+                    go = next(ui, p, &d, .keymap);
                 }
+            },
+            .network => {
+                if (try screenNetwork(ui, &p, &d)) go = next(ui, p, &d, .network);
+            },
+            .services => {
+                if (try screenServices(ui, p, &d)) go = next(ui, p, &d, .services);
+            },
+            .ssh => {
+                if (try screenSsh(ui, &p, &d)) go = next(ui, p, &d, .ssh);
+            },
+            .other => {
+                if (try screenOther(ui, p, &d)) go = next(ui, p, &d, .other);
+            },
+            .repo_pick => {
+                if (try screenRepoPick(ui, &p, env, &d)) go = if (p.repo != null) .packages else .summary;
+            },
+            .packages => {
+                if (try screenPackages(ui, p.repo.?, &d)) go = .summary;
             },
             .summary => {
                 if (try screenSummary(ui, p, env, &d)) |done| return done;
@@ -534,6 +583,34 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
         if (go) |g| try stack.append(ui.arena, g) else _ = stack.pop();
     }
     return null;
+}
+
+/// The screen after `from`, skipping those that don't apply to this image:
+/// services, ssh, the other options, the repository packages, the summary.
+fn next(ui: *Ui, p: Probe, d: *Draft, from: Scr) Scr {
+    var cur = from;
+    while (true) {
+        cur = switch (cur) {
+            .keymap => .network,
+            .network => .services,
+            .services => .ssh,
+            .ssh => .other,
+            .other => .repo_pick,
+            else => .summary,
+        };
+        switch (cur) {
+            .network => if (p.net_stack != .none) return cur,
+            .services => if (p.services.len > 0) return cur,
+            .ssh => if (probe_mod.findService(p.services, "sshd") != null) return cur,
+            .other => if (probe_mod.ntpService(p.services) != null or probe_mod.findService(p.services, "firewalld") != null or p.selinux) return cur,
+            .repo_pick => {
+                if (p.repo != null) return .packages;
+                const cands = probe_mod.repoCandidates(ui.arena, p, if (d.disk) |dk| dk.name else "") catch return .summary;
+                if (cands.len > 0) return cur;
+            },
+            else => return cur,
+        }
+    }
 }
 
 /// The screen after the ESP choices, skipping those that don't apply.
@@ -813,8 +890,644 @@ fn screenPassword(ui: *Ui, title: []const u8, out: *[]const u8) !bool {
     }
 }
 
-fn buildAnswers(d: *const Draft) answers_mod.Answers {
+/// Offers the block devices that might hold a repository (never the target
+/// disk); the chosen one is mounted read-only at /mnt/cdrom. True to go on
+/// (with or without a repository), false for Esc.
+fn screenRepoPick(ui: *Ui, p: *Probe, env: Env, d: *Draft) !bool {
+    _ = env;
+    const cands = try probe_mod.repoCandidates(ui.arena, p.*, if (d.disk) |dk| dk.name else "");
+    while (true) {
+        var items: std.ArrayList(Item) = .empty;
+        try items.append(ui.arena, .{ .label = "No extra packages", .detail = "install the system as it is" });
+        for (cands) |c| {
+            try items.append(ui.arena, .{
+                .label = c.path,
+                .detail = ui.fmt("{s}  {s}  {s}", .{ c.fstype, c.label orelse "", fmtSize(ui.arena, c.size) }),
+            });
+        }
+        const pick = try menu(ui, "Package repository", "Extra packages can be installed from a repository disc or USB stick (apks/<arch>/ with a signed index). Choose the device that holds it; it is mounted read-only at " ++ probe_mod.repo_mount_point ++ ". The target disk is never offered.", items.items, 0) orelse return false;
+        if (pick == 0) return true;
+        const c = cands[pick - 1];
+        if (mountRepo(ui, p, c.path)) |why| {
+            _ = try message(ui, "Package repository", &.{ ui.fmt("{s}: {s}", .{ c.path, why }) }, warn, "Enter: back");
+            continue;
+        }
+        return true;
+    }
+}
+
+/// Mounts `dev` read-only and looks for a repository on it. Returns why not,
+/// or null with `p.repo` set.
+fn mountDevice(ui: *Ui, dev: []const u8) ?[]const u8 {
+    const mp = probe_mod.repo_mount_point;
+    const io = ui.io orelse return "can't mount here";
+    Io.Dir.cwd().createDirPath(io, mp) catch {};
+    const r = std.process.run(ui.arena, io, .{ .argv = &.{ "mount", "-o", "ro", dev, mp } }) catch return "mount could not run";
+    if (!r.term.success()) return ui.fmt("mount failed: {s}", .{std.mem.trim(u8, r.stderr, " \n")});
+    return null;
+}
+
+fn mountRepo(ui: *Ui, p: *Probe, dev: []const u8) ?[]const u8 {
+    const mp = probe_mod.repo_mount_point;
+    if (mountDevice(ui, dev)) |why| return why;
+    const io = ui.io.?;
+    const repo = probe_mod.repoAt(ui.arena, io, mp, probe_mod.repoArch()) catch null;
+    if (repo) |rp| {
+        var rr = rp;
+        rr.mounted_dev = dev;
+        p.repo = rr;
+        return null;
+    }
+    _ = std.process.run(ui.arena, io, .{ .argv = &.{ "umount", mp } }) catch {};
+    return ui.fmt("no apks/{s}/ with an index on it", .{probe_mod.repoArch()});
+}
+
+fn packageError(s: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeAny(u8, s, " \t,");
+    while (it.next()) |t| if (!answers_mod.validPackageName(t)) return "Not a valid package name (letters, digits and . _ + -; not starting with -).";
+    return null;
+}
+
+/// "Additional packages from <repo>": the sets from the medium to tick, or a
+/// free-text list when it has none. Empty means none.
+fn screenPackages(ui: *Ui, repo: probe_mod.Repo, d: *Draft) !bool {
+    const title = ui.fmt("Additional packages from {s}", .{repo.root});
+    if (repo.sets.len == 0) {
+        while (true) {
+            const typed = try input(ui, title, "This repository has no package sets. Type the names of the packages to install, separated by spaces, or leave empty for none.", "", .{ .validate = packageError }) orelse return false;
+            var list: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.tokenizeAny(u8, typed, " \t,");
+            while (it.next()) |t| try list.append(ui.arena, t);
+            d.packages = list.items;
+            if (list.items.len == 0) return true;
+            if (try screenKeepRepo(ui, d)) return true;
+        }
+    }
+    const ticked = try ui.arena.alloc(bool, repo.sets.len);
+    @memset(ticked, false);
+    var cur: usize = 0;
+    while (true) {
+        var items: std.ArrayList(Item) = .empty;
+        for (repo.sets, 0..) |set, i| {
+            try items.append(ui.arena, .{
+                .label = ui.fmt("[{c}] {s}", .{ @as(u8, if (ticked[i]) 'x' else ' '), set.name }),
+                .detail = set.description,
+            });
+        }
+        try items.append(ui.arena, .{ .label = "Done", .detail = "install the ticked sets (none ticked: no extra packages)" });
+        const pick = try menu(ui, title, "Enter ticks or unticks a set. Choose Done when finished.", items.items, cur) orelse return false;
+        cur = pick;
+        if (pick < repo.sets.len) {
+            ticked[pick] = !ticked[pick];
+            continue;
+        }
+        var list: std.ArrayList([]const u8) = .empty;
+        for (repo.sets, 0..) |set, i| if (ticked[i]) try list.appendSlice(ui.arena, set.packages);
+        d.packages = list.items;
+        if (list.items.len == 0) return true;
+        if (try screenKeepRepo(ui, d)) return true;
+    }
+}
+
+fn screenKeepRepo(ui: *Ui, d: *Draft) !bool {
+    const items = [_]Item{
+        .{ .label = "No", .detail = "leave /etc/apk/repositories alone" },
+        .{ .label = "Yes", .detail = "add it, commented out, with an explanation" },
+    };
+    const pick = try menu(ui, "Keep this repository in the installed system?", "The packages are installed offline from the medium. If you keep the repository, the installed system gets a commented-out line for it in /etc/apk/repositories, for use when the medium is mounted again.", &items, if (d.keep_repo) 1 else 0) orelse return false;
+    d.keep_repo = pick == 1;
+    return true;
+}
+
+/// True when zoneinfo is there and has no such zone (a bare image with no
+/// zoneinfo accepts any valid name).
+fn zoneMissing(ui: *Ui, zone: []const u8) bool {
+    const io = ui.io orelse return false;
+    Io.Dir.accessAbsolute(io, "/usr/share/zoneinfo", .{}) catch return false;
+    const path = ui.fmt("/usr/share/zoneinfo/{s}", .{zone});
+    Io.Dir.accessAbsolute(io, path, .{}) catch return true;
+    return false;
+}
+
+// ---- services, ssh, other
+
+fn ipError(s: []const u8) ?[]const u8 {
+    return if (answers_mod.validCidr(s)) null else "Not an address with prefix, for example 192.168.1.5/24 or 2001:db8::5/64.";
+}
+
+fn optIpError(s: []const u8) ?[]const u8 {
+    if (s.len == 0) return null;
+    return if (answers_mod.validIp(s)) null else "Not an IP address.";
+}
+
+fn dnsError(s: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeAny(u8, s, " \t,");
+    while (it.next()) |t| if (!answers_mod.validIp(t)) return "Not a list of IP addresses (separated by spaces).";
+    return null;
+}
+
+fn ssidError(s: []const u8) ?[]const u8 {
+    return if (answers_mod.validSsid(s)) null else "1-32 printable characters, no backslash or double quote.";
+}
+
+fn pskError(s: []const u8) ?[]const u8 {
+    return if (answers_mod.validPsk(s)) null else "8-63 printable characters, no backslash or double quote.";
+}
+
+/// SSIDs in range, from nmcli or iw on the live system; empty if neither works.
+fn scanWifi(ui: *Ui, p: Probe) ![]const []const u8 {
+    const io = ui.io orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    if (std.process.run(ui.arena, io, .{ .argv = &.{ "nmcli", "-t", "-f", "SSID", "device", "wifi", "list" } })) |r| {
+        if (r.term.success()) {
+            var it = std.mem.splitScalar(u8, r.stdout, '\n');
+            while (it.next()) |l| if (l.len > 0 and answers_mod.validSsid(l)) try addUnique(ui, &out, l);
+            return out.items;
+        }
+    } else |_| {}
+    for (p.net_ifaces) |ifc| {
+        if (!ifc.wireless) continue;
+        const r = std.process.run(ui.arena, io, .{ .argv = &.{ "iw", "dev", ifc.name, "scan" } }) catch continue;
+        var it = std.mem.splitScalar(u8, r.stdout, '\n');
+        while (it.next()) |l| {
+            const t = std.mem.trim(u8, l, " \t");
+            if (std.mem.startsWith(u8, t, "SSID: ") and answers_mod.validSsid(t[6..])) try addUnique(ui, &out, t[6..]);
+        }
+    }
+    return out.items;
+}
+
+fn addUnique(ui: *Ui, list: *std.ArrayList([]const u8), s: []const u8) !void {
+    for (list.items) |x| if (std.mem.eql(u8, x, s)) return;
+    try list.append(ui.arena, s);
+}
+
+/// Tries the connection on the live system. Returns the result line.
+fn testWifi(ui: *Ui, wf: answers_mod.Wifi) []const u8 {
+    const io = ui.io orelse return "can't test here";
+    const r = std.process.run(ui.arena, io, .{ .argv = &.{ "nmcli", "device", "wifi", "connect", wf.ssid, "password", wf.psk } }) catch return "nmcli is not available on the live system; not tested.";
+    if (r.term.success()) return "Connected.";
+    return ui.fmt("Failed: {s}", .{std.mem.trim(u8, if (r.stderr.len > 0) r.stderr else r.stdout, " \n")});
+}
+
+/// The network screens: how (guided, copy the live connection, manual, skip),
+/// then for guided: each wired interface, DNS, search domain, WiFi. Esc goes
+/// back a step; the first Esc leaves.
+fn screenNetwork(ui: *Ui, p: *Probe, d: *Draft) !bool {
+    var net: answers_mod.Network = d.network orelse .{};
+    var ifaces: std.ArrayList(answers_mod.Iface) = .empty;
+    var step: usize = 0;
+    while (true) {
+        switch (step) {
+            0 => {
+                var items: std.ArrayList(Item) = .empty;
+                var map: std.ArrayList(u8) = .empty; // item -> 0 guided 1 copy 2 manual 3 shell 4 skip
+                try items.append(ui.arena, .{ .label = "Guided (DHCP/static/WiFi)", .detail = "choose per interface, DNS and WiFi" });
+                try map.append(ui.arena, 0);
+                if (p.net_stack == .networkmanager and p.live_connections.len > 0) {
+                    try items.append(ui.arena, .{ .label = "Copy the live session's connection", .detail = "the one you set up in this live session" });
+                    try map.append(ui.arena, 1);
+                }
+                try items.append(ui.arena, .{ .label = "Manual: configure nothing, network services off", .detail = "set it up after the first boot" });
+                try map.append(ui.arena, 2);
+                try items.append(ui.arena, .{ .label = "Manual: configure by hand now", .detail = "a shell in the new system during the install" });
+                try map.append(ui.arena, 3);
+                try items.append(ui.arena, .{ .label = "Skip: as the image has it", .detail = "DHCP on wired interfaces by the system's own default" });
+                try map.append(ui.arena, 4);
+                const stack_name = switch (p.net_stack) {
+                    .networkmanager => "NetworkManager",
+                    .dhcpcd => "dhcpcd and wpa_supplicant",
+                    .none => "none",
+                };
+                const pick = try menu(ui, "Network", ui.fmt("The new system uses {s}. How do you want to set up its network?", .{stack_name}), items.items, 0) orelse return false;
+                switch (map.items[pick]) {
+                    0 => {
+                        net.mode = .guided;
+                        step = 1;
+                    },
+                    1 => {
+                        var ci: std.ArrayList(Item) = .empty;
+                        for (p.live_connections) |c| try ci.append(ui.arena, .{ .label = c });
+                        const cp = try menu(ui, "Live connection", "Choose the connection to copy to the new system.", ci.items, 0) orelse continue;
+                        net = .{ .mode = .copy, .copy = p.live_connections[cp] };
+                        d.network = net;
+                        return true;
+                    },
+                    2 => {
+                        d.network = .{ .mode = .manual };
+                        return true;
+                    },
+                    3 => {
+                        d.network = .{ .mode = .@"manual-shell" };
+                        return true;
+                    },
+                    else => {
+                        d.network = null;
+                        return true;
+                    },
+                }
+            },
+            1 => { // wired interfaces
+                ifaces.clearRetainingCapacity();
+                var i: usize = 0;
+                var back = false;
+                for (p.net_ifaces) |ifc| {
+                    if (ifc.wireless) continue;
+                    const items = [_]Item{
+                        .{ .label = "DHCP", .detail = "automatic (default)" },
+                        .{ .label = "Static", .detail = "address, gateway" },
+                        .{ .label = "Disabled", .detail = "not brought up" },
+                    };
+                    const pick = try menu(ui, ui.fmt("Interface {s}", .{ifc.name}), "How should this interface get its address?", &items, 0) orelse {
+                        back = true;
+                        break;
+                    };
+                    i += 1;
+                    if (pick == 0) {
+                        try ifaces.append(ui.arena, .{ .name = ifc.name, .kind = .dhcp });
+                    } else if (pick == 2) {
+                        try ifaces.append(ui.arena, .{ .name = ifc.name, .kind = .disabled });
+                    } else {
+                        const addr = try input(ui, ui.fmt("{s}: address", .{ifc.name}), "Address and prefix length, IPv4 or IPv6, for example 192.168.1.5/24.", "", .{ .validate = ipError }) orelse {
+                            back = true;
+                            break;
+                        };
+                        const gw = try input(ui, ui.fmt("{s}: gateway", .{ifc.name}), "Default gateway (same family as the address). Leave empty for none.", "", .{ .validate = optIpError }) orelse {
+                            back = true;
+                            break;
+                        };
+                        try ifaces.append(ui.arena, .{ .name = ifc.name, .kind = .static, .address = addr, .gateway = if (gw.len > 0) gw else null });
+                    }
+                }
+                if (back) {
+                    step = 0;
+                    continue;
+                }
+                net.ifaces = ifaces.items;
+                step = 2;
+            },
+            2 => {
+                const joined = try std.mem.join(ui.arena, " ", net.dns);
+                const v = try input(ui, "DNS servers", "DNS servers for these connections, IPv4 or IPv6, separated by spaces. Leave empty to take them from DHCP.", joined, .{ .validate = dnsError }) orelse {
+                    step = 1;
+                    continue;
+                };
+                var list: std.ArrayList([]const u8) = .empty;
+                var it = std.mem.tokenizeAny(u8, v, " \t,");
+                while (it.next()) |t| try list.append(ui.arena, t);
+                net.dns = list.items;
+                step = 3;
+            },
+            3 => {
+                const v = try input(ui, "Search domain", "DNS search domain. Leave empty for none.", net.search orelse "", .{ .validate = domainError }) orelse {
+                    step = 2;
+                    continue;
+                };
+                net.search = if (v.len == 0) null else v;
+                var any_wifi = false;
+                for (p.net_ifaces) |ifc| if (ifc.wireless) {
+                    any_wifi = true;
+                };
+                if (net.ifaces.len == 0 and net.dns.len > 0) net.dns = &.{};
+                if (!any_wifi) {
+                    d.network = net;
+                    return true;
+                }
+                step = 4;
+            },
+            else => { // WiFi
+                var items: std.ArrayList(Item) = .empty;
+                try items.append(ui.arena, .{ .label = "No WiFi", .detail = "skip" });
+                try items.append(ui.arena, .{ .label = "Type the network name", .detail = "a hidden network, or one not listed" });
+                const found = try scanWifi(ui, p.*);
+                for (found) |n| try items.append(ui.arena, .{ .label = n });
+                const pick = try menu(ui, "WiFi", "Connect to a wireless network. Networks in range are listed when the live system can scan.", items.items, 0) orelse {
+                    step = 3;
+                    continue;
+                };
+                if (pick == 0) {
+                    net.wifi = null;
+                    d.network = net;
+                    return true;
+                }
+                var hidden = false;
+                const ssid = if (pick == 1) blk: {
+                    hidden = true;
+                    break :blk try input(ui, "WiFi name", "The network name (SSID).", "", .{ .validate = ssidError }) orelse continue;
+                } else found[pick - 2];
+                const psk = try input(ui, ui.fmt("Passphrase for {s}", .{ssid}), "The WPA passphrase (8-63 characters). It is never shown or logged.", "", .{ .secret = true, .validate = pskError }) orelse continue;
+                if (pick != 1) hidden = (try yesNo(ui, "Hidden network", "Is this network hidden (does it not announce its name)?", "hidden", "visible", false)) orelse continue;
+                const wf: answers_mod.Wifi = .{ .ssid = ssid, .psk = psk, .hidden = hidden };
+                if (try yesNo(ui, "Test the connection", "Try to connect now, on the live system?", "test it", "skip the test", false) orelse false) {
+                    _ = try message(ui, "WiFi test", &.{testWifi(ui, wf)}, normal, "Enter: continue");
+                }
+                net.wifi = wf;
+                d.network = net;
+                return true;
+            },
+        }
+    }
+}
+
+fn netService(name: []const u8) bool {
+    for (probe_mod.net_service_names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+fn serviceItems(ui: *Ui, p: Probe, d: *Draft) ![]const Item {
+    var items: std.ArrayList(Item) = .empty;
+    const mode: ?answers_mod.NetMode = if (d.network) |n| n.mode else null;
+    for (p.services, 0..) |sv, i| {
+        const net_svc = netService(sv.name);
+        const note: []const u8 = if (net_svc and mode == .@"manual-shell") "   (set by hand)" else if (net_svc and mode == .manual) "   (off: manual network)" else if (sv.network) "   (network server)" else if (sv.core) "   (needed)" else "";
+        const shown = if (net_svc and mode == .manual) false else d.svc_on[i];
+        try items.append(ui.arena, .{
+            .label = ui.fmt("[{c}] {s}{s}", .{ @as(u8, if (shown) 'x' else ' '), sv.name, note }),
+            .detail = sv.label,
+            .enabled = !sv.core and !(net_svc and (mode == .manual or mode == .@"manual-shell")),
+        });
+    }
+    try items.append(ui.arena, .{ .label = "Done", .detail = "keep these choices" });
+    return items.items;
+}
+
+/// Ticks the dinit services that start at boot. Starts as the image has them.
+fn screenServices(ui: *Ui, p: Probe, d: *Draft) !bool {
+    if (d.svc_on.len != p.services.len) {
+        d.svc_on = try ui.arena.alloc(bool, p.services.len);
+        for (p.services, 0..) |sv, i| d.svc_on[i] = sv.enabled;
+    }
+    var cur: usize = 0;
+    while (true) {
+        const items = try serviceItems(ui, p, d);
+        const pick = try menu(ui, "Services", "Services started at boot. Enter ticks or unticks one. Servers that listen on the network are marked; they stay as the image has them unless you change them.", items, cur) orelse return false;
+        cur = pick;
+        if (pick == p.services.len) return true;
+        d.svc_on[pick] = !d.svc_on[pick];
+    }
+}
+
+fn yesNo(ui: *Ui, title: []const u8, intro: []const u8, yes: []const u8, no: []const u8, start_yes: bool) !?bool {
+    const items = [_]Item{ .{ .label = "Yes", .detail = yes }, .{ .label = "No", .detail = no } };
+    const pick = try menu(ui, title, intro, &items, if (start_yes) 0 else 1) orelse return null;
+    return pick == 0;
+}
+
+/// Runs `ssh-keygen -l -f` on `key`; null when it is a key, else why not.
+/// If ssh-keygen can't be run the key is accepted on its syntax.
+fn checkKey(ui: *Ui, key: []const u8) ?[]const u8 {
+    const io = ui.io orelse return null;
+    const dir = "/run/dkrescue-install";
+    Io.Dir.cwd().createDirPath(io, dir) catch return null;
+    const path = dir ++ "/key-check.pub";
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = ui.fmt("{s}\n", .{key}) }) catch return null;
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    const r = std.process.run(ui.arena, io, .{ .argv = &.{ "ssh-keygen", "-l", "-f", path } }) catch return null;
+    if (r.term.success()) return null;
+    return ui.fmt("ssh-keygen: {s}", .{std.mem.trim(u8, if (r.stderr.len > 0) r.stderr else r.stdout, " \n")});
+}
+
+fn keyError(s: []const u8) ?[]const u8 {
+    if (s.len == 0) return null;
+    return if (answers_mod.validPubKey(std.mem.trim(u8, s, " \t"))) null else "Not an OpenSSH public key line (ssh-ed25519 AAAA... comment).";
+}
+
+/// A key file from a mounted medium. Null: back; "" never.
+fn pickKeyFile(ui: *Ui, p: *Probe, d: *Draft) !?[]const u8 {
+    const io = ui.io orelse return null;
+    while (true) {
+        const found = try probe_mod.findPubFiles(ui.arena, io, &probe_mod.key_roots);
+        var items: std.ArrayList(Item) = .empty;
+        for (found) |f| try items.append(ui.arena, .{ .label = f });
+        try items.append(ui.arena, .{ .label = "Type a path...", .detail = "a key file on a medium that is already mounted" });
+        try items.append(ui.arena, .{ .label = "Mount a disc or USB stick...", .detail = "read-only at " ++ probe_mod.repo_mount_point });
+        const pick = try menu(ui, "Key file", "Public key files found on mounted media (/mnt/cdrom, /media, ...).", items.items, 0) orelse return null;
+        var path: []const u8 = undefined;
+        if (pick < found.len) {
+            path = found[pick];
+        } else if (pick == found.len) {
+            path = try input(ui, "Key file", "Path of a public key file.", "", .{ .validate = nonEmpty }) orelse continue;
+        } else {
+            const cands = try probe_mod.repoCandidates(ui.arena, p.*, if (d.disk) |dk| dk.name else "");
+            var ci: std.ArrayList(Item) = .empty;
+            for (cands) |c| try ci.append(ui.arena, .{ .label = c.path, .detail = ui.fmt("{s}  {s}  {s}", .{ c.fstype, c.label orelse "", fmtSize(ui.arena, c.size) }) });
+            const cp = try menu(ui, "Mount", "Choose the device to mount read-only. The target disk is not offered.", ci.items, 0) orelse continue;
+            if (mountDevice(ui, cands[cp].path)) |why| _ = try message(ui, "Mount", &.{why}, warn, "Enter: back");
+            continue;
+        }
+        const text = Io.Dir.cwd().readFileAlloc(io, path, ui.arena, .limited(64 * 1024)) catch {
+            _ = try message(ui, "Key file", &.{ui.fmt("Can't read {s}.", .{path})}, warn, "Enter: back");
+            continue;
+        };
+        const line = probe_mod.firstKeyLine(text) orelse {
+            _ = try message(ui, "Key file", &.{"The file has no key line."}, warn, "Enter: back");
+            continue;
+        };
+        const key = std.mem.trim(u8, line, " \t");
+        if (!answers_mod.validPubKey(key)) {
+            _ = try message(ui, "Key file", &.{"That is not an OpenSSH public key."}, warn, "Enter: back");
+            continue;
+        }
+        return key;
+    }
+}
+
+/// The SSH screens: enable, root login, password login, the user's key.
+/// Esc goes back a step; the first Esc leaves.
+fn screenSsh(ui: *Ui, p: *Probe, d: *Draft) !bool {
+    const sshd = probe_mod.findService(p.services, "sshd").?;
+    var s: answers_mod.Ssh = d.ssh orelse .{};
+    var step: usize = 0;
+    while (true) {
+        switch (step) {
+            0 => {
+                const items = [_]Item{
+                    .{ .label = "Leave SSH as the image has it", .detail = if (sshd.enabled) "sshd is on" else "sshd is off" },
+                    .{ .label = "Set up SSH", .detail = "service, root login, passwords, keys" },
+                };
+                const pick = try menu(ui, "SSH", "Remote login over ssh. The sshd settings go in a drop-in file in /etc/ssh/sshd_config.d/; sshd_config itself is not rewritten.", &items, if (d.ssh != null) 1 else 0) orelse return false;
+                if (pick == 0) {
+                    d.ssh = null;
+                    return true;
+                }
+                step = 1;
+            },
+            1 => {
+                const on = try yesNo(ui, "SSH service", "Start sshd at boot?", "ssh logins are possible", "sshd stays off", s.enable orelse sshd.enabled) orelse {
+                    step = 0;
+                    continue;
+                };
+                s.enable = on;
+                step = 2;
+            },
+            2 => {
+                const items = [_]Item{
+                    .{ .label = "no", .detail = "root can't log in over ssh (default)" },
+                    .{ .label = "prohibit-password", .detail = "root with a key only" },
+                    .{ .label = "yes", .detail = "root with a password too (not recommended)" },
+                };
+                const pick = try menu(ui, "Root login over ssh", "May root log in over ssh?", &items, @intFromEnum(s.root_login)) orelse {
+                    step = 1;
+                    continue;
+                };
+                s.root_login = @enumFromInt(pick);
+                step = 3;
+            },
+            3 => {
+                const pw = try yesNo(ui, "Password login over ssh", "Allow logging in over ssh with a password?", "passwords and keys both work", "keys only (set up a key next)", s.password_auth) orelse {
+                    step = 2;
+                    continue;
+                };
+                s.password_auth = pw;
+                step = 4;
+            },
+            4 => {
+                const items = [_]Item{
+                    .{ .label = "No key", .detail = "no authorized_keys for the new user" },
+                    .{ .label = "Paste a public key", .detail = "one line: ssh-ed25519 AAAA... comment" },
+                    .{ .label = "Read a key file", .detail = "from a mounted disc or USB stick" },
+                    .{ .label = "Generate a key pair", .detail = "ed25519, for the new user; the fingerprint is shown at the end" },
+                };
+                const pick = try menu(ui, "Key for the new user", "A public key lets the user log in over ssh without a password.", &items, 0) orelse {
+                    step = 3;
+                    continue;
+                };
+                s.authorized_key = null;
+                s.generate_key = false;
+                switch (pick) {
+                    0 => {},
+                    1 => {
+                        while (true) {
+                            const typed = try input(ui, "Public key", "Paste the public key (one line).", "", .{ .validate = keyError }) orelse break;
+                            const k = std.mem.trim(u8, typed, " \t");
+                            if (k.len == 0) break;
+                            if (checkKey(ui, k)) |why| {
+                                _ = try message(ui, "Public key", &.{why}, warn, "Enter: back");
+                                continue;
+                            }
+                            s.authorized_key = k;
+                            break;
+                        }
+                    },
+                    2 => if (try pickKeyFile(ui, p, d)) |k| {
+                        if (checkKey(ui, k)) |why| {
+                            _ = try message(ui, "Public key", &.{why}, warn, "Enter: back");
+                        } else s.authorized_key = k;
+                    },
+                    else => s.generate_key = true,
+                }
+                step = 5;
+            },
+            else => {
+                const ssh_on = s.enable orelse sshd.enabled;
+                if (!s.password_auth and ssh_on and s.authorized_key == null and !s.generate_key) {
+                    const ok = try yesNo(ui, "No way to log in over ssh", "Passwords are off and no key is set up: nobody could log in over ssh. Go on anyway?", "go on, I will add a key later", "go back and choose a key or allow passwords", false) orelse {
+                        step = 4;
+                        continue;
+                    };
+                    if (!ok) {
+                        step = 4;
+                        continue;
+                    }
+                    s.allow_lockout = true;
+                } else s.allow_lockout = false;
+                d.ssh = s;
+                return true;
+            },
+        }
+    }
+}
+
+/// NTP, firewall and SELinux mode: each starts at "as the image has it".
+fn screenOther(ui: *Ui, p: Probe, d: *Draft) !bool {
+    var step: usize = 0;
+    while (step < 3) {
+        switch (step) {
+            0 => if (probe_mod.ntpService(p.services)) |ntp| {
+                const items = [_]Item{
+                    .{ .label = "As the image has it", .detail = if (ntp.enabled) "clock sync is on" else "clock sync is off" },
+                    .{ .label = "On", .detail = ui.fmt("start {s} at boot", .{ntp.name}) },
+                    .{ .label = "Off", .detail = "no clock synchronisation" },
+                };
+                const pick = try menu(ui, "Clock synchronisation (NTP)", "Keep the clock right over the network.", &items, if (d.ntp) |v| (if (v) @as(usize, 1) else 2) else 0) orelse return false;
+                d.ntp = switch (pick) {
+                    0 => null,
+                    1 => true,
+                    else => false,
+                };
+            },
+            1 => if (probe_mod.findService(p.services, "firewalld")) |fw| {
+                const items = [_]Item{
+                    .{ .label = "As the image has it", .detail = if (fw.enabled) "firewalld is on" else "firewalld is off" },
+                    .{ .label = "On", .detail = "start firewalld at boot" },
+                    .{ .label = "Off", .detail = "no firewall" },
+                };
+                const pick = try menu(ui, "Firewall", "firewalld filters incoming connections.", &items, if (d.firewall) |v| (if (v) @as(usize, 1) else 2) else 0) orelse {
+                    step = prevOther(p, step);
+                    if (step == 99) return false;
+                    continue;
+                };
+                d.firewall = switch (pick) {
+                    0 => null,
+                    1 => true,
+                    else => false,
+                };
+            },
+            else => if (p.selinux) {
+                const items = [_]Item{
+                    .{ .label = "As the image has it", .detail = "permissive: denials are logged, not enforced" },
+                    .{ .label = "permissive", .detail = "log denials only" },
+                    .{ .label = "enforcing", .detail = "enforce the policy" },
+                    .{ .label = "disabled", .detail = "no SELinux" },
+                };
+                const pick = try menu(ui, "SELinux mode", "Written to /etc/selinux/config in the new system.", &items, if (d.selinux) |m| @as(usize, @intFromEnum(m)) + 1 else 0) orelse {
+                    step = prevOther(p, step);
+                    if (step == 99) return false;
+                    continue;
+                };
+                d.selinux = if (pick == 0) null else @enumFromInt(pick - 1);
+            },
+        }
+        step += 1;
+    }
+    return true;
+}
+
+/// The previous applicable step of `screenOther`, or 99 for "leave".
+fn prevOther(p: Probe, from: usize) usize {
+    var s = from;
+    while (s > 0) {
+        s -= 1;
+        if (s == 0 and probe_mod.ntpService(p.services) != null) return 0;
+        if (s == 1 and probe_mod.findService(p.services, "firewalld") != null) return 1;
+    }
+    return 99;
+}
+
+fn ssh_on_summary(a: answers_mod.Answers, p: Probe) bool {
+    if (a.ssh) |sh| if (sh.enable) |e| return e;
+    if (probe_mod.findService(p.services, "sshd")) |sv| return sv.enabled;
+    return false;
+}
+
+fn buildAnswers(ui: *Ui, d: *const Draft, p: Probe) !answers_mod.Answers {
+    var en: std.ArrayList([]const u8) = .empty;
+    var dis: std.ArrayList([]const u8) = .empty;
+    const nm: ?answers_mod.NetMode = if (d.network) |n| n.mode else null;
+    if (d.svc_on.len == p.services.len) for (p.services, 0..) |sv, i| {
+        if (netService(sv.name) and (nm == .manual or nm == .@"manual-shell")) continue;
+        if (d.svc_on[i] and !sv.enabled) try en.append(ui.arena, sv.name);
+        if (!d.svc_on[i] and sv.enabled) try dis.append(ui.arena, sv.name);
+    };
     return .{
+        .domain = d.domain,
+        .network = d.network,
+        .services_enable = en.items,
+        .services_disable = dis.items,
+        .ssh = d.ssh,
+        .ntp = d.ntp,
+        .firewall = d.firewall,
+        .selinux = d.selinux,
         .disk = d.disk.?.name,
         .partitioning = d.partitioning,
         .root = if (d.root) |r| r.name else null,
@@ -829,12 +1542,14 @@ fn buildAnswers(d: *const Draft) answers_mod.Answers {
         .user_pw = .{ .plain = d.user_pw },
         .timezone = d.timezone,
         .keymap = d.keymap,
+        .packages = d.packages,
+        .keep_repo = d.keep_repo,
     };
 }
 
 /// Builds the summary, asks for the typed confirmation. Null means back.
 fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
-    const a = buildAnswers(d);
+    const a = try buildAnswers(ui, d, p);
     const disk = d.disk.?;
     const result = try plan_mod.build(ui.arena, p, a, env.ids);
     const plan = switch (result) {
@@ -866,6 +1581,38 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
     }
     try lines.append(ui.arena, .{ .text = ui.fmt("Hostname: {s}   User: {s}   Timezone: {s}   Keymap: {s}", .{ d.hostname, d.user, d.timezone, d.keymap }) });
     try lines.append(ui.arena, .{ .text = "Passwords: root set, user set" });
+    if (a.network) |n| {
+        switch (n.mode) {
+            .guided => {
+                try lines.append(ui.arena, .{ .text = ui.fmt("Network: {d} interface setting(s){s}", .{ n.ifaces.len, if (n.wifi != null) ", WiFi (passphrase hidden)" else "" }) });
+            },
+            .copy => try lines.append(ui.arena, .{ .text = ui.fmt("Network: copy the live connection {s}", .{n.copy orelse "?"}) }),
+            .manual => {
+                try lines.append(ui.arena, .{ .text = "Network: NOT configured; network services off.", .attr = warn });
+                try lines.append(ui.arena, .{ .text = "  The installed system has no network until you configure it.", .attr = warn });
+                if (p.services.len > 0) if (ssh_on_summary(a, p)) try lines.append(ui.arena, .{ .text = "  sshd is enabled but will have nothing to listen on.", .attr = warn });
+            },
+            .@"manual-shell" => {
+                try lines.append(ui.arena, .{ .text = "Network: configured by hand in a shell during the install.", .attr = warn });
+                try lines.append(ui.arena, .{ .text = "  Without your changes the installed system has no network.", .attr = warn });
+                if (ssh_on_summary(a, p)) try lines.append(ui.arena, .{ .text = "  sshd is enabled but will have nothing to listen on without a network.", .attr = warn });
+            },
+        }
+    }
+    for (a.services_enable) |n| try lines.append(ui.arena, .{ .text = ui.fmt("Service enabled at boot: {s}", .{n}) });
+    for (a.services_disable) |n| try lines.append(ui.arena, .{ .text = ui.fmt("Service disabled at boot: {s}", .{n}) });
+    if (a.ssh) |sh| try lines.append(ui.arena, .{ .text = ui.fmt("SSH: sshd {s}, root login {s}, passwords {s}, key: {s}", .{
+        if (sh.enable) |e| (if (e) "on" else "off") else "as is",
+        @tagName(sh.root_login),
+        if (sh.password_auth) "allowed" else "off",
+        if (sh.authorized_key != null) "given" else if (sh.generate_key) "generated" else "none",
+    }), .attr = if (!sh.password_auth and sh.authorized_key == null and !sh.generate_key) warn else normal });
+    if (a.ntp) |v| try lines.append(ui.arena, .{ .text = ui.fmt("NTP: {s}", .{if (v) "on" else "off"}) });
+    if (a.firewall) |v| try lines.append(ui.arena, .{ .text = ui.fmt("Firewall: {s}", .{if (v) "on" else "off"}) });
+    if (a.selinux) |m| try lines.append(ui.arena, .{ .text = ui.fmt("SELinux mode: {s}", .{@tagName(m)}) });
+    if (d.packages.len > 0) {
+        try lines.append(ui.arena, .{ .text = ui.fmt("Extra packages: {d} from {s}{s}", .{ d.packages.len, if (p.repo) |r| r.root else "?", if (d.keep_repo) " (repository kept, commented out)" else "" }) });
+    }
     try lines.append(ui.arena, .{ .text = ui.fmt("Firmware: {s}", .{if (p.firmware == .uefi) "UEFI" else "BIOS"}) });
     try lines.append(ui.arena, .{ .text = "" });
     try lines.append(ui.arena, .{ .text = "Commands that will run:", .attr = bold });
@@ -898,6 +1645,7 @@ const out_rows = 40;
 const Progress = struct {
     ui: *Ui,
     steps: []const plan_mod.Step,
+    stack: probe_mod.NetStack = .none,
     cur: usize = 0,
     text: []const u8 = "",
     /// Percentage from a progress-only output line (unsquashfs), if any.
@@ -926,6 +1674,41 @@ const Progress = struct {
             self.count += 1;
         }
         self.draw();
+    }
+
+    /// A soft step failed: show it with its output, and ask. Enter goes on.
+    fn onSoftFail(ctx: ?*anyopaque, f: execute.Failure) bool {
+        const self: *Progress = @ptrCast(@alignCast(ctx.?));
+        const ui = self.ui;
+        while (true) {
+            const r = ui.frame("A step had a problem", "Enter: continue the installation   Q: stop here");
+            var y = r.y;
+            _ = ui.screen.text(r.x, y, ui.fmt("Step {d}: {s}", .{ f.index + 1, f.desc }), warn, @intCast(r.w));
+            y += 1;
+            _ = ui.screen.text(r.x, y, ui.fmt("$ {s}", .{f.text}), dim, @intCast(r.w));
+            y += 1;
+            _ = ui.screen.text(r.x, y, f.reason, danger, @intCast(r.w));
+            y += 2;
+            for (f.tail) |l| {
+                if (y >= r.y + r.h - 3) break;
+                _ = ui.screen.text(r.x, y, l, normal, @intCast(r.w));
+                y += 1;
+            }
+            _ = ui.screen.text(r.x, r.y + r.h - 2, "The base system is already installed. Going on is usually right.", normal, @intCast(r.w));
+            _ = ui.screen.text(r.x, r.y + r.h - 1, ui.fmt("Log: {s}", .{execute.log_path}), dim, @intCast(r.w));
+            const k = ui.key() catch return true;
+            switch (k) {
+                .enter => return true,
+                .char => |c| if (c == 'q' or c == 'Q') return false,
+                else => {},
+            }
+        }
+    }
+
+    /// The `shell` step: pause the screens, offer the shell and the editor.
+    fn onShell(ctx: ?*anyopaque) void {
+        const self: *Progress = @ptrCast(@alignCast(ctx.?));
+        handConfig(self.ui, self.stack);
     }
 
     fn draw(self: *Progress) void {
@@ -972,17 +1755,76 @@ const Progress = struct {
     }
 };
 
+const edit_candidates = [_][]const u8{
+    "/etc/NetworkManager/NetworkManager.conf", "/etc/dhcpcd.conf", "/etc/wpa_supplicant/wpa_supplicant.conf",
+    "/etc/resolv.conf",                         "/etc/hosts",       "/etc/hostname",
+};
+
+/// Pauses the screens and runs `argv` in the target (shell or editor).
+fn inTarget(ui: *Ui, stack: probe_mod.NetStack, argv: []const []const u8, banner: bool, installed: ?plan_mod.Plan) void {
+    const io = ui.io orelse return;
+    const t = ui.terminal orelse return;
+    t.pause();
+    if (banner) {
+        const text = execute.shellBanner(ui.arena, stack) catch "";
+        std.debug.print("{s}", .{text});
+    }
+    const why = if (installed) |pl| execute.shellInInstalled(ui.gpa, io, pl, argv) else execute.chrootRun(ui.gpa, io, argv);
+    if (why) |w| std.debug.print("\n{s}\nPress Enter.\n", .{w});
+    if (why != null) {
+        var b: [1]u8 = undefined;
+        _ = std.posix.read(0, &b) catch 0;
+    }
+    t.unpause();
+    ui.screen.invalidate();
+}
+
+/// "Configure by hand": a shell in the target, or an editor on a config file,
+/// until the user chooses to go on.
+fn handConfig(ui: *Ui, stack: probe_mod.NetStack) void {
+    const io = ui.io orelse return;
+    while (true) {
+        const items = [_]Item{
+            .{ .label = "Open a shell in the new system", .detail = "chroot with /proc /sys /dev /run; type exit to come back" },
+            .{ .label = "Edit a config file", .detail = "with $EDITOR (vi if unset)" },
+            .{ .label = "Done: continue the installation" },
+        };
+        const pick = menu(ui, "Configure by hand", "The new system is mounted. Configure the network (and anything else) here; the installer carries on when you choose Done.", &items, 0) catch return orelse return;
+        switch (pick) {
+            0 => inTarget(ui, stack, &.{ "/bin/bash", "-l" }, true, null),
+            1 => {
+                var list: std.ArrayList(Item) = .empty;
+                for (edit_candidates) |f| {
+                    const full = ui.fmt("{s}{s}", .{ plan_mod.target, f });
+                    Io.Dir.accessAbsolute(io, full, .{}) catch continue;
+                    list.append(ui.arena, .{ .label = f }) catch return;
+                }
+                list.append(ui.arena, .{ .label = "Type a path..." }) catch return;
+                const fp = menu(ui, "Edit a file", "Choose a file in the new system.", list.items, 0) catch return orelse continue;
+                var path = list.items[fp].label;
+                if (fp == list.items.len - 1) {
+                    path = (input(ui, "Edit a file", "Path inside the new system, for example /etc/hosts.", "/etc/", .{ .validate = nonEmpty }) catch return) orelse continue;
+                }
+                inTarget(ui, stack, &.{ "/bin/sh", "-c", "exec ${EDITOR:-vi} \"$1\"", "sh", path }, false, null);
+            },
+            else => return,
+        }
+    }
+}
+
 /// Runs `plan` with the progress screen, then the failure (SPEC.md 5.7) or
 /// completion screen. Needs the real terminal.
-pub fn install(ui: *Ui, io: Io, plan: plan_mod.Plan, info: []const u8) !InstallEnd {
+pub fn install(ui: *Ui, io: Io, plan: plan_mod.Plan, info: []const u8, stack: probe_mod.NetStack) !InstallEnd {
     const t = ui.terminal.?;
     const progress = try ui.gpa.create(Progress);
     defer ui.gpa.destroy(progress);
-    progress.* = .{ .ui = ui, .steps = plan.steps };
+    progress.* = .{ .ui = ui, .steps = plan.steps, .stack = stack };
     var runner = try execute.Runner.init(ui.gpa, io, execute.log_path, .{
         .ctx = progress,
         .on_start = Progress.onStart,
         .on_line = Progress.onLine,
+        .on_soft_fail = Progress.onSoftFail,
+        .on_shell = Progress.onShell,
     });
     defer runner.deinit();
     runner.header(info);
@@ -991,14 +1833,39 @@ pub fn install(ui: *Ui, io: Io, plan: plan_mod.Plan, info: []const u8) !InstallE
     switch (outcome) {
         .ok => {
             while (true) {
-                const r = ui.frame("Installation complete", "R: reboot   L: return to the live system");
+                const r = ui.frame("Installation complete", "R: reboot   L: live system   S: shell in the installed system");
                 _ = ui.screen.text(r.x, r.y, "DKRescue is installed.", good, @intCast(r.w));
                 _ = ui.screen.text(r.x, r.y + 2, ui.fmt("The log is at {s} on the new system.", .{plan_mod.target_log["/run/dkrescue-install/target".len..]}), normal, @intCast(r.w));
                 _ = ui.screen.text(r.x, r.y + 3, "Remove the installation medium before the computer restarts.", normal, @intCast(r.w));
+                var wy = r.y + 5;
+                if (runner.notes.items.len > 0) {
+                    _ = ui.screen.text(r.x, wy, "Key fingerprints:", bold, @intCast(r.w));
+                    wy += 1;
+                    for (runner.notes.items) |n| {
+                        if (wy >= r.y + r.h - 1) break;
+                        _ = ui.screen.text(r.x + 2, wy, n, normal, @intCast(r.w - 2));
+                        wy += 1;
+                    }
+                    wy += 1;
+                }
+                if (runner.warnings.items.len > 0) {
+                    _ = ui.screen.text(r.x, wy, "Warnings (the system is installed and should boot):", warn, @intCast(r.w));
+                    wy += 1;
+                    for (runner.warnings.items) |w| {
+                        if (wy >= r.y + r.h - 1) break;
+                        _ = ui.screen.text(r.x, wy, ui.fmt("- {s}: {s}", .{ w.desc, w.reason }), warn, @intCast(r.w));
+                        wy += 1;
+                        if (w.tail.len > 0 and wy < r.y + r.h - 1) {
+                            _ = ui.screen.text(r.x + 2, wy, w.tail[w.tail.len - 1], dim, @intCast(r.w - 2));
+                            wy += 1;
+                        }
+                    }
+                }
                 switch (try ui.key()) {
                     .char => |c| switch (c) {
                         'r', 'R' => return .reboot,
                         'l', 'L' => return .live,
+                        's', 'S' => inTarget(ui, stack, &.{ "/bin/bash", "-l" }, true, plan),
                         else => {},
                     },
                     else => {},
@@ -1099,9 +1966,9 @@ test "full flow, automatic layout, ends at a typed confirmation" {
     const arena = st.allocator();
     const p = try loadFixture(arena, "uefi-nvme-blank.json");
 
-    // checks Enter, disk (first = nvme0n1) Enter, auto Enter, hostname Enter,
+    // checks Enter, disk (first = nvme0n1) Enter, auto Enter, hostname Enter, domain Enter,
     // root pw x2, user, user pw x2, timezone, keymap, summary Enter, confirm.
-    const keys = [_]Key{ .enter, .enter, .enter, .enter } ++
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter } ++
         testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
         testKeys("dakota") ++ [_]Key{.enter} ++
         testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++
