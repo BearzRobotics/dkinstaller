@@ -19,6 +19,11 @@ const usage =
     \\  --chroot-run CMD   run CMD with sh in the new system mounted at the install target
     \\                     (/proc /sys /dev /run bound in, unbound afterwards); for tests
     \\                     and repairs: the same helper as the install's shell
+    \\  --auto             autoinstall: only with dkinstall.auto=1 on the kernel command line;
+    \\                     finds the answers file (dkinstall.answers=PATH, <live medium>/install/answers.ini,
+    \\                     dkinstall.ini on a mounted or mountable medium), checks the safety gates
+    \\                     (docs/AUTOINSTALL.md) and installs with no screens, else the normal screens
+    \\  --cmdline FILE     with --auto: read the kernel command line from FILE (tests)
     \\  --repo PATH       package repository medium (a mount point holding apks/<arch>/
     \\                     or data/apks/<arch>/ with an index); without it /mnt/cdrom,
     \\                     /mnt/repo, /media/cdrom, /run/live/medium-repo and
@@ -63,6 +68,8 @@ pub fn main(init: std.process.Init) !u8 {
     var erase_disk: ?[]const u8 = null;
     var repo_path: ?[]const u8 = null;
     var chroot_cmd: ?[]const u8 = null;
+    var auto_mode = false;
+    var cmdline_path: []const u8 = "/proc/cmdline";
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg: []const u8 = args[i];
@@ -70,7 +77,9 @@ pub fn main(init: std.process.Init) !u8 {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "--ascii")) {
             ascii = true;
-        } else if (std.mem.eql(u8, arg, "--answers") or std.mem.eql(u8, arg, "--probe") or std.mem.eql(u8, arg, "--repo") or std.mem.eql(u8, arg, "--chroot-run") or std.mem.eql(u8, arg, "--yes-really-erase")) {
+        } else if (std.mem.eql(u8, arg, "--auto")) {
+            auto_mode = true;
+        } else if (std.mem.eql(u8, arg, "--answers") or std.mem.eql(u8, arg, "--probe") or std.mem.eql(u8, arg, "--repo") or std.mem.eql(u8, arg, "--cmdline") or std.mem.eql(u8, arg, "--chroot-run") or std.mem.eql(u8, arg, "--yes-really-erase")) {
             i += 1;
             if (i >= args.len) {
                 try err.print("{s} needs a value\n{s}", .{ arg, usage });
@@ -80,6 +89,8 @@ pub fn main(init: std.process.Init) !u8 {
                 answers_path = args[i];
             } else if (std.mem.eql(u8, arg, "--probe")) {
                 probe_path = args[i];
+            } else if (std.mem.eql(u8, arg, "--cmdline")) {
+                cmdline_path = args[i];
             } else if (std.mem.eql(u8, arg, "--chroot-run")) {
                 chroot_cmd = args[i];
             } else if (std.mem.eql(u8, arg, "--repo")) {
@@ -118,6 +129,28 @@ pub fn main(init: std.process.Init) !u8 {
             return 1;
         }
         return 0;
+    }
+
+    // Autoinstall: the kernel flag, then the answers file. The gates come after the probe.
+    var auto_flag = false;
+    if (auto_mode) {
+        const cmdline = Io.Dir.cwd().readFileAlloc(io, cmdline_path, arena, .limited(64 * 1024)) catch "";
+        const cl = dk.auto.parseCmdline(cmdline);
+        auto_flag = cl.auto;
+        if (!cl.auto) {
+            try err.print("autoinstall: {s}; nothing to do\n", .{dk.auto.Gate.no_flag.message()});
+            return 0;
+        }
+        const explicit = answers_path orelse cl.answers;
+        var found = try dk.auto.discover(arena, io, .{ .explicit = explicit });
+        if (found == null and explicit == null) found = try mountAndDiscover(arena, io, err);
+        if (found) |f| {
+            try err.print("autoinstall: answers file {s}\n", .{f.path});
+            try err.flush();
+            answers_path = f.path;
+        } else {
+            try err.print("autoinstall: no answers file ({s}); starting the normal installer\n", .{if (explicit) |e| e else "looked at the live medium and removable media"});
+        }
     }
 
     // Answers (from a file; otherwise from the screens, below)
@@ -163,6 +196,29 @@ pub fn main(init: std.process.Init) !u8 {
             error.OutOfMemory => "out of memory",
         } });
         return 1;
+    }
+
+    // Autoinstall gates: all must hold, else the normal screens.
+    if (auto_mode and file_answers != null) gate: {
+        var link: ?[]const u8 = null;
+        if (file_answers.?.confirm_erase) |c| if (std.mem.startsWith(u8, c, "/dev/disk/by-")) {
+            if (Io.Dir.cwd().realPathFileAlloc(io, c, arena)) |t| link = t else |_| {}
+        };
+        switch (dk.auto.check(probe, auto_flag, file_answers.?, link)) {
+            .ok => |disk| {
+                file_answers.?.disk = disk.name;
+                erase_disk = disk.name;
+                try err.print("autoinstall: erasing /dev/{s} as the answers file confirms\n", .{disk.name});
+                try err.flush();
+            },
+            .refused => |g| {
+                try err.print("autoinstall REFUSED: {s}.\nStarting the normal installer; nothing was erased.\n", .{g.message()});
+                file_answers = null;
+                answers_path = null;
+                erase_disk = null;
+                break :gate;
+            },
+        }
     }
 
     var entropy: [dk.files.ids_entropy]u8 = undefined;
@@ -300,6 +356,19 @@ pub fn main(init: std.process.Init) !u8 {
             }
             try out_w.interface.print("Installation complete.\n", .{});
             try out_w.interface.flush();
+            if (auto_mode) {
+                const what: []const []const u8 = switch (run_answers.?.when_done) {
+                    .reboot => &.{"reboot"},
+                    .poweroff => &.{"poweroff"},
+                    .shell => &.{"/bin/sh"},
+                };
+                try out_w.interface.print("autoinstall: {s}\n", .{what[0]});
+                try out_w.interface.flush();
+                if (std.process.spawn(io, .{ .argv = what })) |c| {
+                    var ch = c;
+                    _ = ch.wait(io) catch {};
+                } else |_| {}
+            }
             return 0;
         },
         .failed => |f| {
@@ -307,9 +376,39 @@ pub fn main(init: std.process.Init) !u8 {
             try err.print("\nstep {d} failed: {s}\n$ {s}\n{s}\n", .{ f.index + 1, f.desc, f.text, f.reason });
             for (f.tail) |l| try err.print("    {s}\n", .{l});
             try err.print("log: {s}\n", .{dk.execute.log_path});
+            if (auto_mode) {
+                try err.print("autoinstall failed. A shell follows; the log is {s}. Type exit to leave it.\n", .{dk.execute.log_path});
+                try err.flush();
+                if (std.process.spawn(io, .{ .argv = &.{"/bin/sh"} })) |c| {
+                    var ch = c;
+                    _ = ch.wait(io) catch {};
+                } else |_| {}
+            }
             return 1;
         },
     }
+}
+
+/// Mounts each candidate medium read-only (never anything already mounted, the
+/// live medium or a loop/ram device), looks for `dkinstall.ini` at its root,
+/// and leaves the first that has it mounted so the file stays readable.
+fn mountAndDiscover(arena: std.mem.Allocator, io: Io, err: *Io.Writer) !?dk.auto.Found {
+    const p = dk.probe.live(arena, io) catch return null;
+    const cands = try dk.probe.repoCandidates(arena, p, "");
+    Io.Dir.cwd().createDirPath(io, dk.auto.mount_point) catch {};
+    for (cands) |c| {
+        const r = std.process.run(arena, io, .{ .argv = &.{ "mount", "-o", "ro", c.path, dk.auto.mount_point } }) catch continue;
+        if (!r.term.success()) continue;
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dk.auto.mount_point, dk.auto.removable_file });
+        Io.Dir.cwd().access(io, path, .{}) catch {
+            _ = std.process.run(arena, io, .{ .argv = &.{ "umount", dk.auto.mount_point } }) catch {};
+            continue;
+        };
+        try err.print("autoinstall: found {s} on {s}\n", .{ dk.auto.removable_file, c.path });
+        try err.flush();
+        return .{ .path = path, .source = .mounted_medium };
+    }
+    return null;
 }
 
 fn openTerminal(terminal: *dk.term.Terminal, ui: *dk.ui.Ui, gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, ascii: bool) !void {

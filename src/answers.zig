@@ -6,6 +6,8 @@
 //!     [install]
 //!     disk = nvme0n1
 //!     partitioning = auto            # or: existing
+//!     confirm_erase = /dev/nvme0n1   # autoinstall: must name the disk that is erased
+//!     when_done = reboot             # autoinstall: reboot, poweroff or shell
 //!
 //!     [partitions]                   # existing only
 //!     root = nvme0n1p3
@@ -52,6 +54,9 @@
 //!     wifi_ssid = Home               # WiFi: the passphrase is never printed or logged
 //!     wifi_psk = correct horse battery
 //!     wifi_hidden = false
+//!
+//!     [post]                         # optional: commands run in the new system, last
+//!     commands = echo hello > /etc/motd   # repeatable; each runs with sh -c in a chroot (no /proc); a failure is a warning
 //!
 //!     [packages]                     # optional: from the repository medium
 //!     install = nano htop            # package names, space separated
@@ -181,6 +186,9 @@ pub fn validPsk(s: []const u8) bool {
     return true;
 }
 
+/// What an autoinstall does at the end.
+pub const WhenDone = enum { reboot, poweroff, shell };
+
 pub const SelinuxMode = enum { permissive, enforcing, disabled };
 
 pub const RootLogin = enum {
@@ -235,6 +243,11 @@ pub const Answers = struct {
     user_pw: Password,
     timezone: []const u8 = "UTC",
     keymap: ?[]const u8 = null,
+    /// Autoinstall: the disk (path, kernel name or by-id link) the file allows to be erased.
+    confirm_erase: ?[]const u8 = null,
+    when_done: WhenDone = .reboot,
+    /// Commands run with `sh -c` in the new system, after configuration (soft).
+    post: []const []const u8 = &.{},
     /// Domain name for /etc/hosts (host.domain); null: none.
     domain: ?[]const u8 = null,
     /// Null: the network screen was skipped; nothing is configured.
@@ -348,6 +361,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
     var have_user_hash = false;
     var ssh_v: Ssh = .{};
     var ssh_seen = false;
+    var post: std.ArrayList([]const u8) = .empty;
     var net_v: Network = .{};
     var net_seen = false;
     var ifaces: std.ArrayList(Iface) = .empty;
@@ -379,6 +393,11 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
             } else if (std.mem.eql(u8, key, "partitioning")) {
                 partitioning = std.meta.stringToEnum(Partitioning, value) orelse
                     return fail(diag, "partitioning must be auto or existing");
+            } else if (std.mem.eql(u8, key, "confirm_erase")) {
+                if (value.len == 0 or value[0] != '/' and !validIfaceName(value)) return fail(diag, "confirm_erase must be a device path or a kernel name");
+                a.confirm_erase = value;
+            } else if (std.mem.eql(u8, key, "when_done")) {
+                a.when_done = std.meta.stringToEnum(WhenDone, value) orelse return fail(diag, "when_done must be reboot, poweroff or shell");
             } else return fail(diag, "unknown key in [install]");
         } else if (std.mem.eql(u8, section, "partitions")) {
             if (std.mem.eql(u8, key, "root")) {
@@ -470,6 +489,10 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
             } else if (std.mem.eql(u8, key, "wifi_hidden")) {
                 wifi_hidden = parseBool(value) orelse return fail(diag, "expected true or false");
             } else return fail(diag, "unknown key in [network]");
+        } else if (std.mem.eql(u8, section, "post")) {
+            if (!std.mem.eql(u8, key, "commands")) return fail(diag, "unknown key in [post]");
+            if (value.len == 0) return fail(diag, "empty command");
+            try post.append(arena, value);
         } else if (std.mem.eql(u8, section, "services")) {
             var list: std.ArrayList([]const u8) = .empty;
             var it = std.mem.tokenizeAny(u8, value, " \t,");
@@ -516,6 +539,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
 
     diag.line = 0;
     if (ssh_seen) a.ssh = ssh_v;
+    a.post = post.items;
     if (net_seen) {
         net_v.ifaces = ifaces.items;
         if ((wifi_ssid == null) != (wifi_psk == null)) return fail(diag, "[network] wifi_ssid and wifi_psk go together");
@@ -668,6 +692,31 @@ test "network validators and section" {
     try std.testing.expectEqual(IfaceKind.static, a.network.?.ifaces[0].kind);
     try std.testing.expectEqualStrings("Home", a.network.?.wifi.?.ssid);
     try std.testing.expectEqualStrings("example.org", a.domain.?);
+}
+
+test "autoinstall keys and post commands" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = .{};
+    const a = try parse(arena_state.allocator(),
+        \\[install]
+        \\disk = largest
+        \\partitioning = auto
+        \\confirm_erase = /dev/disk/by-id/nvme-X
+        \\when_done = poweroff
+        \\[system]
+        \\root_hash = $6$salt$roothash
+        \\user = dakota
+        \\user_hash = $6$salt$userhash
+        \\[post]
+        \\commands = echo one > /etc/one
+        \\commands = echo two > /etc/two
+    , &diag);
+    try std.testing.expectEqualStrings("largest", a.disk);
+    try std.testing.expectEqualStrings("/dev/disk/by-id/nvme-X", a.confirm_erase.?);
+    try std.testing.expectEqual(WhenDone.poweroff, a.when_done);
+    try std.testing.expectEqual(@as(usize, 2), a.post.len);
+    try std.testing.expectError(error.BadAnswers, parse(arena_state.allocator(), "[install]\nwhen_done = explode\n", &diag));
 }
 
 test "parse rejects plain-text passwords and reports the line" {

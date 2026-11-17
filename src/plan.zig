@@ -351,6 +351,13 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     // 7c. Services, SSH, NTP, firewall
     try planConfig(b, p, a);
     try planNetwork(b, p, a, ids);
+    for (a.post) |cmd| {
+        try b.steps.append(arena, .{
+            .desc = try b.fmt("Post-install command: {s}", .{cmd}),
+            .action = .{ .command = .{ .argv = try arena.dupe([]const u8, &.{ "chroot", target, "/bin/sh", "-c", cmd }) } },
+            .soft = true,
+        });
+    }
 
     // 8. Bootloader
     try b.file("Write dklilo.conf", target ++ "/boot/dklilo.conf", try files.dkliloConf(arena, kernel, layout.root_partuuid), 0o644);
@@ -1338,4 +1345,17 @@ test "package sets parse; candidates never include the target disk" {
     try std.testing.expectEqual(@as(usize, 1), keys.len);
     try std.testing.expectEqualStrings("tests/keys/me.pub", keys[0]);
     try std.testing.expect(answers_mod.validPubKey(probe_mod.firstKeyLine(try Io.Dir.cwd().readFileAlloc(std.testing.io, keys[0], arena, .limited(4096))).?));
+}
+
+test "post-install commands run in the chroot as soft steps, after configuration and before the bootloader" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var a = svcAnswers();
+    a.post = &.{ "echo hi > /etc/motd", "ln -s a b" };
+    const out = try dryRun(arena, (try buildSvc(arena, a)).plan);
+    try std.testing.expect(contains(out, "chroot /run/dkrescue-install/target /bin/sh -c 'echo hi > /etc/motd'"));
+    try std.testing.expect(contains(out, ". Post-install command: ln -s a b"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "echo hi").? < std.mem.indexOf(u8, out, "dklilo").?);
+    try std.testing.expect(contains(out, "failure here is a warning"));
 }

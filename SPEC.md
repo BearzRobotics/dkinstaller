@@ -1,6 +1,6 @@
 # dkrescue-install — Specification
 
-Status: **Draft v0.1** (program version 0.0.3). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.1** (program version 0.0.4). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -430,6 +430,26 @@ the system copy and before the bootloader:
 --repository INDEX --keys-dir KEYDIR add PKG...`, after copying the key
 into `TARGET/etc/apk/keys`. An apk failure is a soft failure.
 
+### 5.11 Autoinstall (0.0.4)
+
+`dkrescue-install --auto` runs the unattended install without a typed
+confirmation. It needs all of: `dkinstall.auto=1` on the kernel command line
+(else it exits 0 and does nothing), an answers file with `[install]
+confirm_erase` naming the disk the plan erases (path, kernel name, or a
+`/dev/disk/by-*` link resolving to it; `[install] disk` may be
+`first-nonremovable`, `largest` or a path, but a selector never confirms
+itself), and a target that is not the live medium (a disk with a mounted
+partition, such as the answers medium, is refused as always). A missing or
+mismatching gate prints which and starts the normal screens; nothing is
+erased. Discovery order: `--answers`/`dkinstall.answers=PATH` (no fallback if
+missing), `<live medium>/install/answers.ini`, `dkinstall.ini` on an
+already mounted medium, then on each candidate device mounted read-only at
+`/mnt/dkinstall-auto`. `first-nonremovable` treats USB-transport disks as
+removable. At the end, after unmounting, `[install] when_done` = `reboot`
+(default), `poweroff` or `shell`; on failure a shell is left and the log path
+printed, exit code 1. `[post] commands` run last, each with `sh -c` in a
+chroot (soft steps). The image must start the launcher (docs/AUTOINSTALL.md).
+
 ## 6. Architecture
 
 ```
@@ -485,6 +505,7 @@ in the log or on screen: they're passed to `chpasswd` on its standard input.
 | `dkrescue-install --answers FILE` | Takes every answer from `FILE` (INI format) and skips the screens, **except** the summary and its typed confirmation |
 | `dkrescue-install --answers FILE --yes-really-erase DISK` | Fully unattended, for tests. `DISK` must match the disk in `FILE` |
 | `--probe FILE` | Uses a recorded probe fixture (`tests/probes/*.json`) instead of reading the machine. For tests and `--dry-run`; refused without `--dry-run` |
+| `--auto` | Autoinstall (5.11, docs/AUTOINSTALL.md). `--cmdline FILE` reads the command line from FILE (tests) |
 | `--repo PATH` | A package repository medium (5.10) |
 | `--chroot-run CMD` | Runs `CMD` in the new system mounted at the install target, with `/proc /sys /dev /run` bound in (for tests and repairs) |
 | `--ascii` | ASCII box drawing |
