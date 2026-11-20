@@ -7,6 +7,7 @@ const Io = std.Io;
 const probe_mod = @import("probe.zig");
 const answers_mod = @import("answers.zig");
 const files = @import("files.zig");
+const fs_mod = @import("fs.zig");
 
 const Probe = probe_mod.Probe;
 const Disk = probe_mod.Disk;
@@ -299,8 +300,15 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     }
     const kernel = p.kernel orelse return b.refuse("no vmlinuz-* kernel found in the system image", .{});
 
+    // The root filesystem (SPEC.md 5.3.4): its tools are on the live disc and the
+    // installed kernel can mount it; otherwise say why, before anything is written.
+    switch (try fs_mod.availability(arena, a.root_fs, p.tools, p.kernel_builtin)) {
+        .ok => {},
+        .unusable => |why| return b.refuse("the root filesystem {s} can't be used: {s}", .{ fs_mod.info(a.root_fs).name, why }),
+    }
+
     const layout: Layout = switch (a.partitioning) {
-        .auto => try planAuto(b, disk, ids),
+        .auto => try planAuto(b, disk, a.root_fs, ids),
         .existing => try planExisting(b, p, disk, a, ids),
     };
 
@@ -318,7 +326,7 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     try b.cmd("Copy the system from the disc image", &.{ "unsquashfs", "-percentage", "-f", "-d", target, rootfs_sfs });
 
     // 4. fstab
-    try b.file("Write fstab", target ++ "/etc/fstab", try files.fstab(arena, layout.root_uuid, layout.esp_uuid), 0o644);
+    try b.file("Write fstab", target ++ "/etc/fstab", try files.fstabFor(arena, a.root_fs, layout.root_uuid, layout.esp_uuid), 0o644);
 
     // 5. Identity
     try b.file("Set the hostname", target ++ "/etc/hostname", try files.hostnameFile(arena, a.hostname), 0o644);
@@ -781,7 +789,7 @@ fn waitForDevices(b: *Builder) !void {
     });
 }
 
-fn planAuto(b: *Builder, disk: Disk, ids: files.Ids) BuildError!Layout {
+fn planAuto(b: *Builder, disk: Disk, root_fs: fs_mod.Fs, ids: files.Ids) BuildError!Layout {
     const arena = b.arena;
     const esp_dev = try files.partitionPath(arena, disk.name, 2);
     const root_dev = try files.partitionPath(arena, disk.name, 3);
@@ -789,7 +797,7 @@ fn planAuto(b: *Builder, disk: Disk, ids: files.Ids) BuildError!Layout {
     try b.cmdStdin("Write the partition table", &.{ "sfdisk", disk.path }, try files.sfdiskScript(arena, ids), false);
     try waitForDevices(b);
     try b.cmd("Format the EFI System Partition", &.{ "mkfs.vfat", "-F", "32", "-n", "ESP", "-i", ids.esp_vol_id, esp_dev });
-    try b.cmd("Format the root filesystem", &.{ "mkfs.ext4", "-L", "dkrescue", "-U", ids.root_fs_uuid, root_dev });
+    try b.cmd(try b.fmt("Format the root filesystem ({s})", .{fs_mod.info(root_fs).name}), try fs_mod.mkfsArgv(arena, root_fs, "dkrescue", ids.root_fs_uuid, root_dev, false));
     return .{
         .root_dev = root_dev,
         .root_partuuid = ids.root_partuuid,
@@ -873,7 +881,7 @@ fn planExisting(b: *Builder, p: Probe, disk: Disk, a: Answers, ids: files.Ids) B
     }
 
     try b.steps.appendSlice(arena, type_fixes.items);
-    try b.cmd("Format the root filesystem", &.{ "mkfs.ext4", "-F", "-L", "dkrescue", "-U", ids.root_fs_uuid, root.path });
+    try b.cmd(try b.fmt("Format the root filesystem ({s})", .{fs_mod.info(a.root_fs).name}), try fs_mod.mkfsArgv(arena, a.root_fs, "dkrescue", ids.root_fs_uuid, root.path, true));
     if (esp_fresh) {
         try b.cmd("Format the EFI System Partition", &.{ "mkfs.vfat", "-F", "32", "-n", "ESP", "-i", ids.esp_vol_id, esp_dev.? });
     }
@@ -949,6 +957,94 @@ test "auto layout on a blank UEFI NVMe machine" {
         have_dklilo = true;
     };
     try std.testing.expect(have_dklilo);
+}
+
+test "btrfs root: formatted with mkfs.btrfs, fstab says btrfs, when its tools and kernel support are there" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-nvme-blank.json");
+    p.tools = &.{"mkfs.btrfs"};
+    p.kernel_builtin = &.{"BTRFS_FS"};
+    var a = testAnswers("nvme0n1", .auto);
+    a.root_fs = .btrfs;
+    const r = try build(arena, p, a, test_ids);
+    const out = try dryRun(arena, r.plan);
+    try std.testing.expect(contains(out, "mkfs.btrfs -L dkrescue -U 11111111-2222-3333-4444-555555555555 /dev/nvme0n1p3"));
+    try std.testing.expect(!contains(out, "mkfs.ext4"));
+    try std.testing.expect(contains(out, "btrfs  defaults,noatime    0 0"));
+    var have = false;
+    for (r.plan.programs) |prog| if (std.mem.eql(u8, prog, "mkfs.btrfs")) {
+        have = true;
+    };
+    try std.testing.expect(have);
+}
+
+test "btrfs on existing partitions is forced (-f), as ext4 is (-F)" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-sata-fdisk.json");
+    p.tools = &.{"mkfs.btrfs"};
+    p.kernel_builtin = &.{"BTRFS_FS"};
+    var a = testAnswers("sda", .existing);
+    a.root_fs = .btrfs;
+    a.root = "sda2";
+    a.esp = "sda1";
+    a.set_esp_type = true;
+    const r = try build(arena, p, a, test_ids);
+    switch (r) {
+        .plan => |pl| try std.testing.expect(contains(try dryRun(arena, pl), "mkfs.btrfs -f -L dkrescue")),
+        .refused => |why| {
+            std.debug.print("refused: {s}\n", .{why});
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "a root filesystem that cannot be used is refused with the reason, before anything is written" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const base = try loadFixture(arena, "uefi-nvme-blank.json");
+    var a = testAnswers("nvme0n1", .auto);
+
+    a.root_fs = .btrfs;
+    const no_tool = try build(arena, base, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, no_tool.refused, "the live disc is missing mkfs.btrfs (package btrfs-progs)") != null);
+
+    var with_tool = base;
+    with_tool.tools = &.{"mkfs.btrfs"};
+    const module = try build(arena, with_tool, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, module.refused, "needs an initramfs") != null);
+
+    a.root_fs = .xfs;
+    var xfs = base;
+    xfs.tools = &.{"mkfs.xfs"};
+    xfs.kernel_builtin = &.{"XFS_FS"};
+    const x = try build(arena, xfs, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, x.refused, "dklilo cannot read xfs") != null);
+
+    a.root_fs = .zfs;
+    var zfs = base;
+    zfs.tools = &.{ "zpool", "zfs" };
+    const z = try build(arena, zfs, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, z.refused, "initramfs") != null);
+}
+
+test "ext2 needs mkfs.ext2 on the live disc; ext4 (the default) needs nothing extra" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const base = try loadFixture(arena, "uefi-nvme-blank.json");
+    var a = testAnswers("nvme0n1", .auto);
+    a.root_fs = .ext2;
+    const missing = try build(arena, base, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, missing.refused, "missing mkfs.ext2 (package e2fsprogs)") != null);
+    var p = base;
+    p.tools = &.{"mkfs.ext2"};
+    const ok = try build(arena, p, a, test_ids);
+    try std.testing.expect(contains(try dryRun(arena, ok.plan), "mkfs.ext2 -L dkrescue -U "));
 }
 
 test "a keymap becomes a dinit service linked into boot.d; none, no service" {

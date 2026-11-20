@@ -13,6 +13,7 @@ const probe_mod = @import("../probe.zig");
 const answers_mod = @import("../answers.zig");
 const plan_mod = @import("../plan.zig");
 const files = @import("../files.zig");
+const fs_mod = @import("../fs.zig");
 const execute = @import("../execute.zig");
 
 const Key = term.Key;
@@ -393,6 +394,7 @@ const Scr = enum {
     checks,
     disk,
     partitioning,
+    root_fs,
     cfdisk,
     root,
     esp,
@@ -419,6 +421,8 @@ const Draft = struct {
     partitioning: answers_mod.Partitioning = .auto,
     /// Partition by hand with cfdisk first, then continue as with existing partitions.
     manual: bool = false,
+    /// The root filesystem (SPEC.md 5.3.4).
+    root_fs: fs_mod.Fs = .ext4,
     root: ?Partition = null,
     esp: ?Partition = null,
     bios_boot: ?Partition = null,
@@ -499,7 +503,10 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
                 if (try screenDisk(ui, p, &d)) go = .partitioning;
             },
             .partitioning => {
-                if (try screenPartitioning(ui, p, env, &d)) go = if (d.manual) .cfdisk else if (d.partitioning == .auto) .hostname else .root;
+                if (try screenPartitioning(ui, p, env, &d)) go = .root_fs;
+            },
+            .root_fs => {
+                if (try screenRootFs(ui, p, &d)) go = if (d.manual) .cfdisk else if (d.partitioning == .auto) .hostname else .root;
             },
             .cfdisk => {
                 if (try screenCfdisk(ui, &p, &d)) go = .root;
@@ -714,7 +721,7 @@ fn screenPartitioning(ui: *Ui, p: Probe, env: Env, d: *Draft) !bool {
     const disk = d.disk.?;
     const has_table = disk.table != null;
     const items = [_]Item{
-        .{ .label = "Erase the disk and partition it automatically", .sub = "GPT: BIOS boot 1 MiB, ESP 512 MiB, root ext4 (the rest). Everything on the disk is lost." },
+        .{ .label = "Erase the disk and partition it automatically", .sub = "GPT: BIOS boot 1 MiB, ESP 512 MiB, root (the rest; ext4 unless you choose another next). Everything on the disk is lost." },
         .{
             .label = "Partition by hand with cfdisk",
             .sub = if (env.cfdisk) "Runs cfdisk on the disk. This writes to the disk before the summary." else "cfdisk was not found.",
@@ -791,6 +798,31 @@ fn partitionItems(ui: *Ui, parts: []const Partition, skip: ?[]const u8) !struct 
     return .{ .items = items.items, .idx = idx.items };
 }
 
+/// The root filesystem (SPEC.md 5.3.4). Every filesystem is listed; one that cannot be
+/// used is greyed with the reason (a missing tool, or what the installed system lacks).
+fn screenRootFs(ui: *Ui, p: Probe, d: *Draft) !bool {
+    var items: std.ArrayList(Item) = .empty;
+    for (fs_mod.all) |f| {
+        const i = fs_mod.info(f);
+        const av = try fs_mod.availability(ui.arena, f, p.tools, p.kernel_builtin);
+        switch (av) {
+            .ok => try items.append(ui.arena, .{
+                .label = i.title,
+                .sub = ui.fmt("Needs {s} (package {s}), found.", .{ i.tools[0], i.package }),
+            }),
+            .unusable => |why| try items.append(ui.arena, .{
+                .label = i.title,
+                .sub = why,
+                .sub_attr = warn,
+                .enabled = false,
+            }),
+        }
+    }
+    const pick = try menu(ui, "Root filesystem", "What should / be formatted as? Greyed ones say what is missing.", items.items, @intFromEnum(d.root_fs)) orelse return false;
+    d.root_fs = fs_mod.all[pick];
+    return true;
+}
+
 fn screenRoot(ui: *Ui, d: *Draft) !bool {
     const disk = d.disk.?;
     const list = try partitionItems(ui, disk.partitions, null);
@@ -798,7 +830,7 @@ fn screenRoot(ui: *Ui, d: *Draft) !bool {
         _ = try message(ui, "Root partition", &.{"The disk has no partitions."}, danger, "Esc: back");
         return false;
     }
-    const pick = try menu(ui, "Root partition", "Which partition becomes /? It is always formatted as ext4 and everything on it is lost.", list.items, 0) orelse return false;
+    const pick = try menu(ui, "Root partition", ui.fmt("Which partition becomes /? It is always formatted as {s} and everything on it is lost.", .{fs_mod.info(d.root_fs).name}), list.items, 0) orelse return false;
     d.root = disk.partitions[list.idx[pick]];
     return true;
 }
@@ -1530,6 +1562,7 @@ fn buildAnswers(ui: *Ui, d: *const Draft, p: Probe) !answers_mod.Answers {
         .selinux = d.selinux,
         .disk = d.disk.?.name,
         .partitioning = d.partitioning,
+        .root_fs = d.root_fs,
         .root = if (d.root) |r| r.name else null,
         .esp = if (d.esp) |e| e.name else null,
         .bios_boot = if (d.bios_boot) |b| b.name else null,
@@ -1567,9 +1600,9 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
         if (describeContents(ui.arena, disk)) |c| {
             try lines.append(ui.arena, .{ .text = ui.fmt("  found: {s}", .{c}), .attr = danger });
         } else try lines.append(ui.arena, .{ .text = "  (nothing found on it)", .attr = dim });
-        try lines.append(ui.arena, .{ .text = "Layout: 1 MiB BIOS boot, 512 MiB ESP (FAT32), rest root (ext4)" });
+        try lines.append(ui.arena, .{ .text = ui.fmt("Layout: 1 MiB BIOS boot, 512 MiB ESP (FAT32), rest root ({s})", .{fs_mod.info(d.root_fs).name}) });
     } else {
-        try lines.append(ui.arena, .{ .text = ui.fmt("Root {s} will be FORMATTED (ext4); everything on it is lost.", .{d.root.?.path}), .attr = danger });
+        try lines.append(ui.arena, .{ .text = ui.fmt("Root {s} will be FORMATTED ({s}); everything on it is lost.", .{ d.root.?.path, fs_mod.info(d.root_fs).name }), .attr = danger });
         if (d.esp) |e| {
             try lines.append(ui.arena, if (d.format_esp)
                 .{ .text = ui.fmt("ESP {s} will be FORMATTED (FAT32).", .{e.path}), .attr = danger }
@@ -1968,7 +2001,8 @@ test "full flow, automatic layout, ends at a typed confirmation" {
 
     // checks Enter, disk (first = nvme0n1) Enter, auto Enter, hostname Enter, domain Enter,
     // root pw x2, user, user pw x2, timezone, keymap, summary Enter, confirm.
-    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter } ++
+    // checks, disk, partitioning, root filesystem (default ext4), hostname, domain
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter } ++
         testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
         testKeys("dakota") ++ [_]Key{.enter} ++
         testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++
@@ -1989,9 +2023,9 @@ test "Esc goes back one screen at a time" {
     defer st.deinit();
     const arena = st.allocator();
     const p = try loadFixture(arena, "uefi-nvme-blank.json");
-    // checks, disk, partitioning, hostname; Esc to partitioning; Esc to disk;
+    // checks, disk, partitioning, root filesystem, hostname; Esc to the root filesystem; Esc to partitioning; Esc to disk;
     // Esc to checks; Esc quits.
-    const keys = [_]Key{ .enter, .enter, .enter, .esc, .esc, .esc, .esc };
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .esc, .esc, .esc, .esc, .esc };
     var ui = try testUi(gpa, arena, &keys);
     defer ui.screen.deinit(gpa);
     const done = try run(&ui, p, .{ .is_root = true, .dry_run = true, .ids = test_ids });
@@ -2045,7 +2079,7 @@ test "full flow with services, ssh and network screens: manual network, key past
     // network: Manual (nothing) = 3rd item (Guided, Copy, Manual), then the services list: Done is
     // after the 11 services; ssh: Set up SSH, enable yes, root no, password yes, no key;
     // other: ntp, firewall, selinux as the image has them; summary; confirm.
-    const keys = [_]Key{ .enter, .enter, .enter, .enter } ++ testKeys("lab.test") ++ [_]Key{.enter} ++
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter } ++ testKeys("lab.test") ++ [_]Key{.enter} ++
         testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
         testKeys("dakota") ++ [_]Key{.enter} ++
         testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++

@@ -223,9 +223,11 @@ and cannot be picked. A filesystem is available when all three checks pass:
    systems do not have yet (docs/initramfs.md in the dkbuild repository), so it is
    shown as `needs an initramfs (not available yet)`. ZFS is never built in.
 3. **dklilo can read `/boot`.** dklilo reads ext2/3/4, btrfs and FAT but not XFS
-   or ZFS. For those two the layout gets a separate `/boot` partition (ext4,
-   1 GiB) between the ESP and the root; with existing partitions it must be
-   chosen (`boot` in the answers file) or the install is refused with that reason.
+   or ZFS. In this release those two are **listed but cannot be chosen**: the
+   reason shown is that `/boot` would need a separate partition or another boot
+   loader, which the installer does not offer yet. (A later release adds a boot
+   loader choice, GRUB reading XFS, and a separate `/boot`; dklilo's rules for
+   finding its config on a separate partition on UEFI have to be checked first.)
 
 | Choice | Needs on the live disc | Package | Kernel | `/boot` |
 |---|---|---|---|---|
@@ -233,8 +235,8 @@ and cannot be picked. A filesystem is available when all three checks pass:
 | ext3 | `mkfs.ext3` | e2fsprogs | built in (the ext4 driver) | on root |
 | ext2 | `mkfs.ext2` | e2fsprogs | built in (the ext4 driver) | on root |
 | btrfs | `mkfs.btrfs` | btrfs-progs | built in from linux r4 (a module before) | on root |
-| XFS | `mkfs.xfs` | xfsprogs | built in from linux r4 | separate ext4 `/boot` |
-| ZFS | `zpool`, `zfs` | zfs | module (linux-lts only); needs an initramfs with ZFS | separate ext4 `/boot` |
+| XFS | `mkfs.xfs` | xfsprogs | built in from linux r4 | **not selectable yet** (dklilo cannot read it) |
+| ZFS | `zpool`, `zfs` | zfs | module (linux-lts only); needs an initramfs with ZFS | **not selectable yet** |
 | FAT32 | `mkfs.vfat` | dosfstools | built in | the ESP only (never the root) |
 
 `mkfs.vfat` is always needed (the ESP, 5.3.1) and `mkfs.ext4` is needed for the

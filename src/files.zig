@@ -3,6 +3,7 @@
 //! Implements SPEC.md 5.3.1, 5.6 (steps 4, 5, 7, 8) and 6.1.
 
 const std = @import("std");
+const fs_mod = @import("fs.zig");
 const Allocator = std.mem.Allocator;
 
 /// GPT partition type GUIDs (lowercase, as `lsblk` prints them).
@@ -42,10 +43,17 @@ pub fn volIdToUuid(arena: Allocator, vol_id: []const u8) ![]u8 {
     return std.fmt.allocPrint(arena, "{s}-{s}", .{ vol_id[0..4], vol_id[4..8] });
 }
 
-/// `/etc/fstab`. `esp_uuid` is null when there is no ESP to mount.
+/// `/etc/fstab` with an ext4 root. `esp_uuid` is null when there is no ESP to mount.
 pub fn fstab(arena: Allocator, root_uuid: []const u8, esp_uuid: ?[]const u8) ![]u8 {
+    return fstabFor(arena, .ext4, root_uuid, esp_uuid);
+}
+
+/// `/etc/fstab` for a root filesystem of type `root_fs` (SPEC.md 5.3.4): its type, its
+/// mount options, and the fsck pass (0 for btrfs, XFS and ZFS, which have no boot-time fsck).
+pub fn fstabFor(arena: Allocator, root_fs: fs_mod.Fs, root_uuid: []const u8, esp_uuid: ?[]const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    const root = try std.fmt.allocPrint(arena, "UUID={s}  /          ext4  defaults    1 1\n", .{root_uuid});
+    const fi = fs_mod.info(root_fs);
+    const root = try std.fmt.allocPrint(arena, "UUID={s}  /          {s}  {s}    {d} {d}\n", .{ root_uuid, fi.fstab_type, fi.fstab_options, fi.fsck_pass, fi.fsck_pass });
     try out.appendSlice(arena, root);
     if (esp_uuid) |u| {
         const esp = try std.fmt.allocPrint(arena, "UUID={s}  /boot/efi  vfat  umask=0077  0 2\n", .{u});
@@ -216,4 +224,17 @@ test "idsFromBytes makes v4 UUIDs and an 8-digit volume id" {
     const ids = try idsFromBytes(st.allocator(), &bytes);
     try std.testing.expectEqualStrings("abababab-abab-4bab-abab-abababababab", ids.root_fs_uuid);
     try std.testing.expectEqualStrings("ABABABAB", ids.esp_vol_id);
+}
+
+test "fstab for each root filesystem" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const e = try fstabFor(a, .ext4, "r", "ABCD-1234");
+    try std.testing.expect(std.mem.indexOf(u8, e, "UUID=r  /          ext4  defaults    1 1\n") != null);
+    const b = try fstabFor(a, .btrfs, "r", null);
+    try std.testing.expect(std.mem.indexOf(u8, b, "UUID=r  /          btrfs  defaults,noatime    0 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b, "/boot/efi") == null);
+    const e2 = try fstabFor(a, .ext2, "r", null);
+    try std.testing.expect(std.mem.indexOf(u8, e2, "ext2  defaults    1 1") != null);
 }

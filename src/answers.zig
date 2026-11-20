@@ -4,7 +4,7 @@
 //! File format: TOML, one table per section. The complete, commented example is
 //! tests/auto/example.toml (also in docs/AUTOINSTALL.md). Sections:
 //!
-//!     [install]     disk, partitioning ("auto" or "existing"), confirm_erase, when_done
+//!     [install]     disk, partitioning ("auto" or "existing"), root_fs, confirm_erase, when_done
 //!     [partitions]  root, esp, bios_boot, format_esp, set_esp_type, set_bios_boot_type
 //!     [system]      hostname, domain, root_hash, user, user_hash, timezone, keymap,
 //!                   ntp, firewall, selinux
@@ -21,6 +21,7 @@
 //! section and key.
 
 const std = @import("std");
+const fs_mod = @import("fs.zig");
 const toml = @import("toml");
 const Allocator = std.mem.Allocator;
 
@@ -187,6 +188,8 @@ pub const Answers = struct {
     /// Kernel name of the target disk, e.g. "nvme0n1".
     disk: []const u8,
     partitioning: Partitioning,
+    /// The root filesystem (SPEC.md 5.3.4): ext4 by default.
+    root_fs: fs_mod.Fs = .ext4,
     /// Existing path: root partition, ESP and BIOS boot partition names.
     root: ?[]const u8 = null,
     esp: ?[]const u8 = null,
@@ -322,7 +325,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
     };
 
     const install = try p.section(root, "install") orelse return fail(diag, "[install] is required");
-    try p.only(install, &.{ "disk", "partitioning", "confirm_erase", "when_done" }, "install");
+    try p.only(install, &.{ "disk", "partitioning", "root_fs", "confirm_erase", "when_done" }, "install");
     a.disk = try p.str(install, "install", "disk") orelse return fail(diag, "[install] disk is required");
     a.partitioning = try p.enumv(Partitioning, install, "install", "partitioning", "auto or existing") orelse
         return fail(diag, "[install] partitioning is required");
@@ -331,6 +334,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
         a.confirm_erase = v;
     }
     if (try p.enumv(WhenDone, install, "install", "when_done", "reboot, poweroff or shell")) |v| a.when_done = v;
+    if (try p.enumv(fs_mod.Fs, install, "install", "root_fs", "ext4, ext3, ext2, btrfs, xfs or zfs")) |v| a.root_fs = v;
 
     if (try p.section(root, "partitions")) |t| {
         try p.only(t, &.{ "root", "esp", "bios_boot", "format_esp", "set_esp_type", "set_bios_boot_type" }, "partitions");
@@ -581,6 +585,24 @@ test "parse a full answers file" {
     try std.testing.expect(a.format_esp);
     try std.testing.expectEqualStrings("dkrescue", a.hostname);
     try std.testing.expectEqualStrings("Europe/Berlin", a.timezone);
+}
+
+test "root_fs: default ext4; a name from the list; anything else is an error" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tail =
+        \\[system]
+        \\root_hash = "$6$salt$roothash"
+        \\user = "dakota"
+        \\user_hash = "$6$salt$userhash"
+    ;
+    var diag: Diag = .{};
+    const d = try parse(arena, "[install]\ndisk = \"sda\"\npartitioning = \"auto\"\n" ++ tail, &diag);
+    try std.testing.expectEqual(fs_mod.Fs.ext4, d.root_fs);
+    const b = try parse(arena, "[install]\ndisk = \"sda\"\npartitioning = \"auto\"\nroot_fs = \"btrfs\"\n" ++ tail, &diag);
+    try std.testing.expectEqual(fs_mod.Fs.btrfs, b.root_fs);
+    try std.testing.expectError(error.BadAnswers, parse(arena, "[install]\ndisk = \"sda\"\npartitioning = \"auto\"\nroot_fs = \"ntfs\"\n" ++ tail, &diag));
 }
 
 test "parse the packages section" {

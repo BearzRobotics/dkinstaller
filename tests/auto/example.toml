@@ -7,6 +7,10 @@
 disk = "largest"
 # Existing partitions instead: partitioning = "existing" and a [partitions] section.
 partitioning = "auto"
+# The root filesystem: ext4 (the default), ext3, ext2 or btrfs. xfs and zfs are listed but refused for now
+# (dklilo cannot read XFS, ZFS needs an initramfs); a filesystem whose tools are not on the live disc, or that
+# the installed kernel cannot mount without an initramfs, is refused with the reason (SPEC.md 5.3.4).
+#root_fs = "ext4"
 # REQUIRED for an autoinstall. Must name the disk the plan erases: its path, its
 # kernel name, or a /dev/disk/by-id/... link to it. A selector is not enough.
 confirm_erase = "/dev/nvme0n1"

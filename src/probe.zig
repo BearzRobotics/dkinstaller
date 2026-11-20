@@ -5,6 +5,7 @@
 //! the running machine (`live`) or from a recorded fixture (`fromFixture`).
 
 const std = @import("std");
+const fs_mod = @import("fs.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const json = std.json;
@@ -91,6 +92,10 @@ pub const Probe = struct {
     net_stack: NetStack = .none,
     /// Connection files of the live NetworkManager (the session's own setup).
     live_connections: []const []const u8 = &.{},
+    /// Which of `fs.candidate_tools` (mkfs.btrfs, mkfs.xfs, zpool, ...) are in PATH on the live disc.
+    tools: []const []const u8 = &.{},
+    /// Which of `fs.kernel_symbols` (BTRFS_FS, XFS_FS) are `=y` in the target kernel's config.
+    kernel_builtin: []const []const u8 = &.{},
 
     /// Looks a disk up by kernel name or device path.
     pub fn findDisk(self: Probe, name_or_path: []const u8) ?Disk {
@@ -730,6 +735,8 @@ pub fn fromFixture(arena: Allocator, text: []const u8) !Probe {
         .net_ifaces = try fixtureIfaces(arena, o.get("net_ifaces")),
         .net_stack = if (str(o.get("net_stack"))) |t| (std.meta.stringToEnum(NetStack, t) orelse .none) else .none,
         .live_connections = try fixtureStrings(arena, o.get("live_connections")),
+        .tools = try fixtureStrings(arena, o.get("tools")),
+        .kernel_builtin = try fixtureStrings(arena, o.get("kernel_builtin")),
     };
 }
 
@@ -822,13 +829,14 @@ pub fn live(arena: Allocator, io: Io) !Probe {
     const services = try readServices(arena, io);
     const sfs = "/run/live/medium/live/rootfs.sfs";
     const is_live = exists(io, sfs);
+    const kernel = if (is_live) findKernel(arena, io, sfs) else null;
     return .{
         .firmware = if (exists(io, "/sys/firmware/efi")) .uefi else .bios,
         .efivars_rw = efivars_rw,
         .is_live = is_live,
         .live_medium_source = medium,
         .rootfs_size = rootfs_size,
-        .kernel = if (is_live) findKernel(arena, io, sfs) else null,
+        .kernel = kernel,
         .disks = try parseLsblk(arena, lsblk.stdout),
         .live_user = liveUser(arena, io),
         .services = services,
@@ -836,7 +844,53 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         .net_ifaces = try readNetIfaces(arena, io),
         .net_stack = detectStack(io, services),
         .live_connections = try readConnections(arena, io),
+        .tools = try liveTools(arena, io),
+        .kernel_builtin = try kernelBuiltin(arena, io, kernel),
     };
+}
+
+/// The optional programs (`fs.candidate_tools`) that are in PATH on the live disc.
+fn liveTools(arena: Allocator, io: Io) ![]const []const u8 {
+    const dirs = [_][]const u8{ "/usr/sbin", "/usr/bin", "/sbin", "/bin" };
+    var out: std.ArrayList([]const u8) = .empty;
+    for (fs_mod.candidate_tools) |tool| {
+        for (dirs) |dir| {
+            const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, tool });
+            if (exists(io, path)) {
+                try out.append(arena, tool);
+                break;
+            }
+        }
+    }
+    return out.items;
+}
+
+/// Which of `fs.kernel_symbols` are `=y` in `/boot/config-<version>` of the live system
+/// (the system image the new system is copied from has the same file). None if the
+/// config is not there: nothing is then claimed to be built in.
+fn kernelBuiltin(arena: Allocator, io: Io, kernel: ?[]const u8) ![]const []const u8 {
+    const k = kernel orelse return &.{};
+    const prefix = "vmlinuz-";
+    if (!std.mem.startsWith(u8, k, prefix)) return &.{};
+    const path = try std.fmt.allocPrint(arena, "/boot/config-{s}", .{k[prefix.len..]});
+    const text = readSmall(arena, io, path) orelse return &.{};
+    return builtinSymbols(arena, text);
+}
+
+/// The `fs.kernel_symbols` that a kernel config text has as `CONFIG_<name>=y`.
+pub fn builtinSymbols(arena: Allocator, config: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (fs_mod.kernel_symbols) |sym| {
+        const want = try std.fmt.allocPrint(arena, "CONFIG_{s}=y", .{sym});
+        var lines = std.mem.splitScalar(u8, config, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, std.mem.trim(u8, line, " \r\t"), want)) {
+                try out.append(arena, sym);
+                break;
+            }
+        }
+    }
+    return out.items;
 }
 
 /// Finds the highest `boot/vmlinuz-*` inside the system image.
@@ -889,4 +943,16 @@ test "a service whose dependency is not in the image is detected" {
     const svcs = [_]Service{ .{ .name = "dbus" }, .{ .name = "cupsd" } };
     try std.testing.expectEqualStrings("avahi-daemon", missingDependency("type = process\ndepends-on: dbus\ndepends-on: avahi-daemon\n", &svcs).?);
     try std.testing.expect(missingDependency("depends-on = dbus\nwaits-for: cupsd\nafter: nothing\n", &svcs) == null);
+}
+
+
+test "builtinSymbols finds =y, not =m or unset" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const syms = try builtinSymbols(a, "CONFIG_EXT4_FS=y\nCONFIG_BTRFS_FS=y\nCONFIG_XFS_FS=m\n# CONFIG_F2FS_FS is not set\n");
+    try std.testing.expectEqual(@as(usize, 1), syms.len);
+    try std.testing.expectEqualStrings("BTRFS_FS", syms[0]);
+    const none = try builtinSymbols(a, "CONFIG_BTRFS_FS=m\n");
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
