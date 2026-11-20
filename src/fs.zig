@@ -67,9 +67,15 @@ fn has(list: []const []const u8, name: []const u8) bool {
     return false;
 }
 
+/// Whether the chosen boot loader can read `/boot` on this root (SPEC.md 5.6.8).
+pub const BootCheck = struct {
+    readable: bool,
+    loader: []const u8,
+};
+
 /// SPEC.md 5.3.4: the tools first (so a missing tool is what the user is told,
 /// as the thing they can fix), then what the installed system cannot do yet.
-pub fn availability(arena: Allocator, fs: Fs, tools: []const []const u8, kernel_builtin: []const []const u8) Allocator.Error!Availability {
+pub fn availability(arena: Allocator, fs: Fs, tools: []const []const u8, kernel_builtin: []const []const u8, boot: BootCheck) Allocator.Error!Availability {
     const i = info(fs);
     var missing: std.ArrayList(u8) = .empty;
     var n: usize = 0;
@@ -88,8 +94,8 @@ pub fn availability(arena: Allocator, fs: Fs, tools: []const []const u8, kernel_
             return .{ .unusable = try std.fmt.allocPrint(arena, "{s} is a module in this kernel, so it needs an initramfs, which installed systems do not have yet (it is built in from linux r4)", .{i.name}) };
         }
     }
-    if (!i.boot_readable) {
-        return .{ .unusable = try std.fmt.allocPrint(arena, "dklilo cannot read {s}, so /boot would need a separate partition or another boot loader, which the installer does not offer yet", .{i.name}) };
+    if (!boot.readable) {
+        return .{ .unusable = try std.fmt.allocPrint(arena, "{s} cannot read {s}: choose GRUB or systemd-boot as the boot loader", .{ boot.loader, i.name }) };
     }
     return .ok;
 }
@@ -122,6 +128,9 @@ pub fn mkfsArgv(arena: Allocator, fs: Fs, label: []const u8, uuid: []const u8, d
 
 // ---------------------------------------------------------------- tests
 
+const ok_boot: BootCheck = .{ .readable = true, .loader = "dklilo" };
+const dklilo_boot: BootCheck = .{ .readable = false, .loader = "dklilo" };
+
 fn arenaTest() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(std.testing.allocator);
 }
@@ -130,37 +139,45 @@ test "ext4 is always available; the others need their tools" {
     var st = arenaTest();
     defer st.deinit();
     const a = st.allocator();
-    try std.testing.expect((try availability(a, .ext4, &.{}, &.{})) == .ok);
-    const e3 = try availability(a, .ext3, &.{}, &.{});
+    try std.testing.expect((try availability(a, .ext4, &.{}, &.{}, ok_boot)) == .ok);
+    const e3 = try availability(a, .ext3, &.{}, &.{}, ok_boot);
     try std.testing.expectEqualStrings("the live disc is missing mkfs.ext3 (package e2fsprogs)", e3.unusable);
-    try std.testing.expect((try availability(a, .ext3, &.{"mkfs.ext3"}, &.{})) == .ok);
+    try std.testing.expect((try availability(a, .ext3, &.{"mkfs.ext3"}, &.{}, ok_boot)) == .ok);
 }
 
 test "btrfs needs mkfs.btrfs and a kernel that has it built in" {
     var st = arenaTest();
     defer st.deinit();
     const a = st.allocator();
-    const no_tool = try availability(a, .btrfs, &.{}, &.{"BTRFS_FS"});
+    const no_tool = try availability(a, .btrfs, &.{}, &.{"BTRFS_FS"}, ok_boot);
     try std.testing.expectEqualStrings("the live disc is missing mkfs.btrfs (package btrfs-progs)", no_tool.unusable);
-    const module = try availability(a, .btrfs, &.{"mkfs.btrfs"}, &.{});
+    const module = try availability(a, .btrfs, &.{"mkfs.btrfs"}, &.{}, ok_boot);
     try std.testing.expect(std.mem.indexOf(u8, module.unusable, "needs an initramfs") != null);
-    try std.testing.expect((try availability(a, .btrfs, &.{"mkfs.btrfs"}, &.{"BTRFS_FS"})) == .ok);
+    try std.testing.expect((try availability(a, .btrfs, &.{"mkfs.btrfs"}, &.{"BTRFS_FS"}, ok_boot)) == .ok);
 }
 
 test "xfs and zfs are listed with the reason they cannot be chosen yet" {
     var st = arenaTest();
     defer st.deinit();
     const a = st.allocator();
-    const x = try availability(a, .xfs, &.{"mkfs.xfs"}, &.{"XFS_FS"});
+    const x = try availability(a, .xfs, &.{"mkfs.xfs"}, &.{"XFS_FS"}, dklilo_boot);
     try std.testing.expect(std.mem.indexOf(u8, x.unusable, "dklilo cannot read xfs") != null);
-    const xm = try availability(a, .xfs, &.{}, &.{});
+    const xm = try availability(a, .xfs, &.{}, &.{}, dklilo_boot);
     try std.testing.expectEqualStrings("the live disc is missing mkfs.xfs (package xfsprogs)", xm.unusable);
-    const z = try availability(a, .zfs, &.{ "zpool", "zfs" }, &.{});
+    const z = try availability(a, .zfs, &.{ "zpool", "zfs" }, &.{}, ok_boot);
     try std.testing.expect(std.mem.indexOf(u8, z.unusable, "initramfs") != null);
-    const zm = try availability(a, .zfs, &.{"zfs"}, &.{});
+    const zm = try availability(a, .zfs, &.{"zfs"}, &.{}, dklilo_boot);
     try std.testing.expectEqualStrings("the live disc is missing zpool (package zfs)", zm.unusable);
-    const zb = try availability(a, .zfs, &.{}, &.{});
+    const zb = try availability(a, .zfs, &.{}, &.{}, dklilo_boot);
     try std.testing.expectEqualStrings("the live disc is missing zpool and zfs (package zfs)", zb.unusable);
+}
+
+test "xfs is available once the loader can read it and the kernel has it built in" {
+    var st = arenaTest();
+    defer st.deinit();
+    const a = st.allocator();
+    const grub: BootCheck = .{ .readable = true, .loader = "grub" };
+    try std.testing.expect((try availability(a, .xfs, &.{"mkfs.xfs"}, &.{"XFS_FS"}, grub)) == .ok);
 }
 
 test "mkfs command lines" {

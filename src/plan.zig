@@ -8,6 +8,7 @@ const probe_mod = @import("probe.zig");
 const answers_mod = @import("answers.zig");
 const files = @import("files.zig");
 const fs_mod = @import("fs.zig");
+const bl_mod = @import("bootloader.zig");
 
 const Probe = probe_mod.Probe;
 const Disk = probe_mod.Disk;
@@ -302,7 +303,14 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
 
     // The root filesystem (SPEC.md 5.3.4): its tools are on the live disc and the
     // installed kernel can mount it; otherwise say why, before anything is written.
-    switch (try fs_mod.availability(arena, a.root_fs, p.tools, p.kernel_builtin)) {
+    const loader = a.bootloader;
+    const fw: bl_mod.Firmware = if (p.firmware == .uefi) .uefi else .bios;
+    switch (try bl_mod.availability(arena, loader, fw, p.tools, p.paths)) {
+        .ok => {},
+        .unusable => |why| return b.refuse("the boot loader {s} can't be used: {s}", .{ bl_mod.info(loader).name, why }),
+    }
+    const boot_check: fs_mod.BootCheck = .{ .readable = bl_mod.canReadRoot(loader, a.root_fs), .loader = bl_mod.info(loader).name };
+    switch (try fs_mod.availability(arena, a.root_fs, p.tools, p.kernel_builtin, boot_check)) {
         .ok => {},
         .unusable => |why| return b.refuse("the root filesystem {s} can't be used: {s}", .{ fs_mod.info(a.root_fs).name, why }),
     }
@@ -317,16 +325,28 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     // 2. Mount
     try b.cmd("Create the mount point", &.{ "mkdir", "-p", target });
     try b.cmd("Mount the root filesystem", &.{ "mount", layout.root_dev, target });
-    if (layout.esp_dev) |esp| {
+    // systemd-boot reads only the ESP, so the kernels live on it: it is /boot. The others
+    // keep /boot on the root and mount the ESP at /boot/efi.
+    const esp_at: []const u8 = if (loader == .@"systemd-boot") "/boot" else "/boot/efi";
+    const esp_mnt: []const u8 = if (loader == .@"systemd-boot") target ++ "/boot" else target ++ "/boot/efi";
+    if (layout.esp_dev) |esp| if (loader != .@"systemd-boot") {
         try b.cmd("Create /boot/efi", &.{ "mkdir", "-p", target ++ "/boot/efi" });
         try b.cmd("Mount the EFI System Partition", &.{ "mount", esp, target ++ "/boot/efi" });
-    }
+    };
 
     // 3. Copy the system
     try b.cmd("Copy the system from the disc image", &.{ "unsquashfs", "-percentage", "-f", "-d", target, rootfs_sfs });
+    if (loader == .@"systemd-boot") {
+        // /boot came in on the root; move what is there onto the ESP, which then covers it. (A copy
+        // straight to FAT would fail to set owners and modes, so the files are copied without them.)
+        const esp = layout.esp_dev orelse return b.refuse("systemd-boot needs an EFI System Partition", .{});
+        try b.cmd("Keep the kernel files aside", &.{ "sh", "-c", "mkdir -p " ++ boot_stash ++ " && cp -a " ++ target ++ "/boot/. " ++ boot_stash ++ "/ && rm -rf " ++ target ++ "/boot/*" });
+        try b.cmd("Mount the EFI System Partition as /boot", &.{ "mount", esp, target ++ "/boot" });
+        try b.cmd("Put the kernel files on the EFI System Partition", &.{ "sh", "-c", "cp -r --no-preserve=all " ++ boot_stash ++ "/. " ++ target ++ "/boot/ && rm -rf " ++ boot_stash });
+    }
 
     // 4. fstab
-    try b.file("Write fstab", target ++ "/etc/fstab", try files.fstabFor(arena, a.root_fs, layout.root_uuid, layout.esp_uuid), 0o644);
+    try b.file("Write fstab", target ++ "/etc/fstab", try files.fstabAt(arena, a.root_fs, layout.root_uuid, layout.esp_uuid, esp_at), 0o644);
 
     // 5. Identity
     try b.file("Set the hostname", target ++ "/etc/hostname", try files.hostnameFile(arena, a.hostname), 0o644);
@@ -368,6 +388,41 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     }
 
     // 8. Bootloader
+    switch (loader) {
+        .dklilo => try planDklilo(b, p, a, layout, disk, kernel),
+        .grub => try planGrub(b, p, layout, disk),
+        .@"systemd-boot" => try planSystemdBoot(b, p, layout),
+    }
+
+    // 9. Finish
+    try b.cmd("Copy the install log to the new system", &.{ "cp", log_path, target_log });
+    try planSelinux(b, a, layout.esp_dev != null, esp_at);
+    try b.cmd("Flush to disk", &.{"sync"});
+    if (layout.esp_dev != null) try b.cmd("Unmount the EFI System Partition", &.{ "umount", esp_mnt });
+    try b.cmd("Unmount the root filesystem", &.{ "umount", target });
+}
+
+/// Where the kernel files wait while the ESP is mounted over /boot (systemd-boot).
+const boot_stash = "/run/dkrescue-install/boot-stash";
+
+/// What the boot loader installers that run in the new system need: /dev, /proc and /sys
+/// (the last carries the EFI variables).
+fn bindMounts(b: *Builder) !void {
+    try b.cmd("Prepare the new system's /dev, /proc and /sys", &.{ "mkdir", "-p", target ++ "/dev", target ++ "/proc", target ++ "/sys" });
+    try b.cmd("Bind /dev into the new system", &.{ "mount", "--bind", "/dev", target ++ "/dev" });
+    try b.cmd("Mount /proc in the new system", &.{ "mount", "-t", "proc", "proc", target ++ "/proc" });
+    try b.cmd("Bind /sys into the new system", &.{ "mount", "--rbind", "/sys", target ++ "/sys" });
+}
+
+fn unbindMounts(b: *Builder) !void {
+    try b.cmd("Unmount /sys from the new system", &.{ "umount", "-R", target ++ "/sys" });
+    try b.cmd("Unmount /proc from the new system", &.{ "umount", target ++ "/proc" });
+    try b.cmd("Unmount /dev from the new system", &.{ "umount", target ++ "/dev" });
+}
+
+fn planDklilo(b: *Builder, p: Probe, a: Answers, layout: Layout, disk: Disk, kernel: []const u8) BuildError!void {
+    const arena = b.arena;
+    _ = a;
     try b.file("Write dklilo.conf", target ++ "/boot/dklilo.conf", try files.dkliloConf(arena, kernel, layout.root_partuuid), 0o644);
     switch (p.firmware) {
         .uefi => {
@@ -387,13 +442,49 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
         .bios => try b.cmd("Install dklilo (BIOS)", &.{ "dklilo", "install-bios", "--yes", disk.path }),
     }
     try b.cmd("Check dklilo.conf", &.{ "dklilo", "check", target ++ "/boot/dklilo.conf" });
+}
 
-    // 9. Finish
-    try b.cmd("Copy the install log to the new system", &.{ "cp", log_path, target_log });
-    try planSelinux(b, a, layout.esp_dev != null);
-    try b.cmd("Flush to disk", &.{"sync"});
-    if (layout.esp_dev != null) try b.cmd("Unmount the EFI System Partition", &.{ "umount", target ++ "/boot/efi" });
-    try b.cmd("Unmount the root filesystem", &.{ "umount", target });
+/// GRUB, installed from inside the new system. There is no initramfs, so the kernel is given
+/// root=PARTUUID (the kernel cannot resolve root=UUID itself).
+fn planGrub(b: *Builder, p: Probe, layout: Layout, disk: Disk) BuildError!void {
+    const arena = b.arena;
+    try b.cmd("GRUB: make /etc/default/grub.d", &.{ "mkdir", "-p", target ++ "/etc/default/grub.d" });
+    try b.file("GRUB: boot by partition id (the kernel has no initramfs to resolve root=UUID)", target ++ "/etc/default/grub.d/50-dkrescue-install.cfg", files.grub_dropin, 0o644);
+    try bindMounts(b);
+    switch (p.firmware) {
+        .uefi => {
+            const esp = layout.esp_dev.?;
+            const has_boot = if (layout.esp_fresh) false else (espBootx64(p, disk, esp));
+            const efi: []const []const u8 = &.{ "chroot", target, "grub-install", "--target=x86_64-efi", "--efi-directory=/boot/efi", "--bootloader-id=FenrirOS" };
+            const removable: []const []const u8 = &.{ "chroot", target, "grub-install", "--target=x86_64-efi", "--efi-directory=/boot/efi", "--removable" };
+            if (p.efivars_rw) {
+                try b.cmd("Install GRUB (UEFI boot entry)", efi);
+                if (!has_boot) try b.cmd("Install GRUB as the removable-media loader", removable);
+            } else if (!has_boot) {
+                try b.cmd("Install GRUB as the removable-media loader (efivars not writable)", removable);
+            } else {
+                return b.refuse("efivars is not writable and the ESP already has \\EFI\\BOOT\\BOOTX64.EFI, which is never replaced: nothing to install", .{});
+            }
+        },
+        .bios => try b.cmd("Install GRUB (BIOS)", &.{ "chroot", target, "grub-install", "--target=i386-pc", "--recheck", disk.path }),
+    }
+    try b.cmd("Write grub.cfg", &.{ "chroot", target, "update-grub" });
+    try unbindMounts(b);
+    _ = arena;
+}
+
+/// systemd-boot, installed from inside the new system with the ESP as /boot.
+fn planSystemdBoot(b: *Builder, p: Probe, layout: Layout) BuildError!void {
+    const arena = b.arena;
+    try b.file("systemd-boot: boot by partition id (the kernel has no initramfs to resolve root=UUID)", target ++ "/etc/default/systemd-boot", try files.systemdBootDefaults(arena, layout.root_partuuid), 0o644);
+    try bindMounts(b);
+    if (p.efivars_rw) {
+        try b.cmd("Install systemd-boot", &.{ "chroot", target, "bootctl", "install", "--esp-path=/boot" });
+    } else {
+        try b.cmd("Install systemd-boot (efivars not writable: no boot entry)", &.{ "chroot", target, "bootctl", "install", "--esp-path=/boot", "--no-variables" });
+    }
+    try b.cmd("Write the boot entries", &.{ "chroot", target, "gen-systemd-boot" });
+    try unbindMounts(b);
 }
 
 /// Where `setfiles` is looked for on the live system (which is what the new
@@ -407,7 +498,7 @@ pub const selinux_file_contexts = target ++ "/etc/selinux/targeted/contexts/file
 /// /etc/selinux/config), so a failure is a warning. The kernel command line
 /// is left alone: SELinux is the kernel's default security module and
 /// /etc/selinux/config decides the mode.
-fn planSelinux(b: *Builder, a: Answers, esp_mounted: bool) !void {
+fn planSelinux(b: *Builder, a: Answers, esp_mounted: bool, esp_at: []const u8) !void {
     if (a.selinux) |mode| {
         try b.steps.append(b.arena, .{
             .desc = try b.fmt("SELinux mode: {s} (/etc/selinux/config)", .{@tagName(mode)}),
@@ -425,7 +516,7 @@ fn planSelinux(b: *Builder, a: Answers, esp_mounted: bool) !void {
     try argv.appendSlice(b.arena, &.{ "setfiles", "-F", "-r", target });
     const skip = [_][]const u8{ "/proc", "/sys", "/dev", "/run", "/tmp" };
     for (skip) |d| try argv.appendSlice(b.arena, &.{ "-e", try b.fmt("{s}{s}", .{ target, d }) });
-    if (esp_mounted) try argv.appendSlice(b.arena, &.{ "-e", target ++ "/boot/efi" });
+    if (esp_mounted) try argv.appendSlice(b.arena, &.{ "-e", try b.fmt("{s}{s}", .{ target, esp_at }) });
     try argv.appendSlice(b.arena, &.{ selinux_file_contexts, target });
     try b.steps.append(b.arena, .{
         .desc = "SELinux: label the new system (only when its policy is installed)",
@@ -1045,6 +1136,94 @@ test "ext2 needs mkfs.ext2 on the live disc; ext4 (the default) needs nothing ex
     p.tools = &.{"mkfs.ext2"};
     const ok = try build(arena, p, a, test_ids);
     try std.testing.expect(contains(try dryRun(arena, ok.plan), "mkfs.ext2 -L dkrescue -U "));
+}
+
+test "GRUB on BIOS: a drop-in for root=PARTUUID, grub-install into the disk, update-grub, nothing for dklilo" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "bios-sata-windows.json");
+    p.tools = &.{ "grub-install", "update-grub" };
+    p.paths = &.{"/usr/lib/grub/i386-pc"};
+    var a = testAnswers("sda", .auto);
+    a.bootloader = .grub;
+    const r = try build(arena, p, a, test_ids);
+    const out = try dryRun(arena, r.plan);
+    try std.testing.expect(contains(out, "GRUB_DISABLE_LINUX_UUID=true"));
+    try std.testing.expect(contains(out, "chroot /run/dkrescue-install/target grub-install --target=i386-pc --recheck /dev/sda\n"));
+    try std.testing.expect(contains(out, "chroot /run/dkrescue-install/target update-grub\n"));
+    try std.testing.expect(contains(out, "mount --rbind /sys /run/dkrescue-install/target/sys"));
+    try std.testing.expect(contains(out, "umount -R /run/dkrescue-install/target/sys"));
+    try std.testing.expect(!contains(out, "dklilo"));
+    try std.testing.expect(!contains(out, "dklilo.conf"));
+}
+
+test "GRUB on UEFI installs for the x86_64-efi platform, ESP at /boot/efi" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-nvme-blank.json");
+    p.tools = &.{ "grub-install", "update-grub" };
+    p.paths = &.{"/usr/lib/grub/x86_64-efi"};
+    var a = testAnswers("nvme0n1", .auto);
+    a.bootloader = .grub;
+    const r = try build(arena, p, a, test_ids);
+    const out = try dryRun(arena, r.plan);
+    try std.testing.expect(contains(out, "grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable"));
+    try std.testing.expect(contains(out, "UUID=ABCD-1234  /boot/efi"));
+}
+
+test "systemd-boot: the ESP is /boot, the kernel files move onto it, bootctl and gen-systemd-boot run in the new system" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-nvme-blank.json");
+    p.tools = &.{ "bootctl", "gen-systemd-boot" };
+    p.paths = &.{"/usr/lib/systemd/boot/efi"};
+    var a = testAnswers("nvme0n1", .auto);
+    a.bootloader = .@"systemd-boot";
+    const r = try build(arena, p, a, test_ids);
+    const out = try dryRun(arena, r.plan);
+    try std.testing.expect(contains(out, "UUID=ABCD-1234  /boot  vfat"));
+    try std.testing.expect(!contains(out, "/boot/efi"));
+    try std.testing.expect(contains(out, "mount /dev/nvme0n1p2 /run/dkrescue-install/target/boot\n"));
+    // efivars is writable in this fixture: a boot entry is made
+    try std.testing.expect(contains(out, "chroot /run/dkrescue-install/target bootctl install --esp-path=/boot\n"));
+    try std.testing.expect(!contains(out, "--no-variables"));
+    try std.testing.expect(contains(out, "chroot /run/dkrescue-install/target gen-systemd-boot\n"));
+    try std.testing.expect(contains(out, "SD_BOOT_CMDLINE=\"root=PARTUUID=aaaaaaaa-0000-0000-0000-000000000003 quiet\""));
+    // the kernel files are moved before the ESP covers /boot, and the order of the whole thing holds
+    const keep = std.mem.indexOf(u8, out, "boot-stash").?;
+    const mnt = std.mem.indexOf(u8, out, "mount /dev/nvme0n1p2 /run/dkrescue-install/target/boot").?;
+    const bootctl = std.mem.indexOf(u8, out, "bootctl install").?;
+    try std.testing.expect(keep < mnt and mnt < bootctl);
+}
+
+test "a boot loader that cannot be used is refused with the reason; XFS needs GRUB or systemd-boot" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const base = try loadFixture(arena, "bios-sata-windows.json");
+    var a = testAnswers("sda", .auto);
+    a.bootloader = .grub;
+    const no_grub = try build(arena, base, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, no_grub.refused, "the live disc is missing grub-install and update-grub (package grub)") != null);
+    a.bootloader = .@"systemd-boot";
+    const sd = try build(arena, base, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, sd.refused, "boots UEFI machines only") != null);
+
+    // XFS: refused under dklilo, allowed under GRUB once its tools and the kernel have it
+    var p = base;
+    p.tools = &.{ "mkfs.xfs", "grub-install", "update-grub" };
+    p.paths = &.{"/usr/lib/grub/i386-pc"};
+    p.kernel_builtin = &.{"XFS_FS"};
+    a.root_fs = .xfs;
+    a.bootloader = .dklilo;
+    const under_dklilo = try build(arena, p, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, under_dklilo.refused, "dklilo cannot read xfs: choose GRUB or systemd-boot") != null);
+    a.bootloader = .grub;
+    const under_grub = try build(arena, p, a, test_ids);
+    try std.testing.expect(contains(try dryRun(arena, under_grub.plan), "mkfs.xfs -L dkrescue -m uuid="));
 }
 
 test "a keymap becomes a dinit service linked into boot.d; none, no service" {

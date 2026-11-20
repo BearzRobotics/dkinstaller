@@ -4,7 +4,7 @@
 //! File format: TOML, one table per section. The complete, commented example is
 //! tests/auto/example.toml (also in docs/AUTOINSTALL.md). Sections:
 //!
-//!     [install]     disk, partitioning ("auto" or "existing"), root_fs, confirm_erase, when_done
+//!     [install]     disk, partitioning ("auto" or "existing"), root_fs, bootloader, confirm_erase, when_done
 //!     [partitions]  root, esp, bios_boot, format_esp, set_esp_type, set_bios_boot_type
 //!     [system]      hostname, domain, root_hash, user, user_hash, timezone, keymap,
 //!                   ntp, firewall, selinux
@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const fs_mod = @import("fs.zig");
+const bl_mod = @import("bootloader.zig");
 const toml = @import("toml");
 const Allocator = std.mem.Allocator;
 
@@ -190,6 +191,8 @@ pub const Answers = struct {
     partitioning: Partitioning,
     /// The root filesystem (SPEC.md 5.3.4): ext4 by default.
     root_fs: fs_mod.Fs = .ext4,
+    /// The boot loader (SPEC.md 5.6.8): dklilo by default.
+    bootloader: bl_mod.Bootloader = .dklilo,
     /// Existing path: root partition, ESP and BIOS boot partition names.
     root: ?[]const u8 = null,
     esp: ?[]const u8 = null,
@@ -325,7 +328,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
     };
 
     const install = try p.section(root, "install") orelse return fail(diag, "[install] is required");
-    try p.only(install, &.{ "disk", "partitioning", "root_fs", "confirm_erase", "when_done" }, "install");
+    try p.only(install, &.{ "disk", "partitioning", "root_fs", "bootloader", "confirm_erase", "when_done" }, "install");
     a.disk = try p.str(install, "install", "disk") orelse return fail(diag, "[install] disk is required");
     a.partitioning = try p.enumv(Partitioning, install, "install", "partitioning", "auto or existing") orelse
         return fail(diag, "[install] partitioning is required");
@@ -335,6 +338,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
     }
     if (try p.enumv(WhenDone, install, "install", "when_done", "reboot, poweroff or shell")) |v| a.when_done = v;
     if (try p.enumv(fs_mod.Fs, install, "install", "root_fs", "ext4, ext3, ext2, btrfs, xfs or zfs")) |v| a.root_fs = v;
+    if (try p.enumv(bl_mod.Bootloader, install, "install", "bootloader", "dklilo, grub or systemd-boot")) |v| a.bootloader = v;
 
     if (try p.section(root, "partitions")) |t| {
         try p.only(t, &.{ "root", "esp", "bios_boot", "format_esp", "set_esp_type", "set_bios_boot_type" }, "partitions");

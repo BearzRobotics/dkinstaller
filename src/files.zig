@@ -51,17 +51,43 @@ pub fn fstab(arena: Allocator, root_uuid: []const u8, esp_uuid: ?[]const u8) ![]
 /// `/etc/fstab` for a root filesystem of type `root_fs` (SPEC.md 5.3.4): its type, its
 /// mount options, and the fsck pass (0 for btrfs, XFS and ZFS, which have no boot-time fsck).
 pub fn fstabFor(arena: Allocator, root_fs: fs_mod.Fs, root_uuid: []const u8, esp_uuid: ?[]const u8) ![]u8 {
+    return fstabAt(arena, root_fs, root_uuid, esp_uuid, "/boot/efi");
+}
+
+/// As `fstabFor`, with the ESP mounted at `esp_at` (`/boot/efi`; `/boot` for systemd-boot).
+pub fn fstabAt(arena: Allocator, root_fs: fs_mod.Fs, root_uuid: []const u8, esp_uuid: ?[]const u8, esp_at: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     const fi = fs_mod.info(root_fs);
     const root = try std.fmt.allocPrint(arena, "UUID={s}  /          {s}  {s}    {d} {d}\n", .{ root_uuid, fi.fstab_type, fi.fstab_options, fi.fsck_pass, fi.fsck_pass });
     try out.appendSlice(arena, root);
     if (esp_uuid) |u| {
-        const esp = try std.fmt.allocPrint(arena, "UUID={s}  /boot/efi  vfat  umask=0077  0 2\n", .{u});
+        const esp = try std.fmt.allocPrint(arena, "UUID={s}  {s}  vfat  umask=0077  0 2\n", .{ u, esp_at });
         try out.appendSlice(arena, esp);
     }
     try out.appendSlice(arena, "\n");
     try out.appendSlice(arena, base_fstab);
     return out.items;
+}
+
+/// `/etc/default/grub.d/50-dkrescue-install.cfg`: the kernel has no initramfs, so it can only
+/// find the root by `root=/dev/...` or `root=PARTUUID=`; GRUB's default `root=UUID=` would not boot.
+pub const grub_dropin =
+    \\# Written by dkrescue-install. The installed kernel has no initramfs, which is what turns a
+    \\# root=UUID=... into a device, so the kernel is given root=PARTUUID=... instead.
+    \\GRUB_DISABLE_LINUX_UUID=true
+    \\GRUB_DISABLE_LINUX_PARTUUID=false
+    \\
+;
+
+/// `/etc/default/systemd-boot`: `gen-systemd-boot` writes root=UUID=...; a later root= on the
+/// command line wins, so the PARTUUID given here (which the kernel can resolve without an initramfs) is used.
+pub fn systemdBootDefaults(arena: Allocator, root_partuuid: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena,
+        \\# Written by dkrescue-install. No initramfs: the kernel resolves root=PARTUUID, not root=UUID;
+        \\# the last root= on the command line is the one used.
+        \\SD_BOOT_CMDLINE="root=PARTUUID={s} quiet"
+        \\
+    , .{root_partuuid});
 }
 
 /// `/etc/hostname`.

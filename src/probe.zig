@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const fs_mod = @import("fs.zig");
+const bl_mod = @import("bootloader.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const json = std.json;
@@ -96,6 +97,8 @@ pub const Probe = struct {
     tools: []const []const u8 = &.{},
     /// Which of `fs.kernel_symbols` (BTRFS_FS, XFS_FS) are `=y` in the target kernel's config.
     kernel_builtin: []const []const u8 = &.{},
+    /// Which of `bootloader.candidate_paths` (GRUB's platform modules, systemd-boot's EFI files) exist.
+    paths: []const []const u8 = &.{},
 
     /// Looks a disk up by kernel name or device path.
     pub fn findDisk(self: Probe, name_or_path: []const u8) ?Disk {
@@ -737,6 +740,7 @@ pub fn fromFixture(arena: Allocator, text: []const u8) !Probe {
         .live_connections = try fixtureStrings(arena, o.get("live_connections")),
         .tools = try fixtureStrings(arena, o.get("tools")),
         .kernel_builtin = try fixtureStrings(arena, o.get("kernel_builtin")),
+        .paths = try fixtureStrings(arena, o.get("paths")),
     };
 }
 
@@ -846,6 +850,7 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         .live_connections = try readConnections(arena, io),
         .tools = try liveTools(arena, io),
         .kernel_builtin = try kernelBuiltin(arena, io, kernel),
+        .paths = try livePaths(arena, io),
     };
 }
 
@@ -853,7 +858,7 @@ pub fn live(arena: Allocator, io: Io) !Probe {
 fn liveTools(arena: Allocator, io: Io) ![]const []const u8 {
     const dirs = [_][]const u8{ "/usr/sbin", "/usr/bin", "/sbin", "/bin" };
     var out: std.ArrayList([]const u8) = .empty;
-    for (fs_mod.candidate_tools) |tool| {
+    for (fs_mod.candidate_tools ++ bl_mod.candidate_tools) |tool| {
         for (dirs) |dir| {
             const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, tool });
             if (exists(io, path)) {
@@ -862,6 +867,13 @@ fn liveTools(arena: Allocator, io: Io) ![]const []const u8 {
             }
         }
     }
+    return out.items;
+}
+
+/// The `bootloader.candidate_paths` that exist on the live disc.
+fn livePaths(arena: Allocator, io: Io) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (bl_mod.candidate_paths) |path| if (exists(io, path)) try out.append(arena, path);
     return out.items;
 }
 

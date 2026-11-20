@@ -14,6 +14,7 @@ const answers_mod = @import("../answers.zig");
 const plan_mod = @import("../plan.zig");
 const files = @import("../files.zig");
 const fs_mod = @import("../fs.zig");
+const bl_mod = @import("../bootloader.zig");
 const execute = @import("../execute.zig");
 
 const Key = term.Key;
@@ -394,6 +395,7 @@ const Scr = enum {
     checks,
     disk,
     partitioning,
+    bootloader,
     root_fs,
     cfdisk,
     root,
@@ -423,6 +425,8 @@ const Draft = struct {
     manual: bool = false,
     /// The root filesystem (SPEC.md 5.3.4).
     root_fs: fs_mod.Fs = .ext4,
+    /// The boot loader (SPEC.md 5.6.8).
+    bootloader: bl_mod.Bootloader = .dklilo,
     root: ?Partition = null,
     esp: ?Partition = null,
     bios_boot: ?Partition = null,
@@ -503,7 +507,10 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
                 if (try screenDisk(ui, p, &d)) go = .partitioning;
             },
             .partitioning => {
-                if (try screenPartitioning(ui, p, env, &d)) go = .root_fs;
+                if (try screenPartitioning(ui, p, env, &d)) go = .bootloader;
+            },
+            .bootloader => {
+                if (try screenBootloader(ui, p, &d)) go = .root_fs;
             },
             .root_fs => {
                 if (try screenRootFs(ui, p, &d)) go = if (d.manual) .cfdisk else if (d.partitioning == .auto) .hostname else .root;
@@ -800,11 +807,41 @@ fn partitionItems(ui: *Ui, parts: []const Partition, skip: ?[]const u8) !struct 
 
 /// The root filesystem (SPEC.md 5.3.4). Every filesystem is listed; one that cannot be
 /// used is greyed with the reason (a missing tool, or what the installed system lacks).
+fn screenBootloader(ui: *Ui, p: Probe, d: *Draft) !bool {
+    var items: std.ArrayList(Item) = .empty;
+    const fw: bl_mod.Firmware = if (p.firmware == .uefi) .uefi else .bios;
+    for (bl_mod.all) |b| {
+        const i = bl_mod.info(b);
+        switch (try bl_mod.availability(ui.arena, b, fw, p.tools, p.paths)) {
+            .ok => try items.append(ui.arena, .{
+                .label = i.title,
+                .sub = switch (b) {
+                    .dklilo => "Reads ext2/3/4, btrfs and FAT; not XFS. BIOS and UEFI.",
+                    .grub => "Reads ext2/3/4, btrfs and XFS. BIOS and UEFI.",
+                    .@"systemd-boot" => "Boots kernels from the EFI System Partition, so any root the kernel can mount works.",
+                },
+            }),
+            .unusable => |why| try items.append(ui.arena, .{
+                .label = i.title,
+                .sub = why,
+                .sub_attr = warn,
+                .enabled = false,
+            }),
+        }
+    }
+    const pick = try menu(ui, "Boot loader", "Which boot loader should start the new system? Greyed ones say what is missing.", items.items, @intFromEnum(d.bootloader)) orelse return false;
+    d.bootloader = bl_mod.all[pick];
+    // A root chosen under another loader may not be readable by this one: back to ext4, the one every loader reads.
+    if (!bl_mod.canReadRoot(d.bootloader, d.root_fs)) d.root_fs = .ext4;
+    return true;
+}
+
 fn screenRootFs(ui: *Ui, p: Probe, d: *Draft) !bool {
     var items: std.ArrayList(Item) = .empty;
     for (fs_mod.all) |f| {
         const i = fs_mod.info(f);
-        const av = try fs_mod.availability(ui.arena, f, p.tools, p.kernel_builtin);
+        const bc: fs_mod.BootCheck = .{ .readable = bl_mod.canReadRoot(d.bootloader, f), .loader = bl_mod.info(d.bootloader).name };
+        const av = try fs_mod.availability(ui.arena, f, p.tools, p.kernel_builtin, bc);
         switch (av) {
             .ok => try items.append(ui.arena, .{
                 .label = i.title,
@@ -1563,6 +1600,7 @@ fn buildAnswers(ui: *Ui, d: *const Draft, p: Probe) !answers_mod.Answers {
         .disk = d.disk.?.name,
         .partitioning = d.partitioning,
         .root_fs = d.root_fs,
+        .bootloader = d.bootloader,
         .root = if (d.root) |r| r.name else null,
         .esp = if (d.esp) |e| e.name else null,
         .bios_boot = if (d.bios_boot) |b| b.name else null,
@@ -1612,6 +1650,7 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
         if (d.set_esp_type) try lines.append(ui.arena, .{ .text = "The ESP's partition type will be changed.", .attr = warn });
         if (d.set_bios_boot_type) try lines.append(ui.arena, .{ .text = ui.fmt("{s} will become the BIOS boot partition.", .{d.bios_boot.?.path}), .attr = warn });
     }
+    try lines.append(ui.arena, .{ .text = ui.fmt("Boot loader: {s}   Root filesystem: {s}", .{ bl_mod.info(d.bootloader).name, fs_mod.info(d.root_fs).name }) });
     try lines.append(ui.arena, .{ .text = ui.fmt("Hostname: {s}   User: {s}   Timezone: {s}   Keymap: {s}", .{ d.hostname, d.user, d.timezone, d.keymap }) });
     try lines.append(ui.arena, .{ .text = "Passwords: root set, user set" });
     if (a.network) |n| {
@@ -2001,8 +2040,8 @@ test "full flow, automatic layout, ends at a typed confirmation" {
 
     // checks Enter, disk (first = nvme0n1) Enter, auto Enter, hostname Enter, domain Enter,
     // root pw x2, user, user pw x2, timezone, keymap, summary Enter, confirm.
-    // checks, disk, partitioning, root filesystem (default ext4), hostname, domain
-    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter } ++
+    // checks, disk, partitioning, boot loader (default dklilo), root filesystem (default ext4), hostname, domain
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter, .enter } ++
         testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
         testKeys("dakota") ++ [_]Key{.enter} ++
         testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++
@@ -2023,9 +2062,9 @@ test "Esc goes back one screen at a time" {
     defer st.deinit();
     const arena = st.allocator();
     const p = try loadFixture(arena, "uefi-nvme-blank.json");
-    // checks, disk, partitioning, root filesystem, hostname; Esc to the root filesystem; Esc to partitioning; Esc to disk;
+    // checks, disk, partitioning, boot loader, root filesystem, hostname; Esc back through each of them to the checks;
     // Esc to checks; Esc quits.
-    const keys = [_]Key{ .enter, .enter, .enter, .enter, .esc, .esc, .esc, .esc, .esc };
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .esc, .esc, .esc, .esc, .esc, .esc };
     var ui = try testUi(gpa, arena, &keys);
     defer ui.screen.deinit(gpa);
     const done = try run(&ui, p, .{ .is_root = true, .dry_run = true, .ids = test_ids });
@@ -2079,7 +2118,7 @@ test "full flow with services, ssh and network screens: manual network, key past
     // network: Manual (nothing) = 3rd item (Guided, Copy, Manual), then the services list: Done is
     // after the 11 services; ssh: Set up SSH, enable yes, root no, password yes, no key;
     // other: ntp, firewall, selinux as the image has them; summary; confirm.
-    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter } ++ testKeys("lab.test") ++ [_]Key{.enter} ++
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter } ++ testKeys("lab.test") ++ [_]Key{.enter} ++
         testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
         testKeys("dakota") ++ [_]Key{.enter} ++
         testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++
