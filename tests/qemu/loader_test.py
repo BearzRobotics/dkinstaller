@@ -35,6 +35,8 @@ keymap = "us"
 """
 
 INSTALL_TIMEOUT = 1800
+# The first boot of a fresh install can be slow on a busy host (seen: over five minutes while the disk was saturated, 34 s the next time).
+BOOT_TIMEOUT = 900
 
 
 def sh(*argv, **kw):
@@ -73,6 +75,21 @@ def run(child, cmd, timeout=60):
     child.sendline(cmd)
     child.expect("READY> ", timeout=timeout)
     return child.before
+
+
+def stop(child):
+    """Wait for the guest to power off; kill QEMU if it does not. Never raises."""
+    try:
+        child.expect(pexpect.EOF, timeout=120)
+    except Exception:
+        pass
+    try:
+        child.close(force=True)
+    except Exception:
+        try:
+            os.kill(child.pid, 9)
+        except Exception:
+            pass
 
 
 def live_login(child):
@@ -115,10 +132,7 @@ def main():
     log = run(child, "tail -60 /run/dkrescue-install/install.log 2>&1", timeout=60)
     (work / "install-log-tail.txt").write_text(log)
     child.sendline("sync; poweroff")
-    try:
-        child.expect(pexpect.EOF, timeout=180)
-    except pexpect.TIMEOUT:
-        child.close(force=True)
+    stop(child)
     done = "Installation complete." in out + log
     print(f"install: exit={code!r} complete={done}")
     if not done:
@@ -132,10 +146,10 @@ def main():
     argv = q.qemu_argv(args.firmware, work, [target])
     child = q.spawn(argv, work / "installed.log")
     try:
-        child.expect("login: ", timeout=300)
+        child.expect("login: ", timeout=BOOT_TIMEOUT)
     except (pexpect.TIMEOUT, pexpect.EOF):
         print(f"BOOT FAILED: no login prompt; see {work}/installed.log")
-        child.close(force=True)
+        stop(child)
         return 1
     print("boot: reached a login prompt")
     child.sendline("tester")
@@ -144,14 +158,11 @@ def main():
     child.expect(r"[#$]")
     time.sleep(1)
     prompt(child)
-    info = run(child, "uname -r; cat /proc/cmdline; findmnt -no SOURCE,FSTYPE,OPTIONS /; findmnt -no SOURCE,FSTYPE /boot /boot/efi 2>&1; ls /boot | head -12")
+    info = run(child, "uname -r; cat /proc/cmdline; findmnt -no SOURCE,FSTYPE,OPTIONS /; sudo findmnt -no TARGET,SOURCE,FSTYPE /boot /boot/efi 2>&1; sudo ls /boot | head -14")
     (work / "installed-info.txt").write_text(info)
     print(info)
     child.sendline("sudo poweroff")
-    try:
-        child.expect(pexpect.EOF, timeout=60)
-    except pexpect.TIMEOUT:
-        child.close(force=True)
+    stop(child)
     ok = True
     if args.root_fs != "ext4" and args.root_fs not in info:
         print(f"WARNING: root is not {args.root_fs}")

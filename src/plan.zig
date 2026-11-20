@@ -341,7 +341,7 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
         // straight to FAT would fail to set owners and modes, so the files are copied without them.)
         const esp = layout.esp_dev orelse return b.refuse("systemd-boot needs an EFI System Partition", .{});
         try b.cmd("Keep the kernel files aside", &.{ "sh", "-c", "mkdir -p " ++ boot_stash ++ " && cp -a " ++ target ++ "/boot/. " ++ boot_stash ++ "/ && rm -rf " ++ target ++ "/boot/*" });
-        try b.cmd("Mount the EFI System Partition as /boot", &.{ "mount", esp, target ++ "/boot" });
+        try b.cmd("Mount the EFI System Partition as /boot", &.{ "mount", "-o", "umask=0077", esp, target ++ "/boot" });
         try b.cmd("Put the kernel files on the EFI System Partition", &.{ "sh", "-c", "cp -r --no-preserve=all " ++ boot_stash ++ "/. " ++ target ++ "/boot/ && rm -rf " ++ boot_stash });
     }
 
@@ -366,6 +366,14 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     try b.cmd("Create the user", &.{ "useradd", "-R", target, "-m", "-G", "wheel,video,render", "-s", "/bin/bash", a.user });
     try b.cmdStdin("Set the user's password", chpasswdArgv(a.user_pw), try b.fmt("{s}:{s}\n", .{ a.user, pwText(a.user_pw) }), true);
     if (!std.mem.eql(u8, p.live_user, a.user)) try b.cmd("Remove the live disc's user", &.{ "userdel", "-R", target, "-r", p.live_user });
+    // The image logs the live user in on tty1 by itself (`agetty --autologin <user>` in /etc/dinit.d/tty1). In the new
+    // system that user is gone (or is the chosen user, who now has a password): a plain login prompt instead.
+    try b.steps.append(arena, .{
+        .desc = "Turn off the live disc's automatic login on tty1",
+        .action = .{ .command = .{ .argv = try arena.dupe([]const u8, &.{ "sed", "-i", try b.fmt("s| --autologin {s} | |", .{p.live_user}), target ++ "/etc/dinit.d/tty1" }) } },
+        .when = .{ .exists = &.{target ++ "/etc/dinit.d/tty1"} },
+        .soft = true,
+    });
 
     // 7. sudo
     const sudo_new = target ++ "/etc/sudoers.d/00-wheel.new";
@@ -1039,6 +1047,7 @@ test "auto layout on a blank UEFI NVMe machine" {
     try std.testing.expect(!contains(out, "install-bios"));
     try std.testing.expect(contains(out, "root = PARTUUID=aaaaaaaa-0000-0000-0000-000000000003"));
     try std.testing.expect(contains(out, "UUID=ABCD-1234  /boot/efi"));
+    try std.testing.expect(contains(out, "sed -i 's| --autologin rescue | |' /run/dkrescue-install/target/etc/dinit.d/tty1"));
     // Passwords never appear.
     try std.testing.expect(!contains(out, "rootsecret"));
     try std.testing.expect(!contains(out, "usersecret"));
@@ -1186,7 +1195,7 @@ test "systemd-boot: the ESP is /boot, the kernel files move onto it, bootctl and
     const out = try dryRun(arena, r.plan);
     try std.testing.expect(contains(out, "UUID=ABCD-1234  /boot  vfat"));
     try std.testing.expect(!contains(out, "/boot/efi"));
-    try std.testing.expect(contains(out, "mount /dev/nvme0n1p2 /run/dkrescue-install/target/boot\n"));
+    try std.testing.expect(contains(out, "mount -o umask=0077 /dev/nvme0n1p2 /run/dkrescue-install/target/boot\n"));
     // efivars is writable in this fixture: a boot entry is made
     try std.testing.expect(contains(out, "chroot /run/dkrescue-install/target bootctl install --esp-path=/boot\n"));
     try std.testing.expect(!contains(out, "--no-variables"));
@@ -1194,7 +1203,7 @@ test "systemd-boot: the ESP is /boot, the kernel files move onto it, bootctl and
     try std.testing.expect(contains(out, "SD_BOOT_CMDLINE=\"root=PARTUUID=aaaaaaaa-0000-0000-0000-000000000003 quiet\""));
     // the kernel files are moved before the ESP covers /boot, and the order of the whole thing holds
     const keep = std.mem.indexOf(u8, out, "boot-stash").?;
-    const mnt = std.mem.indexOf(u8, out, "mount /dev/nvme0n1p2 /run/dkrescue-install/target/boot").?;
+    const mnt = std.mem.indexOf(u8, out, "mount -o umask=0077 /dev/nvme0n1p2 /run/dkrescue-install/target/boot").?;
     const bootctl = std.mem.indexOf(u8, out, "bootctl install").?;
     try std.testing.expect(keep < mnt and mnt < bootctl);
 }
