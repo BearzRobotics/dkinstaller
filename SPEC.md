@@ -207,6 +207,50 @@ answers.
   like every other change, so it's written only after confirmation.
 - No partition is created, resized or deleted in this path.
 
+#### 5.3.4 Root filesystem (0.0.6)
+
+The root can be ext4 (the default), ext2, ext3, btrfs, XFS or ZFS. The screen
+**lists all of them**; one that cannot be used is shown greyed, with the reason,
+and cannot be picked. A filesystem is available when all three checks pass:
+
+1. **The tools are on the live disc.** Each filesystem needs programs from a
+   package. If one is missing the reason reads, for example, `the live disc is
+   missing mkfs.btrfs (package btrfs-progs)`. The checks use `PATH` of the live
+   system; the installer does not install packages.
+2. **The installed kernel can mount it without an initramfs.** The installer
+   reads the target's kernel config (`/boot/config-<kernel>`): `=y` means built
+   in. A filesystem that is only a module needs an initramfs, which installed
+   systems do not have yet (docs/initramfs.md in the dkbuild repository), so it is
+   shown as `needs an initramfs (not available yet)`. ZFS is never built in.
+3. **dklilo can read `/boot`.** dklilo reads ext2/3/4, btrfs and FAT but not XFS
+   or ZFS. For those two the layout gets a separate `/boot` partition (ext4,
+   1 GiB) between the ESP and the root; with existing partitions it must be
+   chosen (`boot` in the answers file) or the install is refused with that reason.
+
+| Choice | Needs on the live disc | Package | Kernel | `/boot` |
+|---|---|---|---|---|
+| ext4 | `mkfs.ext4` | e2fsprogs | built in | on root |
+| ext3 | `mkfs.ext3` | e2fsprogs | built in (the ext4 driver) | on root |
+| ext2 | `mkfs.ext2` | e2fsprogs | built in (the ext4 driver) | on root |
+| btrfs | `mkfs.btrfs` | btrfs-progs | built in from linux r4 (a module before) | on root |
+| XFS | `mkfs.xfs` | xfsprogs | built in from linux r4 | separate ext4 `/boot` |
+| ZFS | `zpool`, `zfs` | zfs | module (linux-lts only); needs an initramfs with ZFS | separate ext4 `/boot` |
+| FAT32 | `mkfs.vfat` | dosfstools | built in | the ESP only (never the root) |
+
+`mkfs.vfat` is always needed (the ESP, 5.3.1) and `mkfs.ext4` is needed for the
+separate `/boot`; both are on every live disc.
+
+Formatting: `mkfs.ext{2,3,4} -L <label> -U <uuid>`, `mkfs.btrfs -f -L <label> -U
+<uuid>`, `mkfs.xfs -f -L <label> -m uuid=<uuid>`. The fstab line carries the type
+and `0 0` as the fsck pass for btrfs, XFS and ZFS (`1 1` for ext2/3/4). With ZFS
+the installer would create the pool and dataset itself (`zpool create`, one
+`ROOT/fenriros` dataset, `bootfs`), set the hostid and write the cache file; that
+part is **not implemented** until the initramfs exists, which is why ZFS is
+listed but not selectable.
+
+The choice is `root_fs` in the answers file (`ext4` by default) and a screen
+after the partitioning choice.
+
 ### 5.4 System settings
 
 One screen per item, each with a sensible default:
@@ -490,7 +534,10 @@ shown is exactly what runs.
 The plan records every program its steps use, and 5.1 checks them all
 before the first screen. They're all on the live disc: util-linux
 (`lsblk`, `blkid`, `wipefs`, `sfdisk`, `cfdisk`, `mount`, `umount`),
-e2fsprogs, dosfstools, squashfs-tools, shadow, sudo (`visudo`) and dklilo.
+e2fsprogs, dosfstools, squashfs-tools, shadow, sudo (`visudo`) and dklilo. The
+programs of the optional root filesystems (5.3.4: `mkfs.btrfs`, `mkfs.xfs`, `zpool`,
+`zfs`) are **not** required: they are checked only for the filesystem chosen, and a
+missing one makes that filesystem unavailable instead of stopping the installer.
 
 ### 6.4 Log
 
