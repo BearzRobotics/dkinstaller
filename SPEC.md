@@ -1,6 +1,6 @@
 # dkrescue-install — Specification
 
-Status: **Draft v0.1** (program version 0.0.4). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.1** (program version 0.0.5). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -430,7 +430,10 @@ the system copy and before the bootloader:
 --repository INDEX --keys-dir KEYDIR add PKG...`, after copying the key
 into `TARGET/etc/apk/keys`. An apk failure is a soft failure.
 
-### 5.11 Autoinstall (0.0.4)
+### 5.11 Autoinstall (0.0.4; TOML answers files since 0.0.5)
+
+Since 0.0.5 the answers file (`--answers`, `--auto`) is TOML, read with toml-zig, and the files it looks for are
+`install/answers.toml` and `dkinstall.toml`; earlier releases read an older, non-TOML format that 0.0.5 no longer accepts.
 
 `dkrescue-install --auto` runs the unattended install without a typed
 confirmation. It needs all of: `dkinstall.auto=1` on the kernel command line
