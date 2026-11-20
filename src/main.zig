@@ -11,7 +11,7 @@ const usage =
     \\
     \\  (no options)       the interactive installer
     \\  --dry-run          print the plan instead of running it
-    \\  --answers FILE     take every answer from FILE (INI) instead of the screens;
+    \\  --answers FILE     take every answer from FILE (TOML) instead of the screens;
     \\                     the summary and its typed confirmation are still shown
     \\  --yes-really-erase DISK
     \\                     with --answers: no screens at all, for tests; DISK must
@@ -20,8 +20,8 @@ const usage =
     \\                     (/proc /sys /dev /run bound in, unbound afterwards); for tests
     \\                     and repairs: the same helper as the install's shell
     \\  --auto             autoinstall: only with dkinstall.auto=1 on the kernel command line;
-    \\                     finds the answers file (dkinstall.answers=PATH, <live medium>/install/answers.ini,
-    \\                     dkinstall.ini on a mounted or mountable medium), checks the safety gates
+    \\                     finds the answers file (dkinstall.answers=PATH, <live medium>/install/answers.toml,
+    \\                     dkinstall.toml on a mounted or mountable medium), checks the safety gates
     \\                     (docs/AUTOINSTALL.md) and installs with no screens, else the normal screens
     \\  --cmdline FILE     with --auto: read the kernel command line from FILE (tests)
     \\  --repo PATH       package repository medium (a mount point holding apks/<arch>/
@@ -162,7 +162,10 @@ pub fn main(init: std.process.Init) !u8 {
         };
         var diag: dk.answers.Diag = .{};
         file_answers = dk.answers.parse(arena, ans_text, &diag) catch {
-            try err.print("{s}:{d}: {s}\n", .{ ans_path, diag.line, diag.message });
+            if (diag.line != 0)
+                try err.print("{s}:{d}: {s}\n", .{ ans_path, diag.line, diag.message })
+            else
+                try err.print("{s}: {s}\n", .{ ans_path, diag.message });
             return 1;
         };
         if (erase_disk) |d| if (!std.mem.eql(u8, d, file_answers.?.disk)) {
@@ -390,7 +393,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 /// Mounts each candidate medium read-only (never anything already mounted, the
-/// live medium or a loop/ram device), looks for `dkinstall.ini` at its root,
+/// live medium or a loop/ram device), looks for `dkinstall.toml` at its root,
 /// and leaves the first that has it mounted so the file stays readable.
 fn mountAndDiscover(arena: std.mem.Allocator, io: Io, err: *Io.Writer) !?dk.auto.Found {
     const p = dk.probe.live(arena, io) catch return null;

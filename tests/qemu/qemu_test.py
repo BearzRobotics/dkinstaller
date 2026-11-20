@@ -31,16 +31,16 @@ LOGIN_TIMEOUT = 300
 INSTALL_TIMEOUT = 1800
 
 ANSWERS = """[install]
-disk = {disk}
-partitioning = auto
+disk = "{disk}"
+partitioning = "auto"
 
 [system]
-hostname = qemutest
-root_hash = {hash}
-user = tester
-user_hash = {hash}
-timezone = UTC
-keymap = us
+hostname = "qemutest"
+root_hash = "{hash}"
+user = "tester"
+user_hash = "{hash}"
+timezone = "UTC"
+keymap = "us"
 """
 
 
@@ -72,7 +72,7 @@ def make_disks(work, with_seed):
         seed_dir.mkdir()
         pw = subprocess.run(["openssl", "passwd", "-6", "-salt", "qemusalt", "testpw"],
                             check=True, capture_output=True, text=True).stdout.strip()
-        (seed_dir / "answers.ini").write_text(ANSWERS.format(disk=DISK, hash=pw))
+        (seed_dir / "answers.toml").write_text(ANSWERS.format(disk=DISK, hash=pw))
         seed = work / "seed.img"
         with open(seed, "wb") as f:
             f.truncate(16 * 1024**2)
@@ -152,7 +152,7 @@ def boot_live(args, work, extra_env=""):
 def cmd_install(args):
     work = args.workdir or tempfile.mkdtemp(prefix="dkinstall-qemu-")
     child, guard, before = boot_live(args, work)
-    child.sendline("dkrescue-install --answers /mnt/seed/answers.ini --yes-really-erase %s; echo EXIT=$?" % DISK)
+    child.sendline("dkrescue-install --answers /mnt/seed/answers.toml --yes-really-erase %s; echo EXIT=$?" % DISK)
     child.expect(r"EXIT=(\d+)", timeout=INSTALL_TIMEOUT)
     code = child.match.group(1)
     run(child, "cp /run/dkrescue-install/install.log /mnt/seed/ 2>/dev/null; true")
@@ -168,7 +168,7 @@ def cmd_inject(args):
     work = args.workdir or tempfile.mkdtemp(prefix="dkinstall-qemu-")
     child, guard, before = boot_live(args, work)
     run(child, f"mkdir -p /tmp/shim && printf '#!/bin/sh\\necho injected failure >&2\\nexit 7\\n' > /tmp/shim/{args.program} && chmod +x /tmp/shim/{args.program}")
-    child.sendline("PATH=/tmp/shim:$PATH dkrescue-install --answers /mnt/seed/answers.ini --yes-really-erase %s; echo EXIT=$?" % DISK)
+    child.sendline("PATH=/tmp/shim:$PATH dkrescue-install --answers /mnt/seed/answers.toml --yes-really-erase %s; echo EXIT=$?" % DISK)
     child.expect(r"EXIT=(\d+)", timeout=INSTALL_TIMEOUT)
     code, out = child.match.group(1), child.before
     log = run(child, "cat /run/dkrescue-install/install.log", timeout=30)

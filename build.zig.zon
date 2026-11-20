@@ -3,7 +3,13 @@
     .version = "0.0.4",
     .fingerprint = 0x270add8a4470dc74,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        // The TOML library (the same one dkbuild reads recipes with), pinned to its published release.
+        .toml = .{
+            .url = "https://github.com/BearzRobotics/toml-zig/releases/download/v0.2.0/toml-0.2.0.tar.gz",
+            .hash = "toml-0.2.0-dDatLIhiAgBq8q4SLFu0RZSUcCJLAwl49UZRIZ-fHqqx",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

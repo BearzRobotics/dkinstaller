@@ -12,8 +12,8 @@ pub const Probe = probe_mod.Probe;
 pub const Disk = probe_mod.Disk;
 
 /// Where the answers file is looked for on a medium root, by convention.
-pub const live_medium_file = "install/answers.ini";
-pub const removable_file = "dkinstall.ini";
+pub const live_medium_file = "install/answers.toml";
+pub const removable_file = "dkinstall.toml";
 /// Where the installer mounts a removable medium to read the file.
 pub const mount_point = "/mnt/dkinstall-auto";
 
@@ -60,7 +60,7 @@ fn isFile(io: Io, path: []const u8) bool {
 }
 
 /// The first answers file, in this order: the explicit path, the live
-/// medium's `install/answers.ini`, then `dkinstall.ini` at the root of a
+/// medium's `install/answers.toml`, then `dkinstall.toml` at the root of a
 /// mounted medium. An explicit path that does not exist is not replaced by
 /// a later one: it is null (the caller says so).
 pub fn discover(arena: Allocator, io: Io, o: DiscoverOpts) Allocator.Error!?Found {
@@ -174,8 +174,8 @@ fn ans(disk: []const u8, confirm: ?[]const u8) answers_mod.Answers {
 test "kernel command line" {
     try std.testing.expect(parseCmdline("quiet root=live:LABEL=X dkinstall.auto=1").auto);
     try std.testing.expect(!parseCmdline("quiet dkinstall.auto=0 xdkinstall.auto=1").auto);
-    try std.testing.expectEqualStrings("/mnt/a.ini", parseCmdline("dkinstall.auto=1 dkinstall.answers=/mnt/a.ini").answers.?);
-    try std.testing.expect(parseCmdline("dkinstall.answers=http://x/a.ini").answers == null);
+    try std.testing.expectEqualStrings("/mnt/a.toml", parseCmdline("dkinstall.auto=1 dkinstall.answers=/mnt/a.toml").answers.?);
+    try std.testing.expect(parseCmdline("dkinstall.answers=http://x/a.toml").answers == null);
 }
 
 test "discovery order: explicit, live medium, then a mounted medium" {
@@ -187,8 +187,8 @@ test "discovery order: explicit, live medium, then a mounted medium" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
     try tmp.dir.createDirPath(std.testing.io, "live/install");
     try tmp.dir.createDirPath(std.testing.io, "media/usb1");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "media/usb1/dkinstall.ini", .data = "x" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "given.ini", .data = "x" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "media/usb1/dkinstall.toml", .data = "x" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "given.toml", .data = "x" });
     const live = try std.fmt.allocPrint(arena, "{s}/live", .{root});
     const media = try std.fmt.allocPrint(arena, "{s}/media", .{root});
     const roots = [_][]const u8{media};
@@ -196,17 +196,17 @@ test "discovery order: explicit, live medium, then a mounted medium" {
     // Only the medium has one.
     var f = (try discover(arena, std.testing.io, .{ .live_medium = live, .media_roots = &roots })).?;
     try std.testing.expectEqual(Source.mounted_medium, f.source);
-    try std.testing.expect(std.mem.endsWith(u8, f.path, "media/usb1/dkinstall.ini"));
+    try std.testing.expect(std.mem.endsWith(u8, f.path, "media/usb1/dkinstall.toml"));
     // The live medium's file wins over it.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "live/install/answers.ini", .data = "x" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "live/install/answers.toml", .data = "x" });
     f = (try discover(arena, std.testing.io, .{ .live_medium = live, .media_roots = &roots })).?;
     try std.testing.expectEqual(Source.live_medium, f.source);
     // An explicit path wins over both.
-    const given = try std.fmt.allocPrint(arena, "{s}/given.ini", .{root});
+    const given = try std.fmt.allocPrint(arena, "{s}/given.toml", .{root});
     f = (try discover(arena, std.testing.io, .{ .explicit = given, .live_medium = live, .media_roots = &roots })).?;
     try std.testing.expectEqual(Source.explicit, f.source);
     // An explicit path that is missing is not replaced by a later one.
-    try std.testing.expect((try discover(arena, std.testing.io, .{ .explicit = "/nonexistent/a.ini", .live_medium = live, .media_roots = &roots })) == null);
+    try std.testing.expect((try discover(arena, std.testing.io, .{ .explicit = "/nonexistent/a.toml", .live_medium = live, .media_roots = &roots })) == null);
     // Nothing anywhere.
     try std.testing.expect((try discover(arena, std.testing.io, .{ .live_medium = "/nonexistent", .media_roots = &.{"/nonexistent"} })) == null);
 }

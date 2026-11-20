@@ -21,39 +21,44 @@ import qemu_test as q
 
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl me@host"
 ANSWERS = """[install]
-disk = vda
-partitioning = auto
+disk = "vda"
+partitioning = "auto"
 
 [system]
-hostname = qemutest
-domain = lab.test
-root_hash = {hash}
-user = tester
-user_hash = {hash}
-timezone = Europe/Berlin
-keymap = us
+hostname = "qemutest"
+domain = "lab.test"
+root_hash = "{hash}"
+user = "tester"
+user_hash = "{hash}"
+timezone = "Europe/Berlin"
+keymap = "us"
 ntp = true
 firewall = false
-selinux = enforcing
+selinux = "enforcing"
 
 [services]
-enable = bluetoothd
-disable = greetd
+enable = ["bluetoothd"]
+disable = ["greetd"]
 
 [ssh]
 enable = true
-root_login = no
+root_login = "no"
 password_auth = false
-authorized_key = {key}
+authorized_key = "{key}"
 
 [network]
-mode = guided
-iface = @IFACE@ static 10.0.2.15/24 10.0.2.2
-dns = 10.0.2.3
-search = lab.test
+mode = "guided"
+dns = ["10.0.2.3"]
+search = "lab.test"
+
+[[network.iface]]
+name = "@IFACE@"
+kind = "static"
+address = "10.0.2.15/24"
+gateway = "10.0.2.2"
 
 [packages]
-install = no-such-package-dk
+install = ["no-such-package-dk"]
 """
 
 
@@ -63,7 +68,7 @@ def make_seed(work, binary):
     shutil.rmtree(seed_dir, ignore_errors=True)
     (seed_dir / "repo/apks/x86_64").mkdir(parents=True)
     pw = subprocess.run(["openssl", "passwd", "-6", "-salt", "qemusalt", "testpw"], check=True, capture_output=True, text=True).stdout.strip()
-    (seed_dir / "answers.ini").write_text(ANSWERS.format(hash=pw, key=KEY))
+    (seed_dir / "answers.toml").write_text(ANSWERS.format(hash=pw, key=KEY))
     shutil.copy(binary, seed_dir / "dkrescue-install")
     (seed_dir / "repo/apks/x86_64/APKINDEX.tar.gz").write_text("not a real index\n")
     (seed_dir / "repo/apks/x86_64/test.pub").write_text("not a real key\n")
@@ -114,9 +119,9 @@ def main():
         child.expect("READY> ")
 
     run("mkdir -p /mnt/seed && mount -o ro /dev/vdc /mnt/seed && cp /mnt/seed/dkrescue-install /usr/sbin/dkrescue-install && chmod +x /usr/sbin/dkrescue-install")
-    run("IF=$(ls /sys/class/net | grep -v '^lo$' | head -1); sed \"s/@IFACE@/$IF/\" /mnt/seed/answers.ini > /tmp/answers.ini; echo IFACE=$IF")
-    out = run("grep -c . /tmp/answers.ini")
-    child.sendline("dkrescue-install --answers /tmp/answers.ini --yes-really-erase vda --repo /mnt/seed/repo 2>&1 | tee /tmp/install.out; echo EXIT=${PIPESTATUS[0]}")
+    run("IF=$(ls /sys/class/net | grep -v '^lo$' | head -1); sed \"s/@IFACE@/$IF/\" /mnt/seed/answers.toml > /tmp/answers.toml; echo IFACE=$IF")
+    out = run("grep -c . /tmp/answers.toml")
+    child.sendline("dkrescue-install --answers /tmp/answers.toml --yes-really-erase vda --repo /mnt/seed/repo 2>&1 | tee /tmp/install.out; echo EXIT=${PIPESTATUS[0]}")
     child.expect(r"EXIT=(\d+)", timeout=q.INSTALL_TIMEOUT)
     code = child.match.group(1)
     child.expect("READY> ")  # the prompt after the install, so run() stays in step

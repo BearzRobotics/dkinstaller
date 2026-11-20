@@ -1,68 +1,27 @@
-//! The user's choices, and the answers-file (INI) parser.
+//! The user's choices, and the answers-file (TOML) parser.
 //! Implements SPEC.md 5.3, 5.4, 6.1 and 7.
 //!
-//! File format:
+//! File format: TOML, one table per section. The complete, commented example is
+//! tests/auto/example.toml (also in docs/AUTOINSTALL.md). Sections:
 //!
-//!     [install]
-//!     disk = nvme0n1
-//!     partitioning = auto            # or: existing
-//!     confirm_erase = /dev/nvme0n1   # autoinstall: must name the disk that is erased
-//!     when_done = reboot             # autoinstall: reboot, poweroff or shell
+//!     [install]     disk, partitioning ("auto" or "existing"), confirm_erase, when_done
+//!     [partitions]  root, esp, bios_boot, format_esp, set_esp_type, set_bios_boot_type
+//!     [system]      hostname, domain, root_hash, user, user_hash, timezone, keymap,
+//!                   ntp, firewall, selinux
+//!     [services]    enable = ["name"], disable = ["name"]
+//!     [ssh]         enable, root_login, password_auth, authorized_key, generate_key,
+//!                   allow_lockout
+//!     [network]     mode, copy, dns = [..], search, wifi_ssid, wifi_psk, wifi_hidden,
+//!                   and one [[network.iface]] (name, kind, address, gateway) per interface
+//!     [packages]    install = ["name"], keep_repo
+//!     [post]        commands = ["sh -c command", ...]
 //!
-//!     [partitions]                   # existing only
-//!     root = nvme0n1p3
-//!     esp = nvme0n1p2
-//!     bios_boot = nvme0n1p1
-//!     format_esp = false
-//!     set_esp_type = false
-//!     set_bios_boot_type = false
-//!
-//!     [system]
-//!     hostname = dkrescue
-//!     root_hash = $6$...
-//!     user = dakota
-//!     user_hash = $6$...
-//!     timezone = UTC
-//!     keymap = us
-//!
-//!     ntp = true                     # optional: NTP service on/off (omitted: as the image has it)
-//!     firewall = true                # optional: firewalld on/off
-//!     selinux = permissive           # optional: permissive, enforcing or disabled
-//!
-//!     [services]                     # optional: switch dinit services (omitted: as the image has them)
-//!     enable = cupsd
-//!     disable = avahi-daemon
-//!
-//!     [ssh]                          # optional: absent = leave sshd as the image has it
-//!     enable = true
-//!     root_login = no                # no, prohibit-password or yes
-//!     password_auth = false
-//!     authorized_key = ssh-ed25519 AAAA... user@host   # for the new user
-//!     generate_key = false           # make an ed25519 pair for the user
-//!     allow_lockout = false          # allow password_auth = false with no key
-//!
-//!     domain = example.org           # optional: hosts gets host.domain
-//!
-//!     [network]                      # optional: absent = nothing configured, as the image defaults
-//!     mode = guided                  # guided, copy (the live session's connection), manual (nothing, services off)
-//!                                    # or manual-shell (a chroot shell during the install; unattended: skipped)
-//!     copy = Wired connection 1      # mode = copy: a file in the live /etc/NetworkManager/system-connections
-//!     iface = eth0 dhcp              # repeatable: NAME dhcp | disabled | static ADDR/PREFIX [GATEWAY]
-//!     iface = eth1 static 192.168.1.5/24 192.168.1.1
-//!     dns = 1.1.1.1 2606:4700:4700::1111
-//!     search = example.org
-//!     wifi_ssid = Home               # WiFi: the passphrase is never printed or logged
-//!     wifi_psk = correct horse battery
-//!     wifi_hidden = false
-//!
-//!     [post]                         # optional: commands run in the new system, last
-//!     commands = echo hello > /etc/motd   # repeatable; each runs with sh -c in a chroot (no /proc); a failure is a warning
-//!
-//!     [packages]                     # optional: from the repository medium
-//!     install = nano htop            # package names, space separated
-//!     keep_repo = false              # leave the repository, commented out, in /etc/apk/repositories
+//! Passwords are crypt(3) hashes, never plain text. Unknown sections and keys
+//! are errors. A syntax error reports line and column; a wrong value names its
+//! section and key.
 
 const std = @import("std");
+const toml = @import("toml");
 const Allocator = std.mem.Allocator;
 
 /// How the disk is partitioned (manual `cfdisk` ends up as `existing`).
@@ -338,17 +297,22 @@ pub fn validPackageName(name: []const u8) bool {
     return true;
 }
 
-fn parseBool(v: []const u8) ?bool {
-    if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "1")) return true;
-    if (std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no") or std.mem.eql(u8, v, "0")) return false;
-    return null;
-}
-
-/// Parses an answers file. Strings are copied into `arena`. On failure
-/// `diag` says which line was wrong.
+/// Parses an answers file (TOML). Strings are copied into `arena`. On
+/// failure `diag.message` says what was wrong: the line and column for a
+/// syntax error, the section and key for a wrong value.
 pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
-    var disk: ?[]const u8 = null;
-    var partitioning: ?Partitioning = null;
+    var tdiag: toml.Diagnostic = .{};
+    const doc = toml.Document.parse(arena, text, .{}, &tdiag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            diag.line = tdiag.line;
+            return fail(diag, try std.fmt.allocPrint(arena, "column {d}: {s}", .{ tdiag.column, tdiag.message }));
+        },
+    };
+    const root = doc.root;
+    var p: Parser = .{ .arena = arena, .diag = diag };
+    try p.only(root, &.{ "install", "partitions", "system", "services", "ssh", "network", "packages", "post" }, "");
+
     var a: Answers = .{
         .disk = "",
         .partitioning = .auto,
@@ -356,205 +320,222 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
         .user = "",
         .user_pw = .{ .hash = "" },
     };
-    var have_root_hash = false;
-    var have_user = false;
-    var have_user_hash = false;
-    var ssh_v: Ssh = .{};
-    var ssh_seen = false;
-    var post: std.ArrayList([]const u8) = .empty;
-    var net_v: Network = .{};
-    var net_seen = false;
-    var ifaces: std.ArrayList(Iface) = .empty;
-    var wifi_ssid: ?[]const u8 = null;
-    var wifi_psk: ?[]const u8 = null;
-    var wifi_hidden = false;
 
-    var section: []const u8 = "";
-    var line_no: usize = 0;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        line_no += 1;
-        diag.line = line_no;
-        var line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
-        if (line[0] == '[') {
-            if (line[line.len - 1] != ']') return fail(diag, "unterminated section header");
-            section = line[1 .. line.len - 1];
-            continue;
+    const install = try p.section(root, "install") orelse return fail(diag, "[install] is required");
+    try p.only(install, &.{ "disk", "partitioning", "confirm_erase", "when_done" }, "install");
+    a.disk = try p.str(install, "install", "disk") orelse return fail(diag, "[install] disk is required");
+    a.partitioning = try p.enumv(Partitioning, install, "install", "partitioning", "auto or existing") orelse
+        return fail(diag, "[install] partitioning is required");
+    if (try p.str(install, "install", "confirm_erase")) |v| {
+        if (v.len == 0 or v[0] != '/' and !validIfaceName(v)) return fail(diag, "confirm_erase must be a device path or a kernel name");
+        a.confirm_erase = v;
+    }
+    if (try p.enumv(WhenDone, install, "install", "when_done", "reboot, poweroff or shell")) |v| a.when_done = v;
+
+    if (try p.section(root, "partitions")) |t| {
+        try p.only(t, &.{ "root", "esp", "bios_boot", "format_esp", "set_esp_type", "set_bios_boot_type" }, "partitions");
+        a.root = try p.str(t, "partitions", "root");
+        a.esp = try p.str(t, "partitions", "esp");
+        a.bios_boot = try p.str(t, "partitions", "bios_boot");
+        if (try p.boolean(t, "partitions", "format_esp")) |v| a.format_esp = v;
+        if (try p.boolean(t, "partitions", "set_esp_type")) |v| a.set_esp_type = v;
+        if (try p.boolean(t, "partitions", "set_bios_boot_type")) |v| a.set_bios_boot_type = v;
+    }
+
+    const sys = try p.section(root, "system") orelse return fail(diag, "[system] is required");
+    try p.only(sys, &.{ "hostname", "domain", "root_hash", "user", "user_hash", "timezone", "keymap", "ntp", "firewall", "selinux" }, "system");
+    if (try p.str(sys, "system", "hostname")) |v| {
+        if (!validHostname(v)) return fail(diag, "invalid hostname");
+        a.hostname = v;
+    }
+    if (try p.str(sys, "system", "domain")) |v| {
+        if (!validHostname(v)) return fail(diag, "invalid domain");
+        a.domain = v;
+    }
+    const root_hash = try p.str(sys, "system", "root_hash") orelse return fail(diag, "[system] root_hash is required");
+    if (!validHash(root_hash)) return fail(diag, "root_hash is not a crypt hash (passwords are never plain text)");
+    a.root_pw = .{ .hash = root_hash };
+    a.user = try p.str(sys, "system", "user") orelse return fail(diag, "[system] user is required");
+    if (!validUsername(a.user)) return fail(diag, "invalid user name");
+    const user_hash = try p.str(sys, "system", "user_hash") orelse return fail(diag, "[system] user_hash is required");
+    if (!validHash(user_hash)) return fail(diag, "user_hash is not a crypt hash (passwords are never plain text)");
+    a.user_pw = .{ .hash = user_hash };
+    if (try p.str(sys, "system", "timezone")) |v| {
+        if (!validTimezone(v)) return fail(diag, "invalid timezone");
+        a.timezone = v;
+    }
+    if (try p.str(sys, "system", "keymap")) |v| {
+        if (!validKeymap(v)) return fail(diag, "invalid keymap name");
+        a.keymap = v;
+    }
+    a.ntp = try p.boolean(sys, "system", "ntp");
+    a.firewall = try p.boolean(sys, "system", "firewall");
+    a.selinux = try p.enumv(SelinuxMode, sys, "system", "selinux", "permissive, enforcing or disabled");
+
+    if (try p.section(root, "services")) |t| {
+        try p.only(t, &.{ "enable", "disable" }, "services");
+        a.services_enable = try p.strings(t, "services", "enable", validServiceName, "invalid service name");
+        a.services_disable = try p.strings(t, "services", "disable", validServiceName, "invalid service name");
+    }
+
+    if (try p.section(root, "ssh")) |t| {
+        try p.only(t, &.{ "enable", "root_login", "password_auth", "authorized_key", "generate_key", "allow_lockout" }, "ssh");
+        var s: Ssh = .{};
+        s.enable = try p.boolean(t, "ssh", "enable");
+        if (try p.enumv(RootLogin, t, "ssh", "root_login", "no, prohibit-password or yes")) |v| s.root_login = v;
+        if (try p.boolean(t, "ssh", "password_auth")) |v| s.password_auth = v;
+        if (try p.str(t, "ssh", "authorized_key")) |v| {
+            if (!validPubKey(v)) return fail(diag, "authorized_key is not an OpenSSH public key line");
+            s.authorized_key = v;
         }
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return fail(diag, "expected key = value");
-        const key = std.mem.trim(u8, line[0..eq], " \t");
-        line = std.mem.trim(u8, line[eq + 1 ..], " \t");
-        const value = try arena.dupe(u8, line);
+        if (try p.boolean(t, "ssh", "generate_key")) |v| s.generate_key = v;
+        if (try p.boolean(t, "ssh", "allow_lockout")) |v| s.allow_lockout = v;
+        a.ssh = s;
+    }
 
-        if (std.mem.eql(u8, section, "install")) {
-            if (std.mem.eql(u8, key, "disk")) {
-                disk = value;
-            } else if (std.mem.eql(u8, key, "partitioning")) {
-                partitioning = std.meta.stringToEnum(Partitioning, value) orelse
-                    return fail(diag, "partitioning must be auto or existing");
-            } else if (std.mem.eql(u8, key, "confirm_erase")) {
-                if (value.len == 0 or value[0] != '/' and !validIfaceName(value)) return fail(diag, "confirm_erase must be a device path or a kernel name");
-                a.confirm_erase = value;
-            } else if (std.mem.eql(u8, key, "when_done")) {
-                a.when_done = std.meta.stringToEnum(WhenDone, value) orelse return fail(diag, "when_done must be reboot, poweroff or shell");
-            } else return fail(diag, "unknown key in [install]");
-        } else if (std.mem.eql(u8, section, "partitions")) {
-            if (std.mem.eql(u8, key, "root")) {
-                a.root = value;
-            } else if (std.mem.eql(u8, key, "esp")) {
-                a.esp = value;
-            } else if (std.mem.eql(u8, key, "bios_boot")) {
-                a.bios_boot = value;
-            } else if (std.mem.eql(u8, key, "format_esp")) {
-                a.format_esp = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else if (std.mem.eql(u8, key, "set_esp_type")) {
-                a.set_esp_type = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else if (std.mem.eql(u8, key, "set_bios_boot_type")) {
-                a.set_bios_boot_type = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else return fail(diag, "unknown key in [partitions]");
-        } else if (std.mem.eql(u8, section, "system")) {
-            if (std.mem.eql(u8, key, "hostname")) {
-                if (!validHostname(value)) return fail(diag, "invalid hostname");
-                a.hostname = value;
-            } else if (std.mem.eql(u8, key, "root_hash")) {
-                if (!validHash(value)) return fail(diag, "root_hash is not a crypt hash (passwords are never plain text)");
-                a.root_pw = .{ .hash = value };
-                have_root_hash = true;
-            } else if (std.mem.eql(u8, key, "user")) {
-                if (!validUsername(value)) return fail(diag, "invalid user name");
-                a.user = value;
-                have_user = true;
-            } else if (std.mem.eql(u8, key, "user_hash")) {
-                if (!validHash(value)) return fail(diag, "user_hash is not a crypt hash (passwords are never plain text)");
-                a.user_pw = .{ .hash = value };
-                have_user_hash = true;
-            } else if (std.mem.eql(u8, key, "timezone")) {
-                if (!validTimezone(value)) return fail(diag, "invalid timezone");
-                a.timezone = value;
-            } else if (std.mem.eql(u8, key, "keymap")) {
-                if (!validKeymap(value)) return fail(diag, "invalid keymap name");
-                a.keymap = value;
-            } else if (std.mem.eql(u8, key, "domain")) {
-                if (!validHostname(value)) return fail(diag, "invalid domain");
-                a.domain = value;
-            } else if (std.mem.eql(u8, key, "ntp")) {
-                a.ntp = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else if (std.mem.eql(u8, key, "firewall")) {
-                a.firewall = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else if (std.mem.eql(u8, key, "selinux")) {
-                a.selinux = std.meta.stringToEnum(SelinuxMode, value) orelse return fail(diag, "selinux must be permissive, enforcing or disabled");
-            } else return fail(diag, "unknown key in [system]");
-        } else if (std.mem.eql(u8, section, "network")) {
-            net_seen = true;
-            if (std.mem.eql(u8, key, "mode")) {
-                net_v.mode = std.meta.stringToEnum(NetMode, value) orelse return fail(diag, "mode must be guided, copy, manual or manual-shell");
-            } else if (std.mem.eql(u8, key, "copy")) {
-                if (value.len == 0 or std.mem.indexOfScalar(u8, value, '/') != null or value[0] == '.') return fail(diag, "invalid connection file name");
-                net_v.copy = value;
-            } else if (std.mem.eql(u8, key, "iface")) {
-                var it = std.mem.tokenizeScalar(u8, value, ' ');
-                const name = it.next() orelse return fail(diag, "iface needs a name");
-                const kind = it.next() orelse return fail(diag, "iface needs dhcp, static or disabled");
+    if (try p.section(root, "network")) |t| {
+        try p.only(t, &.{ "mode", "copy", "iface", "dns", "search", "wifi_ssid", "wifi_psk", "wifi_hidden" }, "network");
+        var n: Network = .{};
+        if (try p.enumv(NetMode, t, "network", "mode", "guided, copy, manual or manual-shell")) |v| n.mode = v;
+        if (try p.str(t, "network", "copy")) |v| {
+            if (v.len == 0 or std.mem.indexOfScalar(u8, v, '/') != null or v[0] == '.') return fail(diag, "invalid connection file name");
+            n.copy = v;
+        }
+        if (t.get("iface")) |v| {
+            const arr = switch (v) {
+                .array => |x| x,
+                else => return fail(diag, "[network] iface must be an array of tables: [[network.iface]]"),
+            };
+            var list: std.ArrayList(Iface) = .empty;
+            for (arr.items.items) |item| {
+                const it = switch (item) {
+                    .table => |x| x,
+                    else => return fail(diag, "[network] iface entries must be tables: [[network.iface]]"),
+                };
+                try p.only(it, &.{ "name", "kind", "address", "gateway" }, "network.iface");
+                const name = try p.str(it, "network.iface", "name") orelse return fail(diag, "[[network.iface]] needs a name");
                 if (!validIfaceName(name)) return fail(diag, "invalid interface name");
                 var ifc: Iface = .{ .name = name };
-                ifc.kind = std.meta.stringToEnum(IfaceKind, kind) orelse return fail(diag, "iface kind must be dhcp, static or disabled");
+                ifc.kind = try p.enumv(IfaceKind, it, "network.iface", "kind", "dhcp, static or disabled") orelse
+                    return fail(diag, "[[network.iface]] needs kind = dhcp, static or disabled");
+                const addr = try p.str(it, "network.iface", "address");
+                const gw = try p.str(it, "network.iface", "gateway");
                 if (ifc.kind == .static) {
-                    const addr = it.next() orelse return fail(diag, "static needs ADDRESS/PREFIX");
-                    if (!validCidr(addr)) return fail(diag, "invalid ADDRESS/PREFIX");
-                    ifc.address = addr;
-                    if (it.next()) |gw| {
-                        if (!validIp(gw) or isV6(gw) != isV6(addr)) return fail(diag, "invalid gateway (same family as the address)");
-                        ifc.gateway = gw;
+                    const ad = addr orelse return fail(diag, "a static interface needs address = \"ADDRESS/PREFIX\"");
+                    if (!validCidr(ad)) return fail(diag, "invalid ADDRESS/PREFIX");
+                    ifc.address = ad;
+                    if (gw) |g| {
+                        if (!validIp(g) or isV6(g) != isV6(ad)) return fail(diag, "invalid gateway (same family as the address)");
+                        ifc.gateway = g;
                     }
-                }
-                try ifaces.append(arena, ifc);
-            } else if (std.mem.eql(u8, key, "dns")) {
-                var list: std.ArrayList([]const u8) = .empty;
-                var it = std.mem.tokenizeAny(u8, value, " \t,");
-                while (it.next()) |t| {
-                    if (!validIp(t)) return fail(diag, "invalid DNS server address");
-                    try list.append(arena, t);
-                }
-                net_v.dns = list.items;
-            } else if (std.mem.eql(u8, key, "search")) {
-                if (!validHostname(value)) return fail(diag, "invalid search domain");
-                net_v.search = value;
-            } else if (std.mem.eql(u8, key, "wifi_ssid")) {
-                if (!validSsid(value)) return fail(diag, "invalid SSID (1-32 printable characters, no backslash or quote)");
-                wifi_ssid = value;
-            } else if (std.mem.eql(u8, key, "wifi_psk")) {
-                if (!validPsk(value)) return fail(diag, "invalid WiFi passphrase (8-63 printable characters, no backslash or quote)");
-                wifi_psk = value;
-            } else if (std.mem.eql(u8, key, "wifi_hidden")) {
-                wifi_hidden = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else return fail(diag, "unknown key in [network]");
-        } else if (std.mem.eql(u8, section, "post")) {
-            if (!std.mem.eql(u8, key, "commands")) return fail(diag, "unknown key in [post]");
-            if (value.len == 0) return fail(diag, "empty command");
-            try post.append(arena, value);
-        } else if (std.mem.eql(u8, section, "services")) {
-            var list: std.ArrayList([]const u8) = .empty;
-            var it = std.mem.tokenizeAny(u8, value, " \t,");
-            while (it.next()) |t| {
-                if (!validServiceName(t)) return fail(diag, "invalid service name");
-                try list.append(arena, t);
+                } else if (addr != null or gw != null) return fail(diag, "address and gateway are only for kind = static");
+                try list.append(arena, ifc);
             }
-            if (std.mem.eql(u8, key, "enable")) {
-                a.services_enable = list.items;
-            } else if (std.mem.eql(u8, key, "disable")) {
-                a.services_disable = list.items;
-            } else return fail(diag, "unknown key in [services]");
-        } else if (std.mem.eql(u8, section, "ssh")) {
-            const ssh = &ssh_v;
-            ssh_seen = true;
-            if (std.mem.eql(u8, key, "enable")) {
-                ssh.enable = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else if (std.mem.eql(u8, key, "root_login")) {
-                ssh.root_login = std.meta.stringToEnum(RootLogin, value) orelse return fail(diag, "root_login must be no, prohibit-password or yes");
-            } else if (std.mem.eql(u8, key, "password_auth")) {
-                ssh.password_auth = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else if (std.mem.eql(u8, key, "authorized_key")) {
-                if (!validPubKey(value)) return fail(diag, "authorized_key is not an OpenSSH public key line");
-                ssh.authorized_key = value;
-            } else if (std.mem.eql(u8, key, "generate_key")) {
-                ssh.generate_key = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else if (std.mem.eql(u8, key, "allow_lockout")) {
-                ssh.allow_lockout = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else return fail(diag, "unknown key in [ssh]");
-        } else if (std.mem.eql(u8, section, "packages")) {
-            if (std.mem.eql(u8, key, "install")) {
-                var list: std.ArrayList([]const u8) = .empty;
-                var it = std.mem.tokenizeAny(u8, value, " \t,");
-                while (it.next()) |t| {
-                    if (!validPackageName(t)) return fail(diag, "invalid package name");
-                    try list.append(arena, t);
-                }
-                a.packages = list.items;
-            } else if (std.mem.eql(u8, key, "keep_repo")) {
-                a.keep_repo = parseBool(value) orelse return fail(diag, "expected true or false");
-            } else return fail(diag, "unknown key in [packages]");
-        } else return fail(diag, "key outside a known section");
+            n.ifaces = list.items;
+        }
+        n.dns = try p.strings(t, "network", "dns", validIp, "invalid DNS server address");
+        if (try p.str(t, "network", "search")) |v| {
+            if (!validHostname(v)) return fail(diag, "invalid search domain");
+            n.search = v;
+        }
+        const ssid = try p.str(t, "network", "wifi_ssid");
+        const psk = try p.str(t, "network", "wifi_psk");
+        if (ssid) |v| if (!validSsid(v)) return fail(diag, "invalid SSID (1-32 printable characters, no backslash or quote)");
+        if (psk) |v| if (!validPsk(v)) return fail(diag, "invalid WiFi passphrase (8-63 printable characters, no backslash or quote)");
+        if ((ssid == null) != (psk == null)) return fail(diag, "[network] wifi_ssid and wifi_psk go together");
+        if (ssid) |sid| n.wifi = .{ .ssid = sid, .psk = psk.?, .hidden = try p.boolean(t, "network", "wifi_hidden") orelse false };
+        if (n.mode == .copy and n.copy == null) return fail(diag, "[network] mode = copy needs copy = FILE");
+        a.network = n;
     }
 
-    diag.line = 0;
-    if (ssh_seen) a.ssh = ssh_v;
-    a.post = post.items;
-    if (net_seen) {
-        net_v.ifaces = ifaces.items;
-        if ((wifi_ssid == null) != (wifi_psk == null)) return fail(diag, "[network] wifi_ssid and wifi_psk go together");
-        if (wifi_ssid) |sid| net_v.wifi = .{ .ssid = sid, .psk = wifi_psk.?, .hidden = wifi_hidden };
-        if (net_v.mode == .copy and net_v.copy == null) return fail(diag, "[network] mode = copy needs copy = FILE");
-        a.network = net_v;
+    if (try p.section(root, "packages")) |t| {
+        try p.only(t, &.{ "install", "keep_repo" }, "packages");
+        a.packages = try p.strings(t, "packages", "install", validPackageName, "invalid package name");
+        if (try p.boolean(t, "packages", "keep_repo")) |v| a.keep_repo = v;
     }
-    a.disk = disk orelse return fail(diag, "[install] disk is required");
-    a.partitioning = partitioning orelse return fail(diag, "[install] partitioning is required");
-    if (!have_root_hash) return fail(diag, "[system] root_hash is required");
-    if (!have_user) return fail(diag, "[system] user is required");
-    if (!have_user_hash) return fail(diag, "[system] user_hash is required");
+
+    if (try p.section(root, "post")) |t| {
+        try p.only(t, &.{"commands"}, "post");
+        a.post = try p.strings(t, "post", "commands", nonEmpty, "empty command");
+    }
+
     if (a.partitioning == .existing and a.root == null) return fail(diag, "[partitions] root is required for existing partitioning");
     return a;
 }
+
+fn nonEmpty(s: []const u8) bool {
+    return s.len != 0;
+}
+
+/// Reads typed values out of the parsed document, with errors that name the
+/// section and key.
+const Parser = struct {
+    arena: Allocator,
+    diag: *Diag,
+
+    fn bad(self: Parser, comptime fmt: []const u8, args: anytype) error{ BadAnswers, OutOfMemory } {
+        return fail(self.diag, try std.fmt.allocPrint(self.arena, fmt, args));
+    }
+
+    fn only(self: Parser, t: *const toml.Table, known: []const []const u8, what: []const u8) !void {
+        for (t.entries.keys()) |k| {
+            const ok = for (known) |n| {
+                if (std.mem.eql(u8, k, n)) break true;
+            } else false;
+            if (ok) continue;
+            if (what.len == 0) return self.bad("unknown section '{s}'", .{k});
+            return self.bad("unknown key '{s}' in [{s}]", .{ k, what });
+        }
+    }
+
+    fn section(self: Parser, t: *const toml.Table, name: []const u8) !?*const toml.Table {
+        const v = t.get(name) orelse return null;
+        return switch (v) {
+            .table => |x| x,
+            else => self.bad("'{s}' must be a [{s}] section", .{ name, name }),
+        };
+    }
+
+    fn str(self: Parser, t: *const toml.Table, sec: []const u8, key: []const u8) !?[]const u8 {
+        const v = t.get(key) orelse return null;
+        return switch (v) {
+            .string => |s| try self.arena.dupe(u8, s),
+            else => self.bad("[{s}] {s} must be a string, not {s}", .{ sec, key, v.typeName() }),
+        };
+    }
+
+    fn boolean(self: Parser, t: *const toml.Table, sec: []const u8, key: []const u8) !?bool {
+        const v = t.get(key) orelse return null;
+        return switch (v) {
+            .boolean => |b| b,
+            else => self.bad("[{s}] {s} must be true or false, not {s}", .{ sec, key, v.typeName() }),
+        };
+    }
+
+    fn enumv(self: Parser, comptime E: type, t: *const toml.Table, sec: []const u8, key: []const u8, choices: []const u8) !?E {
+        const s = try self.str(t, sec, key) orelse return null;
+        return std.meta.stringToEnum(E, s) orelse self.bad("[{s}] {s} must be {s}", .{ sec, key, choices });
+    }
+
+    /// A list of strings, each checked by `ok`; absent means empty.
+    fn strings(self: Parser, t: *const toml.Table, sec: []const u8, key: []const u8, ok: *const fn ([]const u8) bool, msg: []const u8) ![]const []const u8 {
+        const v = t.get(key) orelse return &.{};
+        const arr = switch (v) {
+            .array => |x| x,
+            else => return self.bad("[{s}] {s} must be a list of strings, not {s}", .{ sec, key, v.typeName() }),
+        };
+        const out = try self.arena.alloc([]const u8, arr.items.items.len);
+        for (arr.items.items, out) |item, *dst| {
+            const s = switch (item) {
+                .string => |x| x,
+                else => return self.bad("[{s}] {s} entries must be strings, not {s}", .{ sec, key, item.typeName() }),
+            };
+            if (!ok(s)) return self.bad("[{s}] {s}: {s}: '{s}'", .{ sec, key, msg, s });
+            dst.* = try self.arena.dupe(u8, s);
+        }
+        return out;
+    }
+};
 
 fn fail(diag: *Diag, msg: []const u8) error{BadAnswers} {
     diag.message = msg;
@@ -583,17 +564,17 @@ test "parse a full answers file" {
     var diag: Diag = .{};
     const a = try parse(arena_state.allocator(),
         \\[install]
-        \\disk = sda
-        \\partitioning = existing
+        \\disk = "sda"
+        \\partitioning = "existing"
         \\[partitions]
-        \\root = sda3
-        \\esp = sda2
-        \\format_esp = yes
+        \\root = "sda3"
+        \\esp = "sda2"
+        \\format_esp = true
         \\[system]
-        \\root_hash = $6$salt$roothash
-        \\user = dakota
-        \\user_hash = $6$salt$userhash
-        \\timezone = Europe/Berlin
+        \\root_hash = "$6$salt$roothash"
+        \\user = "dakota"
+        \\user_hash = "$6$salt$userhash"
+        \\timezone = "Europe/Berlin"
     , &diag);
     try std.testing.expectEqualStrings("sda", a.disk);
     try std.testing.expectEqual(Partitioning.existing, a.partitioning);
@@ -608,15 +589,15 @@ test "parse the packages section" {
     var diag: Diag = .{};
     const base =
         \\[install]
-        \\disk = sda
-        \\partitioning = auto
+        \\disk = "sda"
+        \\partitioning = "auto"
         \\[system]
-        \\root_hash = $6$salt$roothash
-        \\user = dakota
-        \\user_hash = $6$salt$userhash
+        \\root_hash = "$6$salt$roothash"
+        \\user = "dakota"
+        \\user_hash = "$6$salt$userhash"
         \\[packages]
-        \\install = nano  htop,git
-        \\keep_repo = yes
+        \\install = ["nano", "htop", "git"]
+        \\keep_repo = true
     ;
     const a = try parse(arena_state.allocator(), base, &diag);
     try std.testing.expectEqual(@as(usize, 3), a.packages.len);
@@ -633,23 +614,23 @@ test "parse services, ssh and the optional system keys" {
     var diag: Diag = .{};
     const a = try parse(arena_state.allocator(),
         \\[install]
-        \\disk = sda
-        \\partitioning = auto
+        \\disk = "sda"
+        \\partitioning = "auto"
         \\[system]
-        \\root_hash = $6$salt$roothash
-        \\user = dakota
-        \\user_hash = $6$salt$userhash
-        \\ntp = no
-        \\firewall = yes
-        \\selinux = enforcing
+        \\root_hash = "$6$salt$roothash"
+        \\user = "dakota"
+        \\user_hash = "$6$salt$userhash"
+        \\ntp = false
+        \\firewall = true
+        \\selinux = "enforcing"
         \\[services]
-        \\enable = cupsd
-        \\disable = avahi-daemon bluetoothd
+        \\enable = ["cupsd"]
+        \\disable = ["avahi-daemon", "bluetoothd"]
         \\[ssh]
-        \\enable = yes
-        \\root_login = prohibit-password
-        \\password_auth = no
-        \\authorized_key = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl me@host
+        \\enable = true
+        \\root_login = "prohibit-password"
+        \\password_auth = false
+        \\authorized_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl me@host"
     , &diag);
     try std.testing.expectEqual(false, a.ntp.?);
     try std.testing.expectEqual(SelinuxMode.enforcing, a.selinux.?);
@@ -674,19 +655,28 @@ test "network validators and section" {
     var diag: Diag = .{};
     const a = try parse(arena_state.allocator(),
         \\[install]
-        \\disk = sda
-        \\partitioning = auto
+        \\disk = "sda"
+        \\partitioning = "auto"
         \\[system]
-        \\root_hash = $6$salt$roothash
-        \\user = dakota
-        \\user_hash = $6$salt$userhash
-        \\domain = example.org
+        \\root_hash = "$6$salt$roothash"
+        \\user = "dakota"
+        \\user_hash = "$6$salt$userhash"
+        \\domain = "example.org"
         \\[network]
-        \\iface = eth0 static 192.168.1.5/24 192.168.1.1
-        \\iface = eth1 disabled
-        \\dns = 1.1.1.1 9.9.9.9
-        \\wifi_ssid = Home
-        \\wifi_psk = hunter2hunter2
+        \\dns = ["1.1.1.1", "9.9.9.9"]
+        \\wifi_ssid = "Home"
+        \\wifi_psk = "hunter2hunter2"
+        \\
+        \\[[network.iface]]
+        \\name = "eth0"
+        \\kind = "static"
+        \\address = "192.168.1.5/24"
+        \\gateway = "192.168.1.1"
+        \\
+        \\[[network.iface]]
+        \\name = "eth1"
+        \\kind = "disabled"
+        \\
     , &diag);
     try std.testing.expectEqual(@as(usize, 2), a.network.?.ifaces.len);
     try std.testing.expectEqual(IfaceKind.static, a.network.?.ifaces[0].kind);
@@ -700,17 +690,16 @@ test "autoinstall keys and post commands" {
     var diag: Diag = .{};
     const a = try parse(arena_state.allocator(),
         \\[install]
-        \\disk = largest
-        \\partitioning = auto
-        \\confirm_erase = /dev/disk/by-id/nvme-X
-        \\when_done = poweroff
+        \\disk = "largest"
+        \\partitioning = "auto"
+        \\confirm_erase = "/dev/disk/by-id/nvme-X"
+        \\when_done = "poweroff"
         \\[system]
-        \\root_hash = $6$salt$roothash
-        \\user = dakota
-        \\user_hash = $6$salt$userhash
+        \\root_hash = "$6$salt$roothash"
+        \\user = "dakota"
+        \\user_hash = "$6$salt$userhash"
         \\[post]
-        \\commands = echo one > /etc/one
-        \\commands = echo two > /etc/two
+        \\commands = ["echo one > /etc/one", "echo two > /etc/two"]
     , &diag);
     try std.testing.expectEqualStrings("largest", a.disk);
     try std.testing.expectEqualStrings("/dev/disk/by-id/nvme-X", a.confirm_erase.?);
@@ -719,16 +708,19 @@ test "autoinstall keys and post commands" {
     try std.testing.expectError(error.BadAnswers, parse(arena_state.allocator(), "[install]\nwhen_done = explode\n", &diag));
 }
 
-test "parse rejects plain-text passwords and reports the line" {
+test "parse rejects plain-text passwords and names the key" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var diag: Diag = .{};
     try std.testing.expectError(error.BadAnswers, parse(arena_state.allocator(),
         \\[install]
-        \\disk = sda
-        \\partitioning = auto
+        \\disk = "sda"
+        \\partitioning = "auto"
         \\[system]
-        \\root_hash = hunter2
+        \\root_hash = "hunter2"
     , &diag));
-    try std.testing.expectEqual(@as(usize, 5), diag.line);
+    try std.testing.expect(std.mem.indexOf(u8, diag.message, "root_hash") != null);
+    // A syntax error carries the line; a wrong value names the section and key instead.
+    try std.testing.expectError(error.BadAnswers, parse(arena_state.allocator(), "[install]\ndisk = \n", &diag));
+    try std.testing.expectEqual(@as(usize, 2), diag.line);
 }

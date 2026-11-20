@@ -1,8 +1,0 @@
-[install]
-disk = sda
-partitioning = auto
-
-[system]
-root_hash = $6$saltsalt$rootrootrootroot
-user = dakota
-user_hash = $6$saltsalt$useruseruseruser

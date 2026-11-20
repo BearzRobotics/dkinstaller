@@ -4,7 +4,7 @@
     auto_test.py --iso ISO --binary zig-out/bin/dkrescue-install [--firmware uefi|bios] [--workdir DIR]
 
 Boots the live ISO with a blank 20 GB disk (vda), a guard disk (vdb) and a
-small second disk (vdc) holding `dkinstall.ini` and a copy of the binary.
+small second disk (vdc) holding `dkinstall.toml` and a copy of the binary.
 In the live session the kernel command line is made to carry
 `dkinstall.auto=1` (a bind mount over /proc/cmdline: nothing on the current
 ISO starts the launcher or sets the flag at boot). `dkrescue-install --auto`
@@ -19,24 +19,26 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import qemu_test as q
 
 ANSWERS = """[install]
-disk = largest
-partitioning = auto
-confirm_erase = /dev/vda
-when_done = poweroff
+disk = "largest"
+partitioning = "auto"
+confirm_erase = "/dev/vda"
+when_done = "poweroff"
 
 [system]
-hostname = autotest
-root_hash = {hash}
-user = tester
-user_hash = {hash}
-timezone = UTC
-keymap = us
+hostname = "autotest"
+root_hash = "{hash}"
+user = "tester"
+user_hash = "{hash}"
+timezone = "UTC"
+keymap = "us"
 
 [post]
-commands = echo ran-in-chroot > /etc/dk-post-ran
-commands = sed -i 's/"ro quiet"/"ro console=tty0 console=ttyS0,115200"/' /boot/dklilo.conf
-commands = ln -sfn ../ttyS0 /etc/dinit.d/boot.d/ttyS0
-commands = false
+commands = [
+    "echo ran-in-chroot > /etc/dk-post-ran",
+    "sed -i 's/\\"ro quiet\\"/\\"ro console=tty0 console=ttyS0,115200\\"/' /boot/dklilo.conf",
+    "ln -sfn ../ttyS0 /etc/dinit.d/boot.d/ttyS0",
+    "false",
+]
 """
 
 results = []
@@ -62,7 +64,7 @@ def main():
     shutil.rmtree(seed_dir, ignore_errors=True)
     seed_dir.mkdir()
     pw = subprocess.run(["openssl", "passwd", "-6", "-salt", "qemusalt", "testpw"], check=True, capture_output=True, text=True).stdout.strip()
-    (seed_dir / "dkinstall.ini").write_text(ANSWERS.format(hash=pw))
+    (seed_dir / "dkinstall.toml").write_text(ANSWERS.format(hash=pw))
     shutil.copy(args.binary, seed_dir / "dkrescue-install")
     seed = work / "seed.img"
     with open(seed, "wb") as f:
@@ -91,7 +93,7 @@ def main():
     i = child.expect([r"EXIT=(\d+)", pexpect.EOF], timeout=q.INSTALL_TIMEOUT)
     child.close(force=True)
     log = open(work / "serial.log").read()
-    check("found the answers file on the unmounted second disk", "found dkinstall.ini on /dev/vdc" in log, log[-800:])
+    check("found the answers file on the unmounted second disk", "found dkinstall.toml on /dev/vdc" in log, log[-800:])
     check("the gates passed and it says which disk it erases", "erasing /dev/vda as the answers file confirms" in log)
     check("no screen was needed: installation completed", "Installation complete." in log, log[-1200:])
     check("the failing post command is only a warning", "warning: Post-install command: false" in log)

@@ -25,9 +25,9 @@ In this order, the first that exists wins:
 
 1. `--answers FILE`, or `dkinstall.answers=PATH`. If given and missing, there
    is no fallback: the normal installer starts.
-2. `<live medium>/install/answers.ini` (`/run/live/medium`): bake it into the
+2. `<live medium>/install/answers.toml` (`/run/live/medium`): bake it into the
    ISO.
-3. `dkinstall.ini` at the root of a medium that is already mounted (`/mnt`,
+3. `dkinstall.toml` at the root of a medium that is already mounted (`/mnt`,
    `/media`, `/run/media`, one directory down), else of each unmounted
    iso9660/vfat/ext4/exfat device in turn (mounted read-only at
    `/mnt/dkinstall-auto`; label does not matter; the live medium and loop
@@ -46,73 +46,83 @@ printed.
 
 ## Complete example
 
-`tests/auto/example.ini` (checked by `--dry-run` in the tests):
+`tests/auto/example.toml` (checked by `--dry-run` in the tests):
 
-```ini
-# dkinstall.ini: a complete autoinstall answers file (docs/AUTOINSTALL.md).
+```toml
+# dkinstall.toml: a complete autoinstall answers file (docs/AUTOINSTALL.md).
 # Passwords are crypt(3) hashes: openssl passwd -6
 
 [install]
 # The disk: a kernel name (nvme0n1), a path (/dev/nvme0n1), first-nonremovable
 # (first installable disk not on USB) or largest (biggest installable disk).
-disk = largest
-# Existing partitions instead: partitioning = existing and a [partitions] section.
-partitioning = auto
+disk = "largest"
+# Existing partitions instead: partitioning = "existing" and a [partitions] section.
+partitioning = "auto"
 # REQUIRED for an autoinstall. Must name the disk the plan erases: its path, its
 # kernel name, or a /dev/disk/by-id/... link to it. A selector is not enough.
-confirm_erase = /dev/nvme0n1
+confirm_erase = "/dev/nvme0n1"
 # reboot (default), poweroff or shell, after everything is unmounted.
-when_done = reboot
+when_done = "reboot"
 
 [system]
-hostname = node01
-domain = lab.example
-root_hash = $6$saltsalt$rootrootrootroot
-user = admin
-user_hash = $6$saltsalt$useruseruseruser
-timezone = Europe/Berlin
-keymap = de
+hostname = "node01"
+domain = "lab.example"
+root_hash = "$6$saltsalt$rootrootrootroot"
+user = "admin"
+user_hash = "$6$saltsalt$useruseruseruser"
+timezone = "Europe/Berlin"
+keymap = "de"
 ntp = true
 firewall = true
 # permissive (default), enforcing or disabled; needs the SELinux policy in the image.
-selinux = permissive
+selinux = "permissive"
 
 [services]
 # Names of dinit services in the image (/etc/dinit.d, /usr/lib/dinit.d).
-enable = sshd
-disable = bluetoothd
+enable = ["sshd"]
+disable = ["bluetoothd"]
 
 [ssh]
 enable = true
-root_login = no
+root_login = "no"
 password_auth = false
 # Public key for the new user; an authorized_keys line.
-authorized_key = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl admin@lab
+authorized_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl admin@lab"
 
 [network]
 # guided, copy (the live session's NetworkManager connection), manual
 # (nothing configured, network services off) or manual-shell (not possible
 # unattended: it is only logged as skipped).
-mode = guided
-iface = eth0 static 192.168.1.5/24 192.168.1.1
-iface = eth1 dhcp
-iface = eth2 disabled
-dns = 1.1.1.1 9.9.9.9
-search = lab.example
-wifi_ssid = Office
-wifi_psk = a passphrase here
+mode = "guided"
+dns = ["1.1.1.1", "9.9.9.9"]
+search = "lab.example"
+wifi_ssid = "Office"
+wifi_psk = "a passphrase here"
 wifi_hidden = false
+
+[[network.iface]]
+name = "eth0"
+kind = "static"
+address = "192.168.1.5/24"
+gateway = "192.168.1.1"
+
+[[network.iface]]
+name = "eth1"
+kind = "dhcp"
+
+[[network.iface]]
+name = "eth2"
+kind = "disabled"
 
 [packages]
 # Extra packages from a repository medium (apks/<arch>/ on /mnt/cdrom or --repo).
-install = curl htop
+install = ["curl", "htop"]
 keep_repo = false
 
 [post]
 # Run last, each with sh -c in a chroot of the new system (/proc is not mounted).
 # A failing command is a warning, not an error.
-commands = echo "installed by dkinstall" > /etc/motd
-commands = ln -sf /usr/share/zoneinfo/Europe/Berlin /etc/localtime
+commands = ["echo \"installed by dkinstall\" > /etc/motd", "ln -sf /usr/share/zoneinfo/Europe/Berlin /etc/localtime"]
 ```
 
 Not covered: one user only; no locale (only keymap and timezone); no
@@ -123,7 +133,7 @@ is never printed or logged, but keep the file private.
 ## Try it without erasing anything
 
     dkrescue-install --auto --cmdline tests/auto/cmdline-auto \
-        --answers tests/auto/example.ini --probe tests/probes/uefi-nvme-blank.json --dry-run
+        --answers tests/auto/example.toml --probe tests/probes/uefi-nvme-blank.json --dry-run
 
 ## What the image has to do
 

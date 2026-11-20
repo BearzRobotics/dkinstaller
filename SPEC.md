@@ -442,7 +442,7 @@ itself), and a target that is not the live medium (a disk with a mounted
 partition, such as the answers medium, is refused as always). A missing or
 mismatching gate prints which and starts the normal screens; nothing is
 erased. Discovery order: `--answers`/`dkinstall.answers=PATH` (no fallback if
-missing), `<live medium>/install/answers.ini`, `dkinstall.ini` on an
+missing), `<live medium>/install/answers.toml`, `dkinstall.toml` on an
 already mounted medium, then on each candidate device mounted read-only at
 `/mnt/dkinstall-auto`. `first-nonremovable` treats USB-transport disks as
 removable. At the end, after unmounting, `[install] when_done` = `reboot`
@@ -502,7 +502,7 @@ in the log or on screen: they're passed to `chpasswd` on its standard input.
 |---|---|
 | `dkrescue-install` | The interactive installer |
 | `dkrescue-install --dry-run` | Runs the screens, then prints the plan instead of running it |
-| `dkrescue-install --answers FILE` | Takes every answer from `FILE` (INI format) and skips the screens, **except** the summary and its typed confirmation |
+| `dkrescue-install --answers FILE` | Takes every answer from `FILE` (TOML format) and skips the screens, **except** the summary and its typed confirmation |
 | `dkrescue-install --answers FILE --yes-really-erase DISK` | Fully unattended, for tests. `DISK` must match the disk in `FILE` |
 | `--probe FILE` | Uses a recorded probe fixture (`tests/probes/*.json`) instead of reading the machine. For tests and `--dry-run`; refused without `--dry-run` |
 | `--auto` | Autoinstall (5.11, docs/AUTOINSTALL.md). `--cmdline FILE` reads the command line from FILE (tests) |
