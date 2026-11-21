@@ -1,6 +1,6 @@
 # dkrescue-install — Specification
 
-Status: **Draft v0.1** (program version 0.0.5). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.1** (program version 0.0.6). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
