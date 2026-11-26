@@ -31,7 +31,8 @@ In this order, the first that exists wins:
    `/media`, `/run/media`, one directory down), else of each unmounted
    iso9660/vfat/ext4/exfat device in turn (mounted read-only at
    `/mnt/dkinstall-auto`; label does not matter; the live medium and loop
-   devices are skipped). Any USB stick or second virtual disk will do.
+   devices are skipped; ext4 with `noload`, so no journal is replayed). Any USB
+   stick or second virtual disk will do.
 
 ## What it does
 

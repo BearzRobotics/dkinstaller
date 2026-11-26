@@ -147,6 +147,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Autoinstall: the kernel flag, then the answers file. The gates come after the probe.
     var auto_flag = false;
+    var mounted_for_answers = false;
     if (auto_mode) {
         const cmdline = Io.Dir.cwd().readFileAlloc(io, cmdline_path, arena, .limited(64 * 1024)) catch "";
         const cl = dk.auto.parseCmdline(cmdline);
@@ -157,7 +158,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         const explicit = answers_path orelse cl.answers;
         var found = try dk.auto.discover(arena, io, .{ .explicit = explicit });
-        if (found == null and explicit == null) found = try mountAndDiscover(arena, io, err);
+        if (found == null and explicit == null) {
+            found = try mountAndDiscover(arena, io, err);
+            mounted_for_answers = found != null;
+        }
         if (found) |f| {
             try err.print("autoinstall: answers file {s}\n", .{f.path});
             try err.flush();
@@ -255,6 +259,17 @@ pub fn main(init: std.process.Init) !u8 {
             .refused => |g| g.message(),
         };
         try err.print("autoinstall REFUSED: {s}.\n" ++ auto_fallback, .{why});
+        // Let go of a medium mounted to read the file, so the screens see its disk as free.
+        if (mounted_for_answers and probe_path == null) {
+            const u = std.process.run(arena, io, .{ .argv = &.{ "umount", dk.auto.mount_point } }) catch null;
+            if (u != null and u.?.term.success()) {
+                const repo = probe.repo;
+                if (dk.probe.live(arena, io)) |fresh| {
+                    probe = fresh;
+                    probe.repo = repo;
+                } else |_| {}
+            }
+        }
         file_answers = null;
         answers_path = null;
         erase_disk = null;
@@ -454,7 +469,7 @@ fn mountAndDiscover(arena: std.mem.Allocator, io: Io, err: *Io.Writer) !?dk.auto
     const cands = try dk.probe.repoCandidates(arena, p, "");
     Io.Dir.cwd().createDirPath(io, dk.auto.mount_point) catch {};
     for (cands) |c| {
-        const r = std.process.run(arena, io, .{ .argv = &.{ "mount", "-o", "ro", c.path, dk.auto.mount_point } }) catch continue;
+        const r = std.process.run(arena, io, .{ .argv = &.{ "mount", "-o", dk.auto.mountOptions(c.fstype), c.path, dk.auto.mount_point } }) catch continue;
         if (!r.term.success()) continue;
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dk.auto.mount_point, dk.auto.removable_file });
         Io.Dir.cwd().access(io, path, .{}) catch {

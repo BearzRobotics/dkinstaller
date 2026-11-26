@@ -82,6 +82,12 @@ pub fn discover(arena: Allocator, io: Io, o: DiscoverOpts) Allocator.Error!?Foun
     return null;
 }
 
+/// How a medium is mounted to look for the answers file. `noload`: a read-only mount of ext4
+/// would otherwise replay its journal, writing to a disk nobody chose.
+pub fn mountOptions(fstype: []const u8) []const u8 {
+    return if (std.mem.eql(u8, fstype, "ext4")) "ro,noload" else "ro";
+}
+
 /// Why an autoinstall must not erase anything. `message` says it for the user.
 pub const Gate = enum {
     no_flag,
@@ -273,4 +279,9 @@ test "every example answers file parses and plans, and the documented copy match
     try std.testing.expect((try plan_mod.build(arena, p, a, ids)) == .plan);
     const doc = try readTest(arena, "docs/AUTOINSTALL.md");
     try std.testing.expect(std.mem.indexOf(u8, doc, try std.fmt.allocPrint(arena, "```toml\n{s}```\n", .{text})) != null);
+}
+
+test "searching a medium never replays an ext4 journal" {
+    try std.testing.expectEqualStrings("ro,noload", mountOptions("ext4"));
+    try std.testing.expectEqualStrings("ro", mountOptions("vfat"));
 }
