@@ -413,7 +413,10 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
 
     // 7c. Services, SSH, NTP, firewall
     try planConfig(b, p, a);
+    // Network files are soft (SPEC.md 5.8): a failure warns, the install goes on.
+    const first_net = b.steps.items.len;
     try planNetwork(b, p, a, ids);
+    for (b.steps.items[first_net..]) |*s| s.soft = true;
     for (a.post) |cmd| {
         try b.steps.append(arena, .{
             .desc = try b.fmt("Post-install command: {s}", .{cmd}),
@@ -673,8 +676,8 @@ fn planConfig(b: *Builder, p: Probe, a: Answers) BuildError!void {
     }
     var ssh_on = if (probe_mod.findService(p.services, "sshd")) |sv| sv.enabled else false;
     if (a.ssh) |ssh| {
+        if (probe_mod.findService(p.services, "sshd") == null) return b.refuse("SSH was chosen but the image has no sshd service", .{});
         if (ssh.enable) |on| {
-            if (probe_mod.findService(p.services, "sshd") == null) return b.refuse("SSH was chosen but the image has no sshd service", .{});
             try setSvc(b, &changes, "sshd", on);
             ssh_on = on;
         }
@@ -962,7 +965,12 @@ fn planRepoPackages(b: *Builder, p: Probe, a: Answers) BuildError!void {
         , .{ rel, if (std.mem.eql(u8, repo.index, "Packages.adb")) "/Packages.adb" else "" });
         try b.cmdStdin("Keep the repository (commented out) in the new system", &.{ "tee", "-a", target ++ "/etc/apk/repositories" }, line, false);
     }
-    if (repo.mounted_dev) |_| try b.cmd("Unmount the repository medium", &.{ "umount", repo.root });
+    // Soft: a busy medium must not stop the install short of its boot loader.
+    if (repo.mounted_dev) |_| try b.steps.append(arena, .{
+        .desc = "Unmount the repository medium",
+        .action = .{ .command = .{ .argv = try arena.dupe([]const u8, &.{ "umount", repo.root }) } },
+        .soft = true,
+    });
 }
 
 fn espBootx64(_: Probe, disk: Disk, esp_dev: []const u8) bool {
@@ -1931,4 +1939,25 @@ test "greetd cleanup: initial_session, nullok and the live issue text go; the re
     for ((try build(arena, p, testAnswers("nvme0n1", .auto), test_ids)).plan.steps) |s| {
         if (std.mem.indexOf(u8, s.desc, "graphical") != null) try std.testing.expect(!s.soft);
     }
+}
+
+test "network steps only warn; [ssh] on an image without sshd is refused before anything is written" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var a = svcAnswers();
+    a.network = .{ .ifaces = &.{.{ .name = "eth0", .kind = .static, .address = "10.0.0.2/8" }} };
+    const r = try buildSvc(arena, a);
+    var seen: usize = 0;
+    for (r.plan.steps) |s| {
+        if (std.mem.indexOf(u8, s.desc, "NetworkManager") == null) continue;
+        seen += 1;
+        try std.testing.expect(s.soft);
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    for (r.plan.steps) |s| if (std.mem.startsWith(u8, s.desc, "Install dklilo")) try std.testing.expect(!s.soft);
+    const plain = try loadFixture(arena, "uefi-nvme-blank.json");
+    var b = svcAnswers();
+    b.ssh = .{ .root_login = .no };
+    try std.testing.expect(contains((try build(arena, plain, b, test_ids)).refused, "no sshd"));
 }

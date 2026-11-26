@@ -258,6 +258,13 @@ pub fn main(init: std.process.Init) !u8 {
             },
         };
         if (executing and erase_disk == null) {
+            // Before the confirmation, not after it (SPEC.md 5.1).
+            var lacking = false;
+            for (plan.programs) |prog| if (!onPath(io, prog)) {
+                try err.print("missing program: {s}\n", .{prog});
+                lacking = true;
+            };
+            if (lacking) return 1;
             const disk = probe.findDisk(answers.disk).?;
             try openTerminal(&terminal, &ui, init.gpa, arena, io, ascii);
             have_term = true;
