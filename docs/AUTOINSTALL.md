@@ -129,7 +129,9 @@ kind = "disabled"
 #trust_medium_key = false
 
 [post]
-# Run last, each with sh -c in a chroot of the new system (/proc is not mounted).
+# Run after the system is set up and BEFORE the boot loader is installed (so
+# they cannot edit dklilo.conf or grub.cfg), each with sh -c in a chroot of the
+# new system (/proc is not mounted).
 # A failing command is a warning, not an error.
 commands = ["echo \"installed by dkinstall\" > /etc/motd", "ln -sf /usr/share/zoneinfo/Europe/Berlin /etc/localtime"]
 ```

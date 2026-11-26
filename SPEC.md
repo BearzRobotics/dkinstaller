@@ -528,7 +528,8 @@ with `noload`) at `/mnt/dkinstall-auto`, unmounted again if the gates
 refuse. `first-nonremovable` treats USB-transport disks as
 removable. At the end, after unmounting, `[install] when_done` = `reboot`
 (default), `poweroff` or `shell`; on failure a shell is left and the log path
-printed, exit code 1. `[post] commands` run last, each with `sh -c` in a
+printed, exit code 1. `[post] commands` run after the system is configured
+and before the boot loader is installed, each with `sh -c` in a
 chroot (soft steps). The image must start the launcher (docs/AUTOINSTALL.md).
 
 ## 6. Architecture
