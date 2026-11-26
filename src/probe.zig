@@ -800,6 +800,9 @@ fn exists(io: Io, path: []const u8) bool {
 
 /// Reads the running machine.
 pub fn live(arena: Allocator, io: Io) !Probe {
+    // lsblk reads the ids from udev's database, which lags behind a table that
+    // was just written (cfdisk). No udevadm, or a failure: blkid fills in below.
+    _ = std.process.run(arena, io, .{ .argv = &.{ "udevadm", "settle", "--timeout=30" } }) catch {};
     const lsblk = try std.process.run(arena, io, .{
         .argv = &.{ "lsblk", "--json", "--bytes", "-o", lsblk_columns },
     });
@@ -841,7 +844,7 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         .live_medium_source = medium,
         .rootfs_size = rootfs_size,
         .kernel = kernel,
-        .disks = try parseLsblk(arena, lsblk.stdout),
+        .disks = try fillMissingIds(arena, io, try parseLsblk(arena, lsblk.stdout)),
         .live_user = liveUser(arena, io),
         .services = services,
         .selinux = exists(io, "/etc/selinux/config"),
@@ -852,6 +855,44 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         .kernel_builtin = try kernelBuiltin(arena, io, kernel),
         .paths = try livePaths(arena, io),
     };
+}
+
+/// For each partition lsblk gave no PARTUUID, reads the disk itself with
+/// `blkid -p` (needs root; without it the values stay missing).
+fn fillMissingIds(arena: Allocator, io: Io, disks: []const Disk) ![]const Disk {
+    const out = try arena.dupe(Disk, disks);
+    for (out) |*disk| {
+        const parts = try arena.dupe(Partition, disk.partitions);
+        for (parts) |*part| {
+            if (part.partuuid != null) continue;
+            const r = std.process.run(arena, io, .{ .argv = &.{ "blkid", "-p", "-o", "export", part.path } }) catch continue;
+            if (r.term.success()) applyBlkid(part, r.stdout);
+        }
+        disk.partitions = parts;
+    }
+    return out;
+}
+
+/// Fills the fields `part` lacks from `blkid -p -o export` output.
+fn applyBlkid(part: *Partition, text: []const u8) void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = line[0..eq];
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \r");
+        if (value.len == 0) continue;
+        const field: *?[]const u8 = if (std.mem.eql(u8, key, "PART_ENTRY_UUID"))
+            &part.partuuid
+        else if (std.mem.eql(u8, key, "PART_ENTRY_TYPE"))
+            &part.parttype
+        else if (std.mem.eql(u8, key, "TYPE"))
+            &part.fstype
+        else if (std.mem.eql(u8, key, "UUID"))
+            &part.uuid
+        else
+            continue;
+        if (field.* == null) field.* = value;
+    }
 }
 
 /// The optional programs (`fs.candidate_tools`) that are in PATH on the live disc.
@@ -927,6 +968,22 @@ test "min sizes" {
     // 3 GiB image -> 3.75 GiB + 0.5 GiB = 4.25 -> 5 GiB
     try std.testing.expectEqual(5 * GiB, minDiskSize(3 * GiB));
     try std.testing.expectEqual(5 * GiB - 512 * MiB, minRootSize(3 * GiB));
+}
+
+test "applyBlkid fills only what lsblk left out" {
+    var part: Partition = .{ .name = "sda2", .path = "/dev/sda2", .number = 2, .size = 1, .fstype = "vfat" };
+    applyBlkid(&part,
+        \\DEVNAME=/dev/sda2
+        \\UUID=ABCD-1234
+        \\TYPE=ext4
+        \\PART_ENTRY_UUID=1a2b3c4d-02
+        \\PART_ENTRY_TYPE=0xef
+        \\
+    );
+    try std.testing.expectEqualStrings("1a2b3c4d-02", part.partuuid.?);
+    try std.testing.expectEqualStrings("0xef", part.parttype.?);
+    try std.testing.expectEqualStrings("ABCD-1234", part.uuid.?);
+    try std.testing.expectEqualStrings("vfat", part.fstype.?);
 }
 
 test "parseLsblk reads nested partitions" {

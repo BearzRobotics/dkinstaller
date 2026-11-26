@@ -444,8 +444,6 @@ const Draft = struct {
     /// Per probe service: switched on at boot (starts as the image has it).
     svc_on: []bool = &.{},
     ssh: ?answers_mod.Ssh = null,
-    ntp: ?bool = null,
-    firewall: ?bool = null,
     selinux: ?answers_mod.SelinuxMode = null,
     domain: ?[]const u8 = null,
     network: ?answers_mod.Network = null,
@@ -582,7 +580,7 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
                 if (try screenSsh(ui, &p, &d)) go = next(ui, p, &d, .ssh);
             },
             .other => {
-                if (try screenOther(ui, p, &d)) go = next(ui, p, &d, .other);
+                if (try screenOther(ui, &d)) go = next(ui, p, &d, .other);
             },
             .repo_pick => {
                 if (try screenRepoPick(ui, &p, env, &d)) go = if (p.repo != null) .packages else .summary;
@@ -615,8 +613,10 @@ fn next(ui: *Ui, p: Probe, d: *Draft, from: Scr) Scr {
         switch (cur) {
             .network => if (p.net_stack != .none) return cur,
             .services => if (p.services.len > 0) return cur,
-            .ssh => if (probe_mod.findService(p.services, "sshd") != null) return cur,
-            .other => if (probe_mod.ntpService(p.services) != null or probe_mod.findService(p.services, "firewalld") != null or p.selinux) return cur,
+            .ssh => if (sshdTicked(p, d)) return cur else {
+                d.ssh = null; // sshd may have been unticked after the SSH screens
+            },
+            .other => if (p.selinux) return cur,
             .repo_pick => {
                 if (p.repo != null) return .packages;
                 const cands = probe_mod.repoCandidates(ui.arena, p, if (d.disk) |dk| dk.name else "") catch return .summary;
@@ -625,6 +625,14 @@ fn next(ui: *Ui, p: Probe, d: *Draft, from: Scr) Scr {
             else => return cur,
         }
     }
+}
+
+/// Whether sshd starts at boot as the services list now stands.
+fn sshdTicked(p: Probe, d: *const Draft) bool {
+    for (p.services, 0..) |sv, i| {
+        if (std.mem.eql(u8, sv.name, "sshd")) return if (d.svc_on.len == p.services.len) d.svc_on[i] else sv.enabled;
+    }
+    return false;
 }
 
 /// The screen after the ESP choices, skipping those that don't apply.
@@ -1401,32 +1409,25 @@ fn pickKeyFile(ui: *Ui, p: *Probe, d: *Draft) !?[]const u8 {
     }
 }
 
-/// The SSH screens: enable, root login, password login, the user's key.
-/// Esc goes back a step; the first Esc leaves.
+/// The SSH screens, shown only when sshd is ticked in the services list: root
+/// login, password login, the user's key. Esc goes back a step; the first Esc
+/// leaves.
 fn screenSsh(ui: *Ui, p: *Probe, d: *Draft) !bool {
-    const sshd = probe_mod.findService(p.services, "sshd").?;
     var s: answers_mod.Ssh = d.ssh orelse .{};
+    s.enable = true;
     var step: usize = 0;
     while (true) {
         switch (step) {
             0 => {
                 const items = [_]Item{
-                    .{ .label = "Leave SSH as the image has it", .detail = if (sshd.enabled) "sshd is on" else "sshd is off" },
-                    .{ .label = "Set up SSH", .detail = "service, root login, passwords, keys" },
+                    .{ .label = "Keep the image's SSH settings", .detail = "sshd starts at boot" },
+                    .{ .label = "Set up SSH", .detail = "root login, passwords, keys" },
                 };
                 const pick = try menu(ui, "SSH", "Remote login over ssh. The sshd settings go in a drop-in file in /etc/ssh/sshd_config.d/; sshd_config itself is not rewritten.", &items, if (d.ssh != null) 1 else 0) orelse return false;
                 if (pick == 0) {
                     d.ssh = null;
                     return true;
                 }
-                step = 1;
-            },
-            1 => {
-                const on = try yesNo(ui, "SSH service", "Start sshd at boot?", "ssh logins are possible", "sshd stays off", s.enable orelse sshd.enabled) orelse {
-                    step = 0;
-                    continue;
-                };
-                s.enable = on;
                 step = 2;
             },
             2 => {
@@ -1436,7 +1437,7 @@ fn screenSsh(ui: *Ui, p: *Probe, d: *Draft) !bool {
                     .{ .label = "yes", .detail = "root with a password too (not recommended)" },
                 };
                 const pick = try menu(ui, "Root login over ssh", "May root log in over ssh?", &items, @intFromEnum(s.root_login)) orelse {
-                    step = 1;
+                    step = 0;
                     continue;
                 };
                 s.root_login = @enumFromInt(pick);
@@ -1488,8 +1489,7 @@ fn screenSsh(ui: *Ui, p: *Probe, d: *Draft) !bool {
                 step = 5;
             },
             else => {
-                const ssh_on = s.enable orelse sshd.enabled;
-                if (!s.password_auth and ssh_on and s.authorized_key == null and !s.generate_key) {
+                if (!s.password_auth and s.authorized_key == null and !s.generate_key) {
                     const ok = try yesNo(ui, "No way to log in over ssh", "Passwords are off and no key is set up: nobody could log in over ssh. Go on anyway?", "go on, I will add a key later", "go back and choose a key or allow passwords", false) orelse {
                         step = 4;
                         continue;
@@ -1507,74 +1507,24 @@ fn screenSsh(ui: *Ui, p: *Probe, d: *Draft) !bool {
     }
 }
 
-/// NTP, firewall and SELinux mode: each starts at "as the image has it".
-fn screenOther(ui: *Ui, p: Probe, d: *Draft) !bool {
-    var step: usize = 0;
-    while (step < 3) {
-        switch (step) {
-            0 => if (probe_mod.ntpService(p.services)) |ntp| {
-                const items = [_]Item{
-                    .{ .label = "As the image has it", .detail = if (ntp.enabled) "clock sync is on" else "clock sync is off" },
-                    .{ .label = "On", .detail = ui.fmt("start {s} at boot", .{ntp.name}) },
-                    .{ .label = "Off", .detail = "no clock synchronisation" },
-                };
-                const pick = try menu(ui, "Clock synchronisation (NTP)", "Keep the clock right over the network.", &items, if (d.ntp) |v| (if (v) @as(usize, 1) else 2) else 0) orelse return false;
-                d.ntp = switch (pick) {
-                    0 => null,
-                    1 => true,
-                    else => false,
-                };
-            },
-            1 => if (probe_mod.findService(p.services, "firewalld")) |fw| {
-                const items = [_]Item{
-                    .{ .label = "As the image has it", .detail = if (fw.enabled) "firewalld is on" else "firewalld is off" },
-                    .{ .label = "On", .detail = "start firewalld at boot" },
-                    .{ .label = "Off", .detail = "no firewall" },
-                };
-                const pick = try menu(ui, "Firewall", "firewalld filters incoming connections.", &items, if (d.firewall) |v| (if (v) @as(usize, 1) else 2) else 0) orelse {
-                    step = prevOther(p, step);
-                    if (step == 99) return false;
-                    continue;
-                };
-                d.firewall = switch (pick) {
-                    0 => null,
-                    1 => true,
-                    else => false,
-                };
-            },
-            else => if (p.selinux) {
-                const items = [_]Item{
-                    .{ .label = "As the image has it", .detail = "permissive: denials are logged, not enforced" },
-                    .{ .label = "permissive", .detail = "log denials only" },
-                    .{ .label = "enforcing", .detail = "enforce the policy" },
-                    .{ .label = "disabled", .detail = "no SELinux" },
-                };
-                const pick = try menu(ui, "SELinux mode", "Written to /etc/selinux/config in the new system.", &items, if (d.selinux) |m| @as(usize, @intFromEnum(m)) + 1 else 0) orelse {
-                    step = prevOther(p, step);
-                    if (step == 99) return false;
-                    continue;
-                };
-                d.selinux = if (pick == 0) null else @enumFromInt(pick - 1);
-            },
-        }
-        step += 1;
-    }
+/// SELinux mode, starting at "as the image has it". NTP and the firewall are
+/// chosen in the services list.
+fn screenOther(ui: *Ui, d: *Draft) !bool {
+    const items = [_]Item{
+        .{ .label = "As the image has it", .detail = "permissive: denials are logged, not enforced" },
+        .{ .label = "permissive", .detail = "log denials only" },
+        .{ .label = "enforcing", .detail = "enforce the policy" },
+        .{ .label = "disabled", .detail = "no SELinux" },
+    };
+    const pick = try menu(ui, "SELinux mode", "Written to /etc/selinux/config in the new system.", &items, if (d.selinux) |m| @as(usize, @intFromEnum(m)) + 1 else 0) orelse return false;
+    d.selinux = if (pick == 0) null else @enumFromInt(pick - 1);
     return true;
-}
-
-/// The previous applicable step of `screenOther`, or 99 for "leave".
-fn prevOther(p: Probe, from: usize) usize {
-    var s = from;
-    while (s > 0) {
-        s -= 1;
-        if (s == 0 and probe_mod.ntpService(p.services) != null) return 0;
-        if (s == 1 and probe_mod.findService(p.services, "firewalld") != null) return 1;
-    }
-    return 99;
 }
 
 fn ssh_on_summary(a: answers_mod.Answers, p: Probe) bool {
     if (a.ssh) |sh| if (sh.enable) |e| return e;
+    for (a.services_enable) |n| if (std.mem.eql(u8, n, "sshd")) return true;
+    for (a.services_disable) |n| if (std.mem.eql(u8, n, "sshd")) return false;
     if (probe_mod.findService(p.services, "sshd")) |sv| return sv.enabled;
     return false;
 }
@@ -1594,8 +1544,6 @@ fn buildAnswers(ui: *Ui, d: *const Draft, p: Probe) !answers_mod.Answers {
         .services_enable = en.items,
         .services_disable = dis.items,
         .ssh = d.ssh,
-        .ntp = d.ntp,
-        .firewall = d.firewall,
         .selinux = d.selinux,
         .disk = d.disk.?.name,
         .partitioning = d.partitioning,
@@ -2108,6 +2056,26 @@ fn downs(comptime n: usize) [n]Key {
     return @splat(.down);
 }
 
+test "the screen after the services: SSH only when sshd is ticked, then only SELinux" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-services.json");
+    var ui = try testUi(gpa, arena, &[_]Key{});
+    defer ui.screen.deinit(gpa);
+    var d: Draft = .{ .ssh = .{} };
+    // The fixture has sshd off: no SSH screen, and earlier SSH answers are dropped.
+    try std.testing.expectEqual(Scr.other, next(&ui, p, &d, .services));
+    try std.testing.expect(d.ssh == null);
+    d.svc_on = try arena.alloc(bool, p.services.len);
+    for (p.services, 0..) |sv, i| d.svc_on[i] = sv.enabled or std.mem.eql(u8, sv.name, "sshd");
+    try std.testing.expectEqual(Scr.ssh, next(&ui, p, &d, .services));
+    // Without SELinux there is nothing left to ask, firewalld or not.
+    p.selinux = false;
+    try std.testing.expect(next(&ui, p, &d, .ssh) != .other);
+}
+
 test "full flow with services, ssh and network screens: manual network, key paste, confirm" {
     const gpa = std.testing.allocator;
     var st = std.heap.ArenaAllocator.init(gpa);
@@ -2115,18 +2083,18 @@ test "full flow with services, ssh and network screens: manual network, key past
     const arena = st.allocator();
     const p = try loadFixture(arena, "uefi-services.json");
     // checks, disk, auto, hostname, domain "lab.test", root pw x2, user, user pw x2, timezone, keymap,
-    // network: Manual (nothing) = 3rd item (Guided, Copy, Manual), then the services list: Done is
-    // after the 11 services; ssh: Set up SSH, enable yes, root no, password yes, no key;
-    // other: ntp, firewall, selinux as the image has them; summary; confirm.
+    // network: Manual (nothing) = 3rd item (Guided, Copy, Manual), then the services list: the
+    // cursor starts on sshd (the first that can be switched), Enter ticks it, Done is last;
+    // ssh: Set up SSH, root no, password yes, no key; SELinux as the image has it; summary; confirm.
     const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter } ++ testKeys("lab.test") ++ [_]Key{.enter} ++
         testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
         testKeys("dakota") ++ [_]Key{.enter} ++
         testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++
         [_]Key{ .enter, .enter } ++
         downs(2) ++ [_]Key{.enter} ++
-        downs(11) ++ [_]Key{.enter} ++
-        [_]Key{ .down, .enter, .enter, .enter, .enter, .enter } ++
-        [_]Key{ .enter, .enter, .enter } ++
+        [_]Key{.enter} ++ downs(11) ++ [_]Key{.enter} ++
+        [_]Key{ .down, .enter, .enter, .enter, .enter } ++
+        [_]Key{.enter} ++
         [_]Key{.enter} ++
         testKeys("nvme0n1") ++ [_]Key{.enter};
     var ui = try testUi(gpa, arena, &keys);
@@ -2136,7 +2104,8 @@ test "full flow with services, ssh and network screens: manual network, key past
     try std.testing.expectEqual(answers_mod.NetMode.manual, done.answers.network.?.mode);
     try std.testing.expect(done.answers.ssh != null);
     try std.testing.expectEqual(answers_mod.RootLogin.no, done.answers.ssh.?.root_login);
-    try std.testing.expectEqual(@as(usize, 0), done.answers.services_enable.len);
+    try std.testing.expectEqual(@as(usize, 1), done.answers.services_enable.len);
+    try std.testing.expectEqualStrings("sshd", done.answers.services_enable[0]);
     var w: Io.Writer.Allocating = .init(arena);
     try done.plan.writeDryRun(&w.writer);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "left unconfigured") != null);

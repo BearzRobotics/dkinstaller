@@ -375,7 +375,8 @@ its `/etc/dinit.d`, `/usr/lib/dinit.d` and `boot.d` are read).
   dkbuild's image step does: `ln -sfn ../NAME boot.d/NAME` (service in
   `/etc/dinit.d`) or `ln -sfn /usr/lib/dinit.d/NAME boot.d/NAME`; disabling
   removes the link. Only differences from the image become steps.
-- **SSH.** sshd on/off, root login (`no` default, `prohibit-password`,
+- **SSH.** Only when sshd is ticked in the services list (which is where it
+  is switched on or off; the screens don't ask again): root login (`no` default, `prohibit-password`,
   `yes`), password login, and a key for the new user: pasted, read from a
   `*.pub` file on a mounted medium (`/mnt/cdrom`, `/media/*`, or a device
   the screen mounts read-only at `/mnt/cdrom`; never the target disk), or
@@ -388,8 +389,9 @@ its `/etc/dinit.d`, `/usr/lib/dinit.d` and `boot.d` are read).
   0700 `.ssh`, chowned inside a chroot. Password login off with sshd on and
   no key is a lockout: the screen asks for confirmation, the plan refuses it
   unless `allow_lockout` is set.
-- **Other:** NTP (the image's chronyd/ntpd/openntpd/ntpsec service), firewall
-  (firewalld) and SELinux mode (`permissive` default, `enforcing`,
+- **SELinux.** NTP and the firewall are services, so they are chosen in the
+  services list only (the answers file also has `ntp` and `firewall` keys).
+  SELinux mode (`permissive` default, `enforcing`,
   `disabled`: `SELINUX=` in `/etc/selinux/config`, with `sed`).
 - **Timezone** is checked against the live system's `/usr/share/zoneinfo`
   when it exists. **Hostname** is followed by an optional **domain**;
