@@ -837,7 +837,7 @@ fn screenBootloader(ui: *Ui, p: Probe, d: *Draft) !bool {
             }),
         }
     }
-    const pick = try menu(ui, "Boot loader", "Which boot loader should start the new system? Greyed ones say what is missing.", items.items, @intFromEnum(d.bootloader)) orelse return false;
+    const pick = try menu(ui, "Boot loader", "Which boot loader should start the new system? Greyed ones say what is missing.", items.items, @backingInt(d.bootloader)) orelse return false;
     d.bootloader = bl_mod.all[pick];
     // A root chosen under another loader may not be readable by this one: back to ext4, the one every loader reads.
     if (!bl_mod.canReadRoot(d.bootloader, d.root_fs)) d.root_fs = .ext4;
@@ -863,7 +863,7 @@ fn screenRootFs(ui: *Ui, p: Probe, d: *Draft) !bool {
             }),
         }
     }
-    const pick = try menu(ui, "Root filesystem", "What should / be formatted as? Greyed ones say what is missing.", items.items, @intFromEnum(d.root_fs)) orelse return false;
+    const pick = try menu(ui, "Root filesystem", "What should / be formatted as? Greyed ones say what is missing.", items.items, @backingInt(d.root_fs)) orelse return false;
     d.root_fs = fs_mod.all[pick];
     return true;
 }
@@ -986,7 +986,7 @@ fn screenRepoPick(ui: *Ui, p: *Probe, env: Env, d: *Draft) !bool {
         if (pick == 0) return true;
         const c = cands[pick - 1];
         if (mountRepo(ui, p, c.path)) |why| {
-            _ = try message(ui, "Package repository", &.{ ui.fmt("{s}: {s}", .{ c.path, why }) }, warn, "Enter: back");
+            _ = try message(ui, "Package repository", &.{ui.fmt("{s}: {s}", .{ c.path, why })}, warn, "Enter: back");
             continue;
         }
         return true;
@@ -1436,11 +1436,11 @@ fn screenSsh(ui: *Ui, p: *Probe, d: *Draft) !bool {
                     .{ .label = "prohibit-password", .detail = "root with a key only" },
                     .{ .label = "yes", .detail = "root with a password too (not recommended)" },
                 };
-                const pick = try menu(ui, "Root login over ssh", "May root log in over ssh?", &items, @intFromEnum(s.root_login)) orelse {
+                const pick = try menu(ui, "Root login over ssh", "May root log in over ssh?", &items, @backingInt(s.root_login)) orelse {
                     step = 0;
                     continue;
                 };
-                s.root_login = @enumFromInt(pick);
+                s.root_login = @fromBackingInt(@intCast(pick));
                 step = 3;
             },
             3 => {
@@ -1516,8 +1516,8 @@ fn screenOther(ui: *Ui, d: *Draft) !bool {
         .{ .label = "enforcing", .detail = "enforce the policy" },
         .{ .label = "disabled", .detail = "no SELinux" },
     };
-    const pick = try menu(ui, "SELinux mode", "Written to /etc/selinux/config in the new system.", &items, if (d.selinux) |m| @as(usize, @intFromEnum(m)) + 1 else 0) orelse return false;
-    d.selinux = if (pick == 0) null else @enumFromInt(pick - 1);
+    const pick = try menu(ui, "SELinux mode", "Written to /etc/selinux/config in the new system.", &items, if (d.selinux) |m| @as(usize, @backingInt(m)) + 1 else 0) orelse return false;
+    d.selinux = if (pick == 0) null else @fromBackingInt(@intCast(pick - 1));
     return true;
 }
 
@@ -1777,7 +1777,7 @@ const Progress = struct {
 
 const edit_candidates = [_][]const u8{
     "/etc/NetworkManager/NetworkManager.conf", "/etc/dhcpcd.conf", "/etc/wpa_supplicant/wpa_supplicant.conf",
-    "/etc/resolv.conf",                         "/etc/hosts",       "/etc/hostname",
+    "/etc/resolv.conf",                        "/etc/hosts",       "/etc/hostname",
 };
 
 /// Pauses the screens and runs `argv` in the target (shell or editor).

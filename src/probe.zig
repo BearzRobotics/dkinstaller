@@ -247,9 +247,9 @@ pub const Service = struct {
 };
 
 const network_services = [_][]const u8{
-    "sshd",   "firewalld", "cupsd",  "cups",    "httpd",  "nginx",  "smbd",   "nmbd",       "samba",  "nfsd",    "rpcbind", "avahi-daemon",
-    "avahi",  "named",     "bind",   "dhcpd",   "dnsmasq", "vsftpd", "exim",   "postfix",    "dovecot", "mariadb", "mysqld",  "postgresql",
-    "redis",  "ntpd",      "chronyd", "incusd", "incus",  "sddm",   "libvirtd", "docker",    "containerd", "mosquitto", "snmpd", "telnetd",
+    "sshd",       "firewalld",  "cupsd",          "cups",           "httpd",   "nginx",  "smbd",     "nmbd",    "samba",      "nfsd",      "rpcbind", "avahi-daemon",
+    "avahi",      "named",      "bind",           "dhcpd",          "dnsmasq", "vsftpd", "exim",     "postfix", "dovecot",    "mariadb",   "mysqld",  "postgresql",
+    "redis",      "ntpd",       "chronyd",        "incusd",         "incus",   "sddm",   "libvirtd", "docker",  "containerd", "mosquitto", "snmpd",   "telnetd",
     "bluetoothd", "tailscaled", "wpa_supplicant", "networkmanager",
 };
 
@@ -1013,7 +1013,6 @@ test "a service whose dependency is not in the image is detected" {
     try std.testing.expectEqualStrings("avahi-daemon", missingDependency("type = process\ndepends-on: dbus\ndepends-on: avahi-daemon\n", &svcs).?);
     try std.testing.expect(missingDependency("depends-on = dbus\nwaits-for: cupsd\nafter: nothing\n", &svcs) == null);
 }
-
 
 test "builtinSymbols finds =y, not =m or unset" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
