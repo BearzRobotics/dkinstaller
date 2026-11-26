@@ -70,8 +70,9 @@ pub const Ui = struct {
     fn frame(self: *Ui, title: []const u8, hint: []const u8) Rect {
         const s = &self.screen;
         s.clear();
-        const w: i32 = s.w;
-        const h: i32 = s.h;
+        // A terminal smaller than this is drawn as if it were this big (and clipped).
+        const w: i32 = @max(s.w, 20);
+        const h: i32 = @max(s.h, 10);
         s.fill(0, 0, w, 1, selected);
         _ = s.text(1, 0, "dkrescue-install", selected, @intCast(w - 2));
         s.box(1, 1, w - 2, h - 3, title, normal);
@@ -2308,4 +2309,19 @@ test "choosing no extra packages forgets a repository the screens mounted" {
     var d: Draft = .{ .packages = &.{"curl"}, .keep_repo = true };
     try std.testing.expect(try screenRepoPick(&ui, &p, .{ .is_root = true, .dry_run = true, .ids = test_ids }, &d));
     try std.testing.expect(p.repo == null and d.packages.len == 0 and !d.keep_repo);
+}
+
+test "a tiny terminal is clipped, not a crash" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    for ([_][2]u16{ .{ 1, 1 }, .{ 5, 3 }, .{ 19, 4 } }) |size| {
+        var ui: Ui = .{ .gpa = gpa, .arena = st.allocator(), .screen = try term.Screen.init(gpa, size[0], size[1], false), .script = &.{ .page_up, .page_down, .esc, .esc, .esc } };
+        defer ui.screen.deinit(gpa);
+        const items = [_]Item{.{ .label = "one", .sub = "two lines" }};
+        try std.testing.expect((try menu(&ui, "Title", "An introduction long enough to wrap", &items, 0)) == null);
+        try std.testing.expect((try input(&ui, "Title", "Words to wrap here", "value", .{})) == null);
+        const lines = [_]Line{ .{ .text = "a" }, .{ .text = "b" } };
+        try std.testing.expect(!try viewer(&ui, "Title", &lines, "hint"));
+    }
 }

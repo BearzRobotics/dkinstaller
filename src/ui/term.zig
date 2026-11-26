@@ -441,8 +441,9 @@ pub const Terminal = struct {
                 if (d.key == .none) continue;
                 return d.key;
             }
-            // Incomplete sequence: read more.
-            if (!try self.fill(200)) {
+            // Incomplete sequence: read more. With the buffer full there is no room to, and it
+            // would be looked at for ever.
+            if (self.pending_len == self.pending.len or !try self.fill(200)) {
                 self.pending_len = 0; // give up on a broken sequence
             }
         }
