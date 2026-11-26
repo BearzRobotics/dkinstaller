@@ -27,7 +27,7 @@ Recommended, not blocking:
 
 ### 1.1 Building and adding the installer
 
-From the `dkinstaller` repository (Zig 0.17.0), static, musl, baseline
+From the `dkinstaller` repository (Zig 0.17.1), static, musl, baseline
 x86-64 (3):
 
 ```

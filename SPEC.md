@@ -61,7 +61,7 @@ DKRescue's CONSTRAINTS.md applies, and these follow from it:
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Language | **Zig 0.17.0** | Pinned in `build.zig.zon`, as in dklilo and dkde. |
+| Language | **Zig 0.17.1** | Pinned in `build.zig.zon`, as in dklilo and dkde. |
 | Terminal UI | **libvaxis**, or a small terminal layer of our own | See 4.1. |
 | Disk information | `lsblk --json` and `blkid`, parsed with `std.json` | Both from util-linux, already on the disc. |
 | Disk changes | `wipefs`, `sfdisk`, `mkfs.vfat`, `mkfs.ext4`, `cfdisk` | Run as commands; see 6. |
