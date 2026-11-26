@@ -226,7 +226,8 @@ pub const Runner = struct {
         while (self.mounted.pop()) |mp| {
             defer self.gpa.free(mp);
             self.logPrint("\n== cleanup: umount {s}\n", .{mp});
-            const res = std.process.run(self.gpa, self.io, .{ .argv = &.{ "umount", mp } }) catch |e| {
+            // -R: a recursive bind (/sys) has mounts under it, and holds up the root too.
+            const res = std.process.run(self.gpa, self.io, .{ .argv = &.{ "umount", "-R", mp } }) catch |e| {
                 self.logPrint("-- umount failed: {s}\n", .{@errorName(e)});
                 continue;
             };
@@ -260,7 +261,8 @@ pub const Runner = struct {
             else => return,
         };
         const prog = std.fs.path.basename(c.argv[0]);
-        if (std.mem.eql(u8, prog, "mount") and c.argv.len >= 3) {
+        // `--make-rslave` changes a mount that is already recorded.
+        if (std.mem.eql(u8, prog, "mount") and c.argv.len >= 3 and !std.mem.startsWith(u8, c.argv[1], "--make-")) {
             const mp = self.gpa.dupe(u8, c.argv[c.argv.len - 1]) catch return;
             self.mounted.append(self.gpa, mp) catch self.gpa.free(mp);
         } else if (std.mem.eql(u8, prog, "umount") and c.argv.len >= 2) {
@@ -442,6 +444,10 @@ pub fn chrootRun(gpa: Allocator, io: Io, argv: []const []const u8) ?[]const u8 {
             break;
         }
         done += 1;
+        if (std.mem.eql(u8, bd.opt, "--rbind") and !runQuiet(io, &.{ "mount", "--make-rslave", dst })) {
+            problem = "can't make the bind mounts private to the target";
+            break;
+        }
     }
     if (problem == null) {
         var full: std.ArrayList([]const u8) = .empty;
@@ -454,7 +460,11 @@ pub fn chrootRun(gpa: Allocator, io: Io, argv: []const []const u8) ?[]const u8 {
             _ = child.wait(io) catch {};
         } else |_| problem = "can't run chroot";
     }
-    // Unbind in reverse, whatever happened.
+    if (problem) |why| if (std.mem.startsWith(u8, why, "can't make")) {
+        done -= 1;
+    };
+    // Unbind in reverse, whatever happened. A mount that could not be made a slave is left
+    // mounted rather than risk unmounting the live system's own.
     while (done > 0) {
         done -= 1;
         const dst = std.fmt.allocPrint(gpa, "{s}{s}", .{ plan_mod.target, binds[done].src }) catch continue;
@@ -807,4 +817,20 @@ test "the planned wpa_supplicant step keeps the passphrase out of the log and th
         const st = try tmp.dir.statFile(testing.io, name, .{});
         try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
     }
+}
+
+test "a change of propagation is not recorded as a new mount" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const log = try std.fmt.allocPrint(testing.allocator, "{s}/install.log", .{dir});
+    defer testing.allocator.free(log);
+    var r = try Runner.init(testing.allocator, testing.io, log, .{});
+    defer r.deinit();
+    r.trackMounts(cmdStep("bind", &.{ "mount", "--rbind", "/sys", "/t/sys" }));
+    r.trackMounts(cmdStep("slave", &.{ "mount", "--make-rslave", "/t/sys" }));
+    try testing.expectEqual(@as(usize, 1), r.mounted.items.len);
+    r.trackMounts(cmdStep("unbind", &.{ "umount", "-R", "/t/sys" }));
+    try testing.expectEqual(@as(usize, 0), r.mounted.items.len);
 }

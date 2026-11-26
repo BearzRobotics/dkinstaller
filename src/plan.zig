@@ -472,6 +472,8 @@ fn bindMounts(b: *Builder) !void {
     try b.cmd("Bind /dev into the new system", &.{ "mount", "--bind", "/dev", target ++ "/dev" });
     try b.cmd("Mount /proc in the new system", &.{ "mount", "-t", "proc", "proc", target ++ "/proc" });
     try b.cmd("Bind /sys into the new system", &.{ "mount", "--rbind", "/sys", target ++ "/sys" });
+    // Without this, unmounting the copy can unmount the live system's own submounts.
+    try b.cmd("Keep unmounts there from reaching the live system", &.{ "mount", "--make-rslave", target ++ "/sys" });
 }
 
 fn unbindMounts(b: *Builder) !void {
@@ -1257,6 +1259,7 @@ test "GRUB on BIOS: a drop-in for root=PARTUUID, grub-install into the disk, upd
     try std.testing.expect(contains(out, "chroot /run/dkrescue-install/target update-grub\n"));
     try std.testing.expect(contains(out, "mount --rbind /sys /run/dkrescue-install/target/sys"));
     try std.testing.expect(contains(out, "umount -R /run/dkrescue-install/target/sys"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "mount --make-rslave /run/dkrescue-install/target/sys").? > std.mem.indexOf(u8, out, "mount --rbind /sys").?);
     try std.testing.expect(!contains(out, "dklilo"));
     try std.testing.expect(!contains(out, "dklilo.conf"));
 }
