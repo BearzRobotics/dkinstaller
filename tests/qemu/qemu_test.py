@@ -180,7 +180,8 @@ def cmd_inject(args):
         "exit code is 1": code == "1",
         "names the failed step": "failed:" in out,
         "log says failed": "-- failed:" in log,
-        "log lists what did not run": "== not run" in log or "failed" in log,
+        # Not true when the last step is the one made to fail.
+        "log lists what did not run": "== not run" in log,
         "nothing left mounted": "dkrescue-install/target" not in mounts,
         "guard disk untouched": before == after,
     }

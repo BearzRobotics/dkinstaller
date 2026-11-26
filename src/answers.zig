@@ -638,7 +638,10 @@ test "parse the packages section" {
     try std.testing.expectEqual(@as(usize, 3), a.packages.len);
     try std.testing.expectEqualStrings("htop", a.packages[1]);
     try std.testing.expect(a.keep_repo);
-    try std.testing.expectError(error.BadAnswers, parse(arena_state.allocator(), base ++ "\ninstall = -oops", &diag));
+    // Well-formed TOML with a name apk would read as an option.
+    const bad = try std.mem.replaceOwned(u8, arena_state.allocator(), base, "\"htop\"", "\"--root=/\"");
+    try std.testing.expectError(error.BadAnswers, parse(arena_state.allocator(), bad, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message, "invalid package name") != null);
     try std.testing.expect(!validPackageName("--root"));
     try std.testing.expect(validPackageName("libstdc++"));
 }
@@ -740,7 +743,8 @@ test "autoinstall keys and post commands" {
     try std.testing.expectEqualStrings("/dev/disk/by-id/nvme-X", a.confirm_erase.?);
     try std.testing.expectEqual(WhenDone.poweroff, a.when_done);
     try std.testing.expectEqual(@as(usize, 2), a.post.len);
-    try std.testing.expectError(error.BadAnswers, parse(arena_state.allocator(), "[install]\nwhen_done = explode\n", &diag));
+    try std.testing.expectError(error.BadAnswers, parse(arena_state.allocator(), "[install]\ndisk = \"sda\"\npartitioning = \"auto\"\nwhen_done = \"explode\"\n", &diag));
+    try std.testing.expectEqualStrings("[install] when_done must be reboot, poweroff or shell", diag.message);
 }
 
 test "parse rejects plain-text passwords and names the key" {

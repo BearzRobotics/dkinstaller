@@ -59,6 +59,8 @@ gateway = "10.0.2.2"
 
 [packages]
 install = ["no-such-package-dk"]
+# The fake repository's key is not one the image trusts.
+trust_medium_key = true
 """
 
 
@@ -120,7 +122,7 @@ def main():
 
     run("mkdir -p /mnt/seed && mount -o ro /dev/vdc /mnt/seed && cp /mnt/seed/dkrescue-install /usr/sbin/dkrescue-install && chmod +x /usr/sbin/dkrescue-install")
     run("IF=$(ls /sys/class/net | grep -v '^lo$' | head -1); sed \"s/@IFACE@/$IF/\" /mnt/seed/answers.toml > /tmp/answers.toml; echo IFACE=$IF")
-    out = run("grep -c . /tmp/answers.toml")
+    live_user = run("awk -F: '$3>=1000 && $3<60000 && $6 ~ /^\\/home\\// {print $1; exit}' /etc/passwd").strip().splitlines()[-1].strip()
     child.sendline("dkrescue-install --answers /tmp/answers.toml --yes-really-erase vda --repo /mnt/seed/repo 2>&1 | tee /tmp/install.out; echo EXIT=${PIPESTATUS[0]}")
     child.expect(r"EXIT=(\d+)", timeout=q.INSTALL_TIMEOUT)
     code = child.match.group(1)
@@ -129,7 +131,7 @@ def main():
     install_out = run("cat /tmp/install.out", 60)
     check("install exits 0 (apk failure is only a warning)", code == "0", f"exit {code}: {install_out[-600:]}")
     check("the failed apk step is reported as a warning", "warning: Install 1 extra package" in install_out, install_out[-400:])
-    check("the live user was removed by its real name", "userdel" in install_out)
+    check("the live user was removed by its real name", bool(live_user) and f"userdel -R /run/dkrescue-install/target -r {live_user}" in install_out, live_user)
 
     # Inspect the new system from the live session.
     run("mkdir -p /mnt/t && mount /dev/vda3 /mnt/t")
@@ -147,14 +149,17 @@ def main():
     dropin = file("/etc/ssh/sshd_config.d/10-dkinstall.conf")
     check("sshd drop-in", "PermitRootLogin no" in dropin and "PasswordAuthentication no" in dropin, dropin)
     check("sshd_config includes the drop-in directory", "Include /etc/ssh/sshd_config.d/" in file("/etc/ssh/sshd_config"))
-    ak = run("ls -ln /mnt/t/home/tester/.ssh/authorized_keys; cat /mnt/t/home/tester/.ssh/authorized_keys; ls -ldn /mnt/t/home/tester/.ssh")
-    uid = run("grep '^tester:' /mnt/t/etc/passwd | cut -d: -f3,4").strip()
-    check("authorized_keys: key, mode 600, owned by the user", KEY in ak and "-rw-------" in ak and uid.split(":")[0] in ak and "drwx------" in ak, ak + " uid=" + uid)
+    ak = file("/home/tester/.ssh/authorized_keys")
+    # Mode and numeric owner of each, against the new system's own passwd entry.
+    owners = run("stat -c 'ST %a %u:%g %n' /mnt/t/home/tester/.ssh /mnt/t/home/tester/.ssh/authorized_keys; grep '^tester:' /mnt/t/etc/passwd | awk -F: '{print \"ID \" $3 \":\" $4}'")
+    ids = [l.split()[1] for l in owners.splitlines() if l.startswith("ID ")]
+    stats = [l.split()[1:3] for l in owners.splitlines() if l.startswith("ST ")]
+    check("authorized_keys: key, mode 600, owned by the user", KEY in ak and len(ids) == 1 and stats == [["700", ids[0]], ["600", ids[0]]], ak + owners)
     check("ssh host keys generated at install", has("test -f /mnt/t/etc/ssh/ssh_host_ed25519_key"))
     nm = run("ls -l /mnt/t/etc/NetworkManager/system-connections/; cat /mnt/t/etc/NetworkManager/system-connections/dk-*.nmconnection")
     check("NetworkManager connection: static, 0600", "address1=10.0.2.15/24,10.0.2.2" in nm and "-rw-------" in nm and "dns=10.0.2.3;" in nm, nm)
     check("log copied to the new system", has("test -s /mnt/t/var/log/dkrescue-install.log"))
-    check("live user gone", "live:" not in run("cat /mnt/t/etc/passwd"))
+    check("live user gone", bool(live_user) and not has(f"grep '^{live_user}:' /mnt/t/etc/passwd"), live_user)
     skip("SELinux mode written to /etc/selinux/config", "this ISO has no /etc/selinux/config; the step is skipped as designed; needs the next ISO")
     check("no stray .autorelabel without policy", not has("test -e /mnt/t/.autorelabel"))
     skip("apk install from a repository medium", "needs a real signed repository disc; here the apk step ran and failed softly on a fake index")
@@ -201,7 +206,7 @@ def main():
         print("     services in the booted system:\n" + "\n".join("       " + l for l in svc.strip().splitlines()))
         # dinitctl list shows {+} for a started service, {X}/blank for stopped ones.
         check("sshd started in the installed system", any("{+}" in l and "sshd" in l and "keys" not in l for l in svc.splitlines()), svc)
-        check("firewalld and greetd are not started (disabled), as chosen", not any("{+}" in l and ("firewalld" in l or "greetd" in l) for l in svc.splitlines()), svc)
+        check("firewalld and greetd are not started (disabled), as chosen", "{+}" in svc and not any("{+}" in l and ("firewalld" in l or "greetd" in l) for l in svc.splitlines()), svc)
         check("hostname in the booted system", "qemutest" in run("hostname"))
         child.sendline("poweroff")
     except (pexpect.TIMEOUT, pexpect.EOF) as e:

@@ -161,11 +161,20 @@ def main():
     info = run(child, "uname -r; cat /proc/cmdline; findmnt -no SOURCE,FSTYPE,OPTIONS /; sudo findmnt -no TARGET,SOURCE,FSTYPE /boot /boot/efi 2>&1; sudo ls /boot | head -14")
     (work / "installed-info.txt").write_text(info)
     print(info)
+    # Asked on their own, so nothing else in the output can match.
+    rootfs = run(child, "findmnt -no FSTYPE /").strip()
+    wanted = {"dklilo": "sudo test -f /boot/dklilo.conf",
+              "grub": "sudo test -f /boot/grub/grub.cfg",
+              "systemd-boot": "test \"$(findmnt -no FSTYPE /boot)\" = vfat && sudo test -d /boot/loader/entries"}[args.bootloader]
+    loader_ok = "LOADER=0" in run(child, wanted + "; echo LOADER=$?")
     child.sendline("sudo poweroff")
     stop(child)
     ok = True
-    if args.root_fs != "ext4" and args.root_fs not in info:
-        print(f"WARNING: root is not {args.root_fs}")
+    if rootfs.splitlines()[-1:] != [args.root_fs]:
+        print(f"FAIL: root is {rootfs!r}, not {args.root_fs}")
+        ok = False
+    if not loader_ok:
+        print(f"FAIL: the installed system lacks what {args.bootloader} installs")
         ok = False
     print(f"RESULT {tag}: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1

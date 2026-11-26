@@ -1535,7 +1535,7 @@ test "SELinux: label step is conditional and never fatal; mode is written" {
     try std.testing.expect(contains(out, "setfiles -F -r /run/dkrescue-install/target -e /run/dkrescue-install/target/proc"));
     try std.testing.expect(contains(out, "-e /run/dkrescue-install/target/boot/efi /run/dkrescue-install/target/etc/selinux/targeted/contexts/files/file_contexts /run/dkrescue-install/target"));
     try std.testing.expect(contains(out, "runs only if all of these exist: /run/dkrescue-install/target/etc/selinux/config"));
-    try std.testing.expect(contains(out, "failure here is a warning"));
+    try expectSoft(r.plan, "SELinux", 3);
     try std.testing.expect(contains(out, "touch /run/dkrescue-install/target/.autorelabel"));
     try std.testing.expect(contains(out, "s/^SELINUX=.*/SELINUX=enforcing/"));
     // The log copy comes after the labelling steps, so it holds their warnings.
@@ -1739,7 +1739,6 @@ test "network: manual leaves it unconfigured with the services off; manual-shell
     try std.testing.expect(std.mem.indexOf(u8, out, "open a shell").? > std.mem.indexOf(u8, out, "unsquashfs").?);
     try std.testing.expect(std.mem.indexOf(u8, out, "open a shell").? < std.mem.indexOf(u8, out, "dklilo").?);
     try std.testing.expectEqualStrings("/dev/nvme0n1p3", r.plan.root_dev);
-    // chroot is a program the install needs when a key is chowned.
 }
 
 test "repository: sets, no sets, none, and a bad package name" {
@@ -1791,7 +1790,6 @@ test "--repo path: missing directory and a directory with no layout are errors" 
     const arena = st.allocator();
     try std.testing.expectError(error.RepoMissing, probe_mod.findRepo(arena, std.testing.io, "tests/repos/does-not-exist", "x86_64"));
     try std.testing.expectError(error.RepoNoLayout, probe_mod.findRepo(arena, std.testing.io, "tests/repos/empty", "x86_64"));
-    try std.testing.expectEqual(@as(?probe_mod.Repo, null), try probe_mod.findRepo(arena, std.testing.io, null, "x86_64") orelse null);
 }
 
 test "package sets parse; candidates never include the target disk" {
@@ -1801,10 +1799,26 @@ test "package sets parse; candidates never include the target disk" {
     const sets = try probe_mod.parseSets(arena, "# c\nweb | Web | nginx php\nbad\n | x | y\nempty | none |\n");
     try std.testing.expectEqual(@as(usize, 1), sets.len);
     try std.testing.expectEqualStrings("nginx", sets[0].packages[0]);
-    const p = try loadFixture(arena, "uefi-nvme-blank.json");
-    const c = try probe_mod.repoCandidates(arena, p, "sdc");
-    for (c) |x| try std.testing.expect(!std.mem.startsWith(u8, x.path, "/dev/sdc") and !std.mem.eql(u8, x.path, "/dev/sdb1"));
-    // sdc1 is mounted anyway; the live medium (sdb1) is never offered.
+    var p = try loadFixture(arena, "uefi-nvme-blank.json");
+    // Unmounted media on the live disk, the data disk and a third one.
+    const disks = try arena.dupe(Disk, p.disks);
+    for (disks) |*disk| {
+        const parts = try arena.dupe(Partition, disk.partitions);
+        for (parts) |*part| part.mounted = false;
+        disk.partitions = parts;
+        if (std.mem.eql(u8, disk.name, "sdd")) disk.fstype = "vfat";
+    }
+    p.disks = disks;
+    const all = try probe_mod.repoCandidates(arena, p, "");
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+    try std.testing.expectEqualStrings("/dev/sdc1", all[0].path);
+    try std.testing.expectEqualStrings("/dev/sdd", all[1].path);
+    // Never the target disk (by name or path), and never the live medium (sdb).
+    for ([_][]const u8{ "sdc", "/dev/sdc" }) |target_disk| {
+        const c = try probe_mod.repoCandidates(arena, p, target_disk);
+        try std.testing.expectEqual(@as(usize, 1), c.len);
+        try std.testing.expectEqualStrings("/dev/sdd", c[0].path);
+    }
     try std.testing.expectEqualStrings("a label", probe_mod.serviceLabel("#!/bin/sh\n# a label\nx"));
     try std.testing.expectEqualStrings("Hello", probe_mod.serviceLabel("type = process\ndescription = Hello\n"));
     const keys = try probe_mod.findPubFiles(arena, std.testing.io, &.{"tests/keys"});
@@ -1819,11 +1833,23 @@ test "post-install commands run in the chroot as soft steps, after configuration
     const arena = st.allocator();
     var a = svcAnswers();
     a.post = &.{ "echo hi > /etc/motd", "ln -s a b" };
-    const out = try dryRun(arena, (try buildSvc(arena, a)).plan);
+    const plan = (try buildSvc(arena, a)).plan;
+    try expectSoft(plan, "Post-install command", 2);
+    const out = try dryRun(arena, plan);
     try std.testing.expect(contains(out, "chroot /run/dkrescue-install/target /bin/sh -c 'echo hi > /etc/motd'"));
     try std.testing.expect(contains(out, ". Post-install command: ln -s a b"));
     try std.testing.expect(std.mem.indexOf(u8, out, "echo hi").? < std.mem.indexOf(u8, out, "dklilo").?);
-    try std.testing.expect(contains(out, "failure here is a warning"));
+}
+
+/// Exactly `count` steps mention `what` in their description, and each only warns on failure.
+fn expectSoft(plan: Plan, what: []const u8, count: usize) !void {
+    var n: usize = 0;
+    for (plan.steps) |s| {
+        if (std.mem.indexOf(u8, s.desc, what) == null) continue;
+        try std.testing.expect(s.soft);
+        n += 1;
+    }
+    try std.testing.expectEqual(count, n);
 }
 
 fn biosGptFixture(arena: Allocator) !Probe {

@@ -91,14 +91,17 @@ def main():
     check("the flag shows in /proc/cmdline", "dkinstall.auto=1" in run("cat /proc/cmdline"))
     child.sendline("dkrescue-install --auto 2>&1 | tee /tmp/auto.out; echo EXIT=${PIPESTATUS[0]}")
     i = child.expect([r"EXIT=(\d+)", pexpect.EOF], timeout=q.INSTALL_TIMEOUT)
+    powered_off = i == 1
+    if not powered_off:
+        # `poweroff` returns before the machine is down; QEMU exiting is the proof.
+        powered_off = child.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=120) == 0
     child.close(force=True)
     log = open(work / "serial.log").read()
     check("found the answers file on the unmounted second disk", "found dkinstall.toml on /dev/vdc" in log, log[-800:])
     check("the gates passed and it says which disk it erases", "erasing /dev/vda as the answers file confirms" in log)
     check("no screen was needed: installation completed", "Installation complete." in log, log[-1200:])
     check("the failing post command is only a warning", "warning: Post-install command: false" in log)
-    check("it powered the machine off (when_done = poweroff)", i == 1 or "autoinstall: poweroff" in log)
-    child.close(force=True)
+    check("it powered the machine off (when_done = poweroff)", powered_off)
     check("guard disk untouched", q.sha256(guard) == before)
 
     # Boot the installed disk (AHCI: the kernel has no initrd and no virtio-blk).

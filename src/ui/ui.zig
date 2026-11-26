@@ -2133,7 +2133,7 @@ test "Esc goes back one screen at a time" {
     try std.testing.expectEqual(keys.len, ui.script_i);
 }
 
-test "wrong confirmation is not accepted; ineligible disks are shown with a reason" {
+test "ineligible disks are shown with a reason" {
     const gpa = std.testing.allocator;
     var st = std.heap.ArenaAllocator.init(gpa);
     defer st.deinit();
@@ -2324,4 +2324,34 @@ test "a tiny terminal is clipped, not a crash" {
         const lines = [_]Line{ .{ .text = "a" }, .{ .text = "b" } };
         try std.testing.expect(!try viewer(&ui, "Title", &lines, "hint"));
     }
+}
+
+test "wrong confirmation is not accepted" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try loadFixture(arena, "uefi-nvme-blank.json");
+    const plan = (try plan_mod.build(arena, p, .{ .disk = "nvme0n1", .partitioning = .auto, .root_pw = .{ .hash = "$6$r$x" }, .user = "dakota", .user_pw = .{ .hash = "$6$u$x" } }, test_ids)).plan;
+    const disk = p.findDisk("nvme0n1").?;
+    // Through the summary, then: nothing, a near miss, another disk's name. Only Esc gets out.
+    for ([_][]const Key{
+        &([_]Key{ .enter, .enter, .esc }),
+        &([_]Key{.enter} ++ testKeys("nvme0n") ++ [_]Key{ .enter, .esc }),
+        &([_]Key{.enter} ++ testKeys("sdc") ++ [_]Key{ .enter, .esc }),
+    }) |keys| {
+        var ui = try testUi(gpa, arena, keys);
+        defer ui.screen.deinit(gpa);
+        try std.testing.expect(!try confirmPlan(&ui, disk, plan));
+        try std.testing.expectEqual(keys.len, ui.script_i);
+    }
+    var ui = try testUi(gpa, arena, &([_]Key{.enter} ++ testKeys("nvme0n1") ++ [_]Key{.enter}));
+    defer ui.screen.deinit(gpa);
+    try std.testing.expect(try confirmPlan(&ui, disk, plan));
+    // The screens' own confirmation, after the summary.
+    var d: Draft = .{ .disk = disk, .user = "dakota", .root_pw = "a", .user_pw = "b" };
+    var wrong = try testUi(gpa, arena, &([_]Key{.enter} ++ testKeys("nvme0n1x") ++ [_]Key{ .enter, .esc }));
+    defer wrong.screen.deinit(gpa);
+    try std.testing.expect((try screenSummary(&wrong, p, .{ .is_root = true, .dry_run = true, .ids = test_ids }, &d)) == null);
+    try std.testing.expectEqual(wrong.script.len, wrong.script_i);
 }
