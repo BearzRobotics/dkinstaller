@@ -1298,7 +1298,10 @@ fn screenNetwork(ui: *Ui, p: *Probe, d: *Draft) !bool {
             2 => {
                 const joined = try std.mem.join(ui.arena, " ", net.dns);
                 const v = try input(ui, "DNS servers", "DNS servers for these connections, IPv4 or IPv6, separated by spaces. Leave empty to take them from DHCP.", joined, .{ .validate = dnsError }) orelse {
-                    step = 1;
+                    // With no wired interface, step 1 asks nothing and would come straight back.
+                    var any_wired = false;
+                    for (p.net_ifaces) |ifc| any_wired = any_wired or !ifc.wireless;
+                    step = if (any_wired) 1 else 0;
                     continue;
                 };
                 var list: std.ArrayList([]const u8) = .empty;
@@ -2206,4 +2209,17 @@ test "choosing a disk forgets the earlier disk's partition choices" {
     d.root = d.disk.?.partitions[0];
     // This used to panic building the summary.
     try std.testing.expect((try screenSummary(&ui, p, .{ .is_root = true, .dry_run = true, .ids = test_ids }, &d)) == null);
+}
+
+test "with only WiFi, Esc leaves the DNS screen and then the network screens" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-services.json");
+    p.net_ifaces = &.{.{ .name = "wlan0", .wireless = true }};
+    var ui = try testUi(gpa, arena, &[_]Key{ .enter, .esc, .esc });
+    defer ui.screen.deinit(gpa);
+    var d: Draft = .{};
+    try std.testing.expect(!try screenNetwork(&ui, &p, &d));
 }
