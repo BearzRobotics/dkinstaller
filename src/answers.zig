@@ -13,7 +13,7 @@
 //!                   allow_lockout
 //!     [network]     mode, copy, dns = [..], search, wifi_ssid, wifi_psk, wifi_hidden,
 //!                   and one [[network.iface]] (name, kind, address, gateway) per interface
-//!     [packages]    install = ["name"], keep_repo
+//!     [packages]    install = ["name"], keep_repo, trust_medium_key
 //!     [post]        commands = ["sh -c command", ...]
 //!
 //! Passwords are crypt(3) hashes, never plain text. Unknown sections and keys
@@ -230,6 +230,8 @@ pub const Answers = struct {
     packages: []const []const u8 = &.{},
     /// Leave a (commented-out) line for the repository in the new system.
     keep_repo: bool = false,
+    /// Accept a repository signed with a key the system does not already trust.
+    trust_medium_key: bool = false,
 };
 
 /// Where and why parsing failed.
@@ -457,9 +459,10 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
     }
 
     if (try p.section(root, "packages")) |t| {
-        try p.only(t, &.{ "install", "keep_repo" }, "packages");
+        try p.only(t, &.{ "install", "keep_repo", "trust_medium_key" }, "packages");
         a.packages = try p.strings(t, "packages", "install", validPackageName, "invalid package name");
         if (try p.boolean(t, "packages", "keep_repo")) |v| a.keep_repo = v;
+        if (try p.boolean(t, "packages", "trust_medium_key")) |v| a.trust_medium_key = v;
     }
 
     if (try p.section(root, "post")) |t| {

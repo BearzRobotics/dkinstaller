@@ -916,8 +916,12 @@ fn planRepoPackages(b: *Builder, p: Probe, a: Answers) BuildError!void {
         if (!answers_mod.validPackageName(name)) return b.refuse("invalid package name: {s}", .{name});
     }
     const arena = b.arena;
+    if (repo.keys.len > 0 and !repo.keys_trusted and !a.trust_medium_key) {
+        return b.refuse("the repository's signing key ({s}) is not one the system already trusts, so the medium only vouches for itself; set [packages] trust_medium_key = true to use it anyway", .{repo.keys[0]});
+    }
     const keys_dir = target ++ "/etc/apk/keys";
-    if (repo.keys.len > 0) {
+    // The new system goes on trusting the key only if the repository is kept.
+    if (repo.keys.len > 0 and a.keep_repo) {
         try b.cmd("Create the apk key directory", &.{ "mkdir", "-p", keys_dir });
         var cp: std.ArrayList([]const u8) = .empty;
         try cp.append(arena, "cp");
@@ -1663,9 +1667,14 @@ test "repository: sets, no sets, none, and a bad package name" {
     // With sets (data/apks layout, key in keys/).
     p.repo = (try probe_mod.findRepo(arena, std.testing.io, "tests/repos/with-sets", "x86_64")).?;
     try std.testing.expectEqual(@as(usize, 2), p.repo.?.sets.len);
+    // The test host does not trust this key: it takes consent.
+    p.repo.?.keys_trusted = false;
+    try std.testing.expect(contains((try build(arena, p, a, test_ids)).refused, "trust_medium_key"));
+    a.trust_medium_key = true;
     var out = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
     try std.testing.expect(contains(out, "apk --root /run/dkrescue-install/target --no-network --no-progress --repositories-file /dev/null --repository tests/repos/with-sets/data/apks/x86_64/Packages.adb --keys-dir tests/repos/with-sets/keys add curl wget"));
-    try std.testing.expect(contains(out, "cp tests/repos/with-sets/keys/fenriros.pub /run/dkrescue-install/target/etc/apk/keys"));
+    // Not kept: the new system gets neither the repository nor its key.
+    try std.testing.expect(!contains(out, "/etc/apk/keys"));
     try std.testing.expect(!contains(out, "/etc/apk/repositories"));
     // apk comes before the bootloader, after the copy.
     try std.testing.expect(std.mem.indexOf(u8, out, "apk --root").? > std.mem.indexOf(u8, out, "unsquashfs").?);
@@ -1673,6 +1682,7 @@ test "repository: sets, no sets, none, and a bad package name" {
     // Keep the repository: a commented-out line.
     a.keep_repo = true;
     out = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    try std.testing.expect(contains(out, "cp tests/repos/with-sets/keys/fenriros.pub /run/dkrescue-install/target/etc/apk/keys"));
     try std.testing.expect(contains(out, "tee -a /run/dkrescue-install/target/etc/apk/repositories"));
     try std.testing.expect(contains(out, "#/mnt/cdrom/data/apks/x86_64/Packages.adb"));
     // Without sets (apks/ layout, APKINDEX.tar.gz, key next to the packages).

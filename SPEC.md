@@ -486,8 +486,14 @@ the repository: if so a commented-out line is appended to the new
 system's `/etc/apk/repositories` with an explanation. The step runs after
 the system copy and before the bootloader:
 `apk --root TARGET --no-network --no-progress --repositories-file /dev/null
---repository INDEX --keys-dir KEYDIR add PKG...`, after copying the key
-into `TARGET/etc/apk/keys`. An apk failure is a soft failure.
+--repository INDEX --keys-dir KEYDIR add PKG...`, copying the key
+into `TARGET/etc/apk/keys` when the repository is kept. An apk failure is a
+soft failure.
+
+A medium's key that is not byte-identical to one in the image's
+`etc/apk/keys` or `usr/share/apk/keys` proves nothing about where the
+packages came from. The screens show its SHA-256 and ask (default no); an
+answers file needs `[packages] trust_medium_key = true`.
 
 ### 5.11 Autoinstall (0.0.4; TOML answers files since 0.0.5)
 

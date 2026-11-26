@@ -430,6 +430,9 @@ pub const Repo = struct {
     key_dir: ?[]const u8 = null,
     /// Key files (`*.pub`) in `key_dir`, absolute.
     keys: []const []const u8 = &.{},
+    /// Every key in `keys` is one the system image already trusts. Otherwise the medium
+    /// vouches for itself, and the user has to agree to that.
+    keys_trusted: bool = false,
     /// From `packages-sets.txt` / `sets.txt`; empty when the medium has none.
     sets: []const PackageSet = &.{},
     /// The installer mounted `mounted_dev` itself, so the plan unmounts it.
@@ -490,6 +493,36 @@ pub fn parseSets(arena: Allocator, text: []const u8) Allocator.Error![]const Pac
     return out.items;
 }
 
+/// Where the image (or, without the image mount, the running system) keeps the keys apk trusts.
+const trusted_key_dirs = [_][]const u8{ image_mount ++ "/etc/apk/keys", image_mount ++ "/usr/share/apk/keys", "/etc/apk/keys", "/usr/share/apk/keys" };
+
+/// Whether every file in `keys` has the same contents as some file in `dirs`.
+pub fn allTrusted(arena: Allocator, io: Io, keys: []const []const u8, dirs: []const []const u8) bool {
+    next: for (keys) |key| {
+        const want = readSmall(arena, io, key) orelse return false;
+        for (dirs) |dir| {
+            var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch continue;
+            defer d.close(io);
+            var it = d.iterate();
+            while (it.next(io) catch null) |e| {
+                const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, e.name }) catch return false;
+                const have = readSmall(arena, io, path) orelse continue;
+                if (std.mem.eql(u8, have, want)) continue :next;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+/// SHA-256 of a key file in hex, as shown when asking whether to trust it.
+pub fn keyDigest(arena: Allocator, io: Io, path: []const u8) []const u8 {
+    const text = readSmall(arena, io, path) orelse return "(unreadable)";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    return std.fmt.allocPrint(arena, "{x}", .{&digest}) catch "?";
+}
+
 /// Looks for a repository under `root` (a mounted medium, or the `apks/<arch>`
 /// directory itself). Null if the layout is not there.
 pub fn repoAt(arena: Allocator, io: Io, root_in: []const u8, arch: []const u8) Allocator.Error!?Repo {
@@ -534,6 +567,7 @@ pub fn repoAt(arena: Allocator, io: Io, root_in: []const u8, arch: []const u8) A
                 }.lt);
                 repo.key_dir = kd;
                 repo.keys = keys.items;
+                repo.keys_trusted = allTrusted(arena, io, keys.items, &trusted_key_dirs);
                 break;
             }
         }
@@ -1234,4 +1268,14 @@ test "services and accounts are read from the image tree given" {
     try std.testing.expect(findService(sv, "dk-test-cups").?.enabled);
     try std.testing.expect(!findService(sv, "dk-test-sshd").?.enabled);
     try std.testing.expectEqualStrings("img", liveUser(arena, io, root));
+}
+
+test "a medium's key is trusted only when the system already has the same key" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const key = [_][]const u8{"tests/repos/with-sets/keys/fenriros.pub"};
+    try std.testing.expect(allTrusted(arena, std.testing.io, &key, &.{"tests/repos/with-sets/keys"}));
+    try std.testing.expect(!allTrusted(arena, std.testing.io, &key, &.{ "tests/keys", "/nonexistent-dk" }));
+    try std.testing.expectEqual(@as(usize, 64), keyDigest(arena, std.testing.io, key[0]).len);
 }

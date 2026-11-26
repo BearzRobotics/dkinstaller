@@ -441,6 +441,7 @@ const Draft = struct {
     keymap: []const u8 = "us",
     packages: []const []const u8 = &.{},
     keep_repo: bool = false,
+    trust_medium_key: bool = false,
     /// Per probe service: switched on at boot (starts as the image has it).
     svc_on: []bool = &.{},
     ssh: ?answers_mod.Ssh = null,
@@ -1041,6 +1042,7 @@ fn screenPackages(ui: *Ui, repo: probe_mod.Repo, d: *Draft) !bool {
             while (it.next()) |t| try list.append(ui.arena, t);
             d.packages = list.items;
             if (list.items.len == 0) return true;
+            if (!try screenTrustKey(ui, repo, d)) continue;
             if (try screenKeepRepo(ui, d)) return true;
         }
     }
@@ -1066,8 +1068,20 @@ fn screenPackages(ui: *Ui, repo: probe_mod.Repo, d: *Draft) !bool {
         for (repo.sets, 0..) |set, i| if (ticked[i]) try list.appendSlice(ui.arena, set.packages);
         d.packages = list.items;
         if (list.items.len == 0) return true;
+        if (!try screenTrustKey(ui, repo, d)) continue;
         if (try screenKeepRepo(ui, d)) return true;
     }
+}
+
+/// Asks before using a key only the medium vouches for. False: don't (back to the packages).
+fn screenTrustKey(ui: *Ui, repo: probe_mod.Repo, d: *Draft) !bool {
+    d.trust_medium_key = false;
+    if (repo.keys.len == 0 or repo.keys_trusted) return true;
+    const digest = if (ui.io) |io| probe_mod.keyDigest(ui.arena, io, repo.keys[0]) else "(unreadable)";
+    const intro = ui.fmt("This repository is signed with a key the system does not already trust, so only the medium itself vouches for its packages, and their scripts run as root. Use it only if you know where the medium came from. {d} key(s); the first: {s} SHA-256 {s}", .{ repo.keys.len, repo.keys[0], digest });
+    const ok = try yesNo(ui, "Unknown signing key", intro, "trust this medium's key", "go back (choose no packages to skip)", false) orelse return false;
+    d.trust_medium_key = ok;
+    return ok;
 }
 
 fn screenKeepRepo(ui: *Ui, d: *Draft) !bool {
@@ -1567,6 +1581,7 @@ fn buildAnswers(ui: *Ui, d: *const Draft, p: Probe) !answers_mod.Answers {
         .keymap = d.keymap,
         .packages = d.packages,
         .keep_repo = d.keep_repo,
+        .trust_medium_key = d.trust_medium_key,
     };
 }
 
