@@ -455,6 +455,16 @@ const Draft = struct {
     selinux: ?answers_mod.SelinuxMode = null,
     domain: ?[]const u8 = null,
     network: ?answers_mod.Network = null,
+
+    /// Forgets everything chosen about partitions (another disk, a new table).
+    fn resetPartitions(self: *Draft) void {
+        self.root = null;
+        self.esp = null;
+        self.bios_boot = null;
+        self.format_esp = false;
+        self.set_esp_type = false;
+        self.set_bios_boot_type = false;
+    }
 };
 
 fn isEspType(t: ?[]const u8) bool {
@@ -737,9 +747,7 @@ fn screenDisk(ui: *Ui, p: Probe, d: *Draft) !bool {
     }
     const pick = try menu(ui, "Choose the disk to install to", "Disks that can't be used are listed with the reason.", items.items, 0) orelse return false;
     d.disk = disks.items[pick];
-    d.root = null;
-    d.esp = null;
-    d.bios_boot = null;
+    d.resetPartitions();
     return true;
 }
 
@@ -792,9 +800,7 @@ fn screenCfdisk(ui: *Ui, p: *Probe, d: *Draft) !bool {
     p.* = fresh;
     const nd = fresh.findDisk(disk.name) orelse return false;
     d.disk = nd;
-    d.root = null;
-    d.esp = null;
-    d.bios_boot = null;
+    d.resetPartitions();
     if (failed) {
         _ = try message(ui, "Partition by hand", &.{"cfdisk did not exit cleanly. The disk was read again; check the partitions on the next screens."}, warn, "Enter: continue");
     }
@@ -918,6 +924,8 @@ fn screenEsp(ui: *Ui, p: Probe, d: *Draft) !bool {
     d.esp = if (idx.items[pick]) |i| disk.partitions[i] else null;
     d.format_esp = false;
     d.set_esp_type = false;
+    d.bios_boot = null;
+    d.set_bios_boot_type = false;
     return true;
 }
 
@@ -2182,4 +2190,20 @@ test "Enter on a menu with nothing to choose does nothing" {
     defer ui.screen.deinit(gpa);
     const items = [_]Item{.{ .label = "only the live USB", .enabled = false }};
     try std.testing.expectEqual(@as(?usize, null), try menu(&ui, "Disk", "", &items, 0));
+}
+
+test "choosing a disk forgets the earlier disk's partition choices" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try loadFixture(arena, "bios-mbr-fdisk.json");
+    var ui = try testUi(gpa, arena, &[_]Key{ .enter, .enter, .esc });
+    defer ui.screen.deinit(gpa);
+    var d: Draft = .{ .disk = p.disks[0], .partitioning = .existing, .set_bios_boot_type = true, .set_esp_type = true, .format_esp = true, .user = "u", .root_pw = "a", .user_pw = "b" };
+    try std.testing.expect(try screenDisk(&ui, p, &d));
+    try std.testing.expect(!d.set_bios_boot_type and !d.set_esp_type and !d.format_esp);
+    d.root = d.disk.?.partitions[0];
+    // This used to panic building the summary.
+    try std.testing.expect((try screenSummary(&ui, p, .{ .is_root = true, .dry_run = true, .ids = test_ids }, &d)) == null);
 }
