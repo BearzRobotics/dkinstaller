@@ -800,6 +800,27 @@ fn dnsLines(arena: Allocator, dns: []const []const u8, search: ?[]const u8, six:
     return o.items;
 }
 
+/// A string value in a keyfile: a leading space, which reading would drop, is written `\s`.
+/// (The validators keep backslashes, quotes and control characters out.)
+fn keyfileText(arena: Allocator, s: []const u8) ![]const u8 {
+    var n: usize = 0;
+    while (n < s.len and s[n] == ' ') n += 1;
+    var o: std.ArrayList(u8) = .empty;
+    for (0..n) |_| try o.appendSlice(arena, "\\s");
+    try o.appendSlice(arena, s[n..]);
+    return o.items;
+}
+
+/// An SSID value. NetworkManager reads `12;34;` as a list of bytes, so a name that looks
+/// like one is written as the list of its own bytes.
+fn keyfileSsid(arena: Allocator, s: []const u8) ![]const u8 {
+    const looks_like_bytes = s.len > 0 and s[s.len - 1] == ';' and std.ascii.isDigit(s[0]) and std.mem.indexOfNone(u8, s, "0123456789;") == null;
+    if (!looks_like_bytes) return keyfileText(arena, s);
+    var o: std.ArrayList(u8) = .empty;
+    for (s) |c| try o.appendSlice(arena, try std.fmt.allocPrint(arena, "{d};", .{c}));
+    return o.items;
+}
+
 /// A NetworkManager keyfile for a WPA network.
 pub fn wifiKeyfile(arena: Allocator, id: []const u8, uuid: []const u8, wf: answers_mod.Wifi, dns: []const []const u8, search: ?[]const u8) ![]u8 {
     return std.fmt.allocPrint(arena,
@@ -822,7 +843,7 @@ pub fn wifiKeyfile(arena: Allocator, id: []const u8, uuid: []const u8, wf: answe
         \\[ipv6]
         \\method=auto
         \\{s}
-    , .{ id, uuid, wf.ssid, if (wf.hidden) "hidden=true\n" else "", wf.psk, try dnsLines(arena, dns, search, false), try dnsLines(arena, dns, search, true) });
+    , .{ try keyfileText(arena, id), uuid, try keyfileSsid(arena, wf.ssid), if (wf.hidden) "hidden=true\n" else "", try keyfileText(arena, wf.psk), try dnsLines(arena, dns, search, false), try dnsLines(arena, dns, search, true) });
 }
 
 /// For dhcpcd, DNS and the search domain live in interface blocks, so with WiFi each wireless
@@ -2020,4 +2041,14 @@ test "static IPv6: no DNS under a disabled IPv4; an IPv4 server turns IPv4 on" {
     out = try dryRun(arena, (try buildSvc(arena, a)).plan);
     try std.testing.expect(contains(out, "| [ipv4]\n    | method=auto\n    | dns=9.9.9.9;\n"));
     try std.testing.expect(!contains(out, "method=disabled"));
+}
+
+test "keyfile values keep leading spaces, and a byte-list lookalike SSID stays itself" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const t = try wifiKeyfile(arena, " x", "u", .{ .ssid = " x", .psk = "  password1" }, &.{}, null);
+    try std.testing.expect(contains(t, "id=\\sx\n") and contains(t, "ssid=\\sx\n") and contains(t, "psk=\\s\\spassword1\n"));
+    try std.testing.expectEqualStrings("49;59;50;59;", try keyfileSsid(arena, "1;2;"));
+    try std.testing.expectEqualStrings("a;b", try keyfileSsid(arena, "a;b"));
 }
