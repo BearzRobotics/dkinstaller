@@ -324,18 +324,8 @@ pub fn firstOrdinaryUser(text: []const u8) ?[]const u8 {
 /// The first `depends-on`/`depends-ms`/`waits-for` name in `text` that is not
 /// among `services`; null if all are there.
 pub fn missingDependency(text: []const u8, services: []const Service) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        const l = std.mem.trim(u8, raw, " \t\r");
-        for ([_][]const u8{ "depends-on", "depends-ms", "waits-for" }) |key| {
-            if (!std.mem.startsWith(u8, l, key)) continue;
-            var rest = std.mem.trim(u8, l[key.len..], " \t");
-            if (rest.len == 0 or (rest[0] != ':' and rest[0] != '=')) continue;
-            rest = std.mem.trim(u8, rest[1..], " \t");
-            if (rest.len == 0) continue;
-            if (findService(services, rest) == null) return rest;
-        }
-    }
+    var deps: Dependencies = .{ .lines = std.mem.splitScalar(u8, text, '\n') };
+    while (deps.next()) |name| if (findService(services, name) == null) return name;
     return null;
 }
 
@@ -376,12 +366,55 @@ pub fn readServices(arena: Allocator, io: Io, root: []const u8) Allocator.Error!
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lt);
-    for (out.items) |*sv| {
+    const texts = try arena.alloc([]const u8, out.items.len);
+    for (out.items, texts) |sv, *text| {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ if (sv.in_usr) "/usr/lib/dinit.d" else "/etc/dinit.d", sv.name });
-        if (readIn(arena, io, root, path)) |t| sv.missing_dep = missingDependency(t, out.items);
+        text.* = readIn(arena, io, root, path) orelse "";
     }
+    markMissingDependencies(out.items, texts);
     return out.items;
 }
+
+/// Sets `missing_dep` from each service's file (`texts`, in the same order), through any
+/// number of services in between.
+pub fn markMissingDependencies(services: []Service, texts: []const []const u8) void {
+    for (services, texts) |*sv, t| sv.missing_dep = missingDependency(t, services);
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (services, texts) |*sv, t| {
+            if (sv.missing_dep != null) continue;
+            var deps: Dependencies = .{ .lines = std.mem.splitScalar(u8, t, '\n') };
+            while (deps.next()) |name| {
+                const dep = findService(services, name) orelse continue;
+                if (dep.missing_dep) |missing| {
+                    sv.missing_dep = missing;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The names after `depends-on`, `depends-ms` and `waits-for` in a service file.
+const Dependencies = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+
+    fn next(self: *Dependencies) ?[]const u8 {
+        while (self.lines.next()) |raw| {
+            const l = std.mem.trim(u8, raw, " \t\r");
+            for ([_][]const u8{ "depends-on", "depends-ms", "waits-for" }) |key| {
+                if (!std.mem.startsWith(u8, l, key)) continue;
+                var rest = std.mem.trim(u8, l[key.len..], " \t");
+                if (rest.len == 0 or (rest[0] != ':' and rest[0] != '=')) continue;
+                rest = std.mem.trim(u8, rest[1..], " \t");
+                if (rest.len > 0) return rest;
+            }
+        }
+        return null;
+    }
+};
 
 pub fn findService(services: []const Service, name: []const u8) ?Service {
     for (services) |s| if (std.mem.eql(u8, s.name, name)) return s;
@@ -1278,4 +1311,11 @@ test "a medium's key is trusted only when the system already has the same key" {
     try std.testing.expect(allTrusted(arena, std.testing.io, &key, &.{"tests/repos/with-sets/keys"}));
     try std.testing.expect(!allTrusted(arena, std.testing.io, &key, &.{ "tests/keys", "/nonexistent-dk" }));
     try std.testing.expectEqual(@as(usize, 64), keyDigest(arena, std.testing.io, key[0]).len);
+}
+
+test "a missing dependency is found through the services in between, cycles included" {
+    var svcs = [_]Service{ .{ .name = "a" }, .{ .name = "b" }, .{ .name = "c" }, .{ .name = "d" } };
+    markMissingDependencies(&svcs, &.{ "depends-on: b\n", "waits-for: c\ndepends-on: a\n", "depends-ms = gone\n", "depends-on: d\n" });
+    for (svcs[0..3]) |s| try std.testing.expectEqualStrings("gone", s.missing_dep.?);
+    try std.testing.expect(svcs[3].missing_dep == null);
 }
