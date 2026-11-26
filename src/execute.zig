@@ -517,10 +517,19 @@ pub fn shellInInstalled(gpa: Allocator, io: Io, plan: plan_mod.Plan, argv: []con
     Io.Dir.cwd().createDirPath(io, t) catch {};
     if (!runQuiet(io, &.{ "mount", plan.root_dev, t })) return "can't mount the new system";
     var esp_mounted = false;
-    if (plan.esp_dev) |esp| esp_mounted = runQuiet(io, &.{ "mount", esp, t ++ "/boot/efi" });
+    var esp_buf: [256]u8 = undefined;
+    const esp_mnt = std.fmt.bufPrint(&esp_buf, "{s}{s}", .{ t, plan.esp_at }) catch return "the ESP mount point is too long";
+    if (plan.esp_dev) |esp| {
+        esp_mounted = runQuiet(io, &.{ "mount", esp, esp_mnt });
+        // A shell without it would put boot files where the firmware never looks.
+        if (!esp_mounted) {
+            _ = runQuiet(io, &.{ "umount", t });
+            return "can't mount the new system's EFI System Partition";
+        }
+    }
     const r = chrootRun(gpa, io, argv);
     _ = runQuiet(io, &.{"sync"});
-    if (esp_mounted) _ = runQuiet(io, &.{ "umount", t ++ "/boot/efi" });
+    if (esp_mounted) _ = runQuiet(io, &.{ "umount", esp_mnt });
     _ = runQuiet(io, &.{ "umount", t });
     return r;
 }

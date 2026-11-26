@@ -106,6 +106,8 @@ pub const Plan = struct {
     /// again for a shell in the installed system.
     root_dev: []const u8 = "",
     esp_dev: ?[]const u8 = null,
+    /// Where the new system mounts the ESP: /boot/efi, or /boot under systemd-boot.
+    esp_at: []const u8 = "/boot/efi",
 
     /// Prints the plan as `--dry-run` and the summary screen show it.
     pub fn writeDryRun(self: Plan, w: *Io.Writer) Io.Writer.Error!void {
@@ -203,6 +205,7 @@ const Builder = struct {
     refusal: ?[]const u8 = null,
     root_dev: []const u8 = "",
     esp_dev: ?[]const u8 = null,
+    esp_at: []const u8 = "/boot/efi",
 
     fn refuse(self: *Builder, comptime f: []const u8, args: anytype) error{Refused} {
         self.refusal = std.fmt.allocPrint(self.arena, f, args) catch "out of memory";
@@ -282,6 +285,7 @@ pub fn build(arena: Allocator, p: Probe, a: Answers, ids: files.Ids) Allocator.E
             .programs = try collectPrograms(arena, b.steps.items),
             .root_dev = b.root_dev,
             .esp_dev = b.esp_dev,
+            .esp_at = b.esp_at,
         } };
     } else |err| switch (err) {
         error.Refused => return .{ .refused = b.refusal.? },
@@ -347,6 +351,7 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     // systemd-boot reads only the ESP, so the kernels live on it: it is /boot. The others
     // keep /boot on the root and mount the ESP at /boot/efi.
     const esp_at: []const u8 = if (loader == .@"systemd-boot") "/boot" else "/boot/efi";
+    b.esp_at = esp_at;
     const esp_mnt: []const u8 = if (loader == .@"systemd-boot") target ++ "/boot" else target ++ "/boot/efi";
     if (layout.esp_dev) |esp| if (loader != .@"systemd-boot") {
         try b.cmd("Create /boot/efi", &.{ "mkdir", "-p", target ++ "/boot/efi" });
@@ -1291,6 +1296,7 @@ test "systemd-boot: the ESP is /boot, the kernel files move onto it, bootctl and
     const r = try build(arena, p, a, test_ids);
     const out = try dryRun(arena, r.plan);
     try std.testing.expect(contains(out, "UUID=ABCD-1234  /boot  vfat"));
+    try std.testing.expectEqualStrings("/boot", r.plan.esp_at);
     try std.testing.expect(!contains(out, "/boot/efi"));
     try std.testing.expect(contains(out, "mount -o umask=0077 /dev/nvme0n1p2 /run/dkrescue-install/target/boot\n"));
     // efivars is writable in this fixture: a boot entry is made
