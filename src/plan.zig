@@ -453,7 +453,7 @@ fn planDklilo(b: *Builder, p: Probe, a: Answers, layout: Layout, disk: Disk, ker
             } else if (!has_boot) {
                 try b.cmd("Install dklilo as the removable-media loader (efivars not writable)", &.{ "dklilo", "install-uefi", "--yes", "--removable", esp_mnt });
             } else {
-                return b.refuse("efivars is not writable and the ESP already has \\EFI\\BOOT\\BOOTX64.EFI, which is never replaced: nothing to install", .{});
+                return b.refuse("efivars is not writable and the ESP already has \\EFI\\BOOT\\BOOTX64.EFI (or could not be checked for it), which is never replaced: nothing to install", .{});
             }
         },
         .bios => try b.cmd("Install dklilo (BIOS)", &.{ "dklilo", "install-bios", "--yes", disk.path }),
@@ -480,7 +480,7 @@ fn planGrub(b: *Builder, p: Probe, layout: Layout, disk: Disk) BuildError!void {
             } else if (!has_boot) {
                 try b.cmd("Install GRUB as the removable-media loader (efivars not writable)", removable);
             } else {
-                return b.refuse("efivars is not writable and the ESP already has \\EFI\\BOOT\\BOOTX64.EFI, which is never replaced: nothing to install", .{});
+                return b.refuse("efivars is not writable and the ESP already has \\EFI\\BOOT\\BOOTX64.EFI (or could not be checked for it), which is never replaced: nothing to install", .{});
             }
         },
         .bios => try b.cmd("Install GRUB (BIOS)", &.{ "chroot", target, "grub-install", "--target=i386-pc", "--recheck", disk.path }),

@@ -848,14 +848,15 @@ pub fn live(arena: Allocator, io: Io) !Probe {
     const sfs = "/run/live/medium/live/rootfs.sfs";
     const is_live = exists(io, sfs);
     const kernel = if (is_live) findKernel(arena, io, sfs) else null;
+    const firmware: Firmware = if (exists(io, "/sys/firmware/efi")) .uefi else .bios;
     return .{
-        .firmware = if (exists(io, "/sys/firmware/efi")) .uefi else .bios,
+        .firmware = firmware,
         .efivars_rw = efivars_rw,
         .is_live = is_live,
         .live_medium_source = medium,
         .rootfs_size = rootfs_size,
         .kernel = kernel,
-        .disks = try fillMissingIds(arena, io, try parseLsblk(arena, lsblk.stdout)),
+        .disks = try checkEsps(arena, io, firmware, try fillMissingIds(arena, io, try parseLsblk(arena, lsblk.stdout))),
         .live_user = liveUser(arena, io),
         .services = services,
         .selinux = exists(io, "/etc/selinux/config"),
@@ -882,6 +883,54 @@ fn fillMissingIds(arena: Allocator, io: Io, disks: []const Disk) ![]const Disk {
         disk.partitions = parts;
     }
     return out;
+}
+
+/// Where a FAT partition is mounted read-only to look at it.
+const esp_check_dir = "/run/dkrescue-install/espcheck";
+
+/// On UEFI, looks on each unmounted FAT partition for `EFI/BOOT/BOOTX64.EFI` (SPEC.md 5.6).
+/// One that can't be mounted (no root, a damaged filesystem) stays unknown, and the plan then
+/// assumes the file is there.
+fn checkEsps(arena: Allocator, io: Io, firmware: Firmware, disks: []const Disk) ![]const Disk {
+    if (firmware != .uefi) return disks;
+    const out = try arena.dupe(Disk, disks);
+    for (out) |*disk| {
+        const parts = try arena.dupe(Partition, disk.partitions);
+        disk.partitions = parts;
+        for (parts) |*part| {
+            if (part.mounted or !std.mem.eql(u8, part.fstype orelse "", "vfat")) continue;
+            Io.Dir.cwd().createDirPath(io, esp_check_dir) catch return out;
+            const m = std.process.run(arena, io, .{ .argv = &.{ "mount", "-t", "vfat", "-o", "ro", part.path, esp_check_dir } }) catch continue;
+            if (!m.term.success()) continue;
+            part.has_bootx64 = hasFileCaseless(io, esp_check_dir, &.{ "EFI", "BOOT", "BOOTX64.EFI" });
+            const u = std.process.run(arena, io, .{ .argv = &.{ "umount", esp_check_dir } }) catch return out;
+            // Mounting over a mount that stayed would show the wrong partition.
+            if (!u.term.success()) return out;
+        }
+    }
+    return out;
+}
+
+/// Whether `names` exists below `root`, ignoring case as FAT firmware does. Null if a
+/// directory can't be read.
+pub fn hasFileCaseless(io: Io, root: []const u8, names: []const []const u8) ?bool {
+    var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    for (names, 0..) |want, n| {
+        var it = dir.iterate();
+        var buf: [256]u8 = undefined;
+        const found: []const u8 = while (it.next(io) catch return null) |e| {
+            if (std.ascii.eqlIgnoreCase(e.name, want) and e.name.len <= buf.len) {
+                @memcpy(buf[0..e.name.len], e.name);
+                break buf[0..e.name.len];
+            }
+        } else return false;
+        if (n + 1 == names.len) return true;
+        const sub_dir = dir.openDir(io, found, .{ .iterate = true }) catch return null;
+        dir.close(io);
+        dir = sub_dir;
+    }
+    return false;
 }
 
 /// Fills the fields `part` lacks from `blkid -p -o export` output.
@@ -1051,4 +1100,19 @@ test "a disk used through LUKS, LVM or RAID is in use" {
     const p: Probe = .{ .firmware = .uefi, .efivars_rw = true, .is_live = true, .live_medium_source = null, .rootfs_size = null, .kernel = null, .disks = disks };
     for (disks[0..3]) |d| try std.testing.expectEqual(@as(?Ineligible, .mounted), ineligible(p, d, false));
     try std.testing.expectEqual(@as(?Ineligible, null), ineligible(p, disks[3], false));
+}
+
+test "BOOTX64.EFI is found whatever its case, and its absence is known" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", st.allocator());
+    const want = [_][]const u8{ "EFI", "BOOT", "BOOTX64.EFI" };
+    try std.testing.expectEqual(@as(?bool, false), hasFileCaseless(std.testing.io, root, &want));
+    try tmp.dir.createDirPath(std.testing.io, "efi/Boot");
+    try std.testing.expectEqual(@as(?bool, false), hasFileCaseless(std.testing.io, root, &want));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "efi/Boot/bootx64.efi", .data = "x" });
+    try std.testing.expectEqual(@as(?bool, true), hasFileCaseless(std.testing.io, root, &want));
+    try std.testing.expectEqual(@as(?bool, null), hasFileCaseless(std.testing.io, "/nonexistent-dk", &want));
 }
