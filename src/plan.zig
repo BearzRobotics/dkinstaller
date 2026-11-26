@@ -408,7 +408,7 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     switch (loader) {
         .dklilo => try planDklilo(b, p, a, layout, disk, kernel),
         .grub => try planGrub(b, p, layout, disk),
-        .@"systemd-boot" => try planSystemdBoot(b, p, layout),
+        .@"systemd-boot" => try planSystemdBoot(b, p, layout, disk),
     }
 
     // 9. Finish
@@ -490,16 +490,38 @@ fn planGrub(b: *Builder, p: Probe, layout: Layout, disk: Disk) BuildError!void {
     _ = arena;
 }
 
+/// `sh -c` script: runs the command after `$1 $2` and puts the file `$1`, if there was one, back
+/// as it was (saved at `$2`), whether or not the command worked.
+pub const keep_file =
+    \\f=$1 s=$2; shift 2
+    \\had=; if [ -f "$f" ]; then cp "$f" "$s" || exit 1; had=1; fi
+    \\"$@"; r=$?
+    \\if [ -n "$had" ]; then cp "$s" "$f" || { echo "could not restore $f; it is saved at $s" >&2; exit 1; }; fi
+    \\exit $r
+;
+const bootx64_saved = "/run/dkrescue-install/BOOTX64.EFI.kept";
+
 /// systemd-boot, installed from inside the new system with the ESP as /boot.
-fn planSystemdBoot(b: *Builder, p: Probe, layout: Layout) BuildError!void {
+fn planSystemdBoot(b: *Builder, p: Probe, layout: Layout, disk: Disk) BuildError!void {
     const arena = b.arena;
     try b.file("systemd-boot: boot by partition id (the kernel has no initramfs to resolve root=UUID)", target ++ "/etc/default/systemd-boot", try files.systemdBootDefaults(arena, layout.root_partuuid), 0o644);
+    // A kept ESP may already have another system's BOOTX64.EFI, and `bootctl install` writes there.
+    const keep = !layout.esp_fresh and espBootx64(p, disk, layout.esp_dev.?);
+    if (keep and !p.efivars_rw) return b.refuse("efivars is not writable and the ESP already has \\EFI\\BOOT\\BOOTX64.EFI (or could not be checked for it), which is never replaced: nothing to install", .{});
     try bindMounts(b);
-    if (p.efivars_rw) {
-        try b.cmd("Install systemd-boot", &.{ "chroot", target, "bootctl", "install", "--esp-path=/boot" });
-    } else {
-        try b.cmd("Install systemd-boot (efivars not writable: no boot entry)", &.{ "chroot", target, "bootctl", "install", "--esp-path=/boot", "--no-variables" });
-    }
+    const install: []const []const u8 = if (p.efivars_rw)
+        &.{ "chroot", target, "bootctl", "install", "--esp-path=/boot" }
+    else
+        &.{ "chroot", target, "bootctl", "install", "--esp-path=/boot", "--no-variables" };
+    var argv: std.ArrayList([]const u8) = .empty;
+    if (keep) try argv.appendSlice(arena, &.{ "sh", "-c", keep_file, "sh", target ++ "/boot/EFI/BOOT/BOOTX64.EFI", bootx64_saved });
+    try argv.appendSlice(arena, install);
+    try b.cmd(if (!p.efivars_rw)
+        "Install systemd-boot (efivars not writable: no boot entry)"
+    else if (keep)
+        "Install systemd-boot, keeping the ESP's own BOOTX64.EFI"
+    else
+        "Install systemd-boot", argv.items);
     try b.cmd("Write the boot entries", &.{ "chroot", target, "gen-systemd-boot" });
     try unbindMounts(b);
 }
@@ -1724,5 +1746,51 @@ test "only a small partition without a filesystem is retyped as BIOS boot" {
         disks[0].partitions = parts;
         p.disks = disks;
         try std.testing.expect(contains((try build(arena, p, a, test_ids)).refused, "contents are overwritten"));
+    }
+}
+
+test "systemd-boot on a kept ESP restores its BOOTX64.EFI; with read-only efivars it refuses" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-sata-fdisk.json");
+    p.tools = &.{ "bootctl", "gen-systemd-boot" };
+    p.paths = &.{"/usr/lib/systemd/boot/efi"};
+    var a = testAnswers("sda", .existing);
+    a.root = "sda2";
+    a.esp = "sda1";
+    a.set_esp_type = true;
+    a.bootloader = .@"systemd-boot";
+    const out = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    try std.testing.expect(contains(out, "keeping the ESP's own BOOTX64.EFI"));
+    try std.testing.expect(contains(out, "BOOTX64.EFI /run/dkrescue-install/BOOTX64.EFI.kept chroot"));
+    p.efivars_rw = false;
+    try std.testing.expect(contains((try build(arena, p, a, test_ids)).refused, "never replaced"));
+    a.format_esp = true;
+    try std.testing.expect(!contains(try dryRun(arena, (try build(arena, p, a, test_ids)).plan), "BOOTX64.EFI.kept"));
+}
+
+test "the keep-file script restores the file even when the command fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir);
+    const f = try std.fmt.allocPrint(gpa, "{s}/BOOTX64.EFI", .{dir});
+    defer gpa.free(f);
+    const s = try std.fmt.allocPrint(gpa, "{s}/saved", .{dir});
+    defer gpa.free(s);
+    try tmp.dir.writeFile(io, .{ .sub_path = "BOOTX64.EFI", .data = "other system" });
+    for ([_]u8{ 0, 3 }) |code| {
+        const cmd = try std.fmt.allocPrint(gpa, "echo systemd > '{s}'; exit {d}", .{ f, code });
+        defer gpa.free(cmd);
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", keep_file, "sh", f, s, "sh", "-c", cmd } });
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = code }, r.term);
+        const now = try tmp.dir.readFileAlloc(io, "BOOTX64.EFI", gpa, .limited(100));
+        defer gpa.free(now);
+        try std.testing.expectEqualStrings("other system", now);
     }
 }

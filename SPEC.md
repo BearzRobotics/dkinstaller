@@ -339,7 +339,11 @@ area below a progress list. The steps, in order:
      directory and finds the device itself) creates the boot entry. If the
      ESP has no `\EFI\BOOT\BOOTX64.EFI` yet, `--removable` is run too, so
      firmware that loses its boot entries still finds dklilo. An existing
-     `BOOTX64.EFI` (another system's) is never replaced.
+     `BOOTX64.EFI` (another system's) is never replaced. To know, the probe
+     mounts each unmounted FAT partition read-only; one it can't check counts
+     as having the file. `bootctl install` writes that path itself, so under
+     systemd-boot the file on a kept ESP is saved and put back, and with
+     read-only efivars that combination is refused.
    - **BIOS:** `dklilo install-bios --yes <disk>`.
    - `dklilo check <target>/boot/dklilo.conf` must pass.
 9. **Finish:** the log is copied to the target's `/var/log/dkrescue-install.log`
