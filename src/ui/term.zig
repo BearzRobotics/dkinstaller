@@ -84,6 +84,36 @@ pub fn decode(bytes: []const u8) ?Decoded {
 
 // ------------------------------------------------------------- clean text
 
+/// The code point at `s[i.*]`, moving `i` past it. A byte that doesn't start a whole, valid
+/// UTF-8 sequence (a Latin-1 message, a line cut in the middle) is U+FFFD.
+pub fn nextCodepoint(s: []const u8, i: *usize) u21 {
+    const n: usize = std.unicode.utf8ByteSequenceLength(s[i.*]) catch 0;
+    if (n != 0 and i.* + n <= s.len) {
+        if (std.unicode.utf8Decode(s[i.*..][0..n])) |cp| {
+            i.* += n;
+            return cp;
+        } else |_| {}
+    }
+    i.* += 1;
+    return 0xfffd;
+}
+
+/// How many columns `s` takes (one for each code point).
+pub fn columns(s: []const u8) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len) : (n += 1) _ = nextCodepoint(s, &i);
+    return n;
+}
+
+/// The byte offset where column `col` of `s` starts.
+pub fn byteAtColumn(s: []const u8, col: usize) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len and n < col) : (n += 1) _ = nextCodepoint(s, &i);
+    return i;
+}
+
 fn isControl(c: u21) bool {
     return c < 0x20 or (c >= 0x7f and c <= 0x9f);
 }
@@ -175,9 +205,10 @@ pub const Screen = struct {
     /// number of columns written.
     pub fn text(self: *Screen, x: i32, y: i32, s: []const u8, attr: Attr, max: usize) usize {
         var n: usize = 0;
-        var it = std.unicode.Utf8Iterator{ .bytes = s, .i = 0 };
-        while (it.nextCodepoint()) |cp| {
+        var i: usize = 0;
+        while (i < s.len) {
             if (n >= max) break;
+            const cp = nextCodepoint(s, &i);
             self.put(x + @as(i32, @intCast(n)), y, cp, attr);
             n += 1;
         }
@@ -484,4 +515,18 @@ test "control characters never reach the terminal" {
     defer a.deinit();
     try writeClean(&a.writer, "ok\n\x1b[2J\xc2\x9bx \xe9 é\t.");
     try std.testing.expectEqualStrings("ok\n?[2J?x ? é\t.", a.written());
+}
+
+test "text that is not valid UTF-8 is drawn, not a crash" {
+    const gpa = std.testing.allocator;
+    var s = try Screen.init(gpa, 20, 1, false);
+    defer s.deinit(gpa);
+    for ([_][]const u8{ "caf\xe9 latin-1", "ab\xc3", "\xff\xfe", "\xe2\x80" }) |bad| _ = s.text(0, 0, bad, .{}, 20);
+    s.clear();
+    _ = s.text(0, 0, "caf\xe9!", .{}, 20);
+    const t = try s.toText(gpa);
+    defer gpa.free(t);
+    try std.testing.expectEqualStrings("caf\u{fffd}!\n", t);
+    try std.testing.expectEqual(@as(usize, 3), columns("aé€"));
+    try std.testing.expectEqual(@as(usize, 3), byteAtColumn("aé€", 2));
 }

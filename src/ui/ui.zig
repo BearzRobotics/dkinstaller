@@ -127,7 +127,11 @@ fn wrap(arena: Allocator, s: []const u8, width: usize) ![]const []const u8 {
         while (para.len - start > width) {
             var cut = start + width;
             while (cut > start and para[cut] != ' ') cut -= 1;
-            if (cut == start) cut = start + width;
+            if (cut == start) {
+                cut = start + width;
+                // Not in the middle of a character.
+                while (cut > start + 1 and (para[cut] & 0xC0) == 0x80) cut -= 1;
+            }
             try lines.append(arena, std.mem.trimEnd(u8, para[start..cut], " "));
             start = cut;
             while (start < para.len and para[start] == ' ') start += 1;
@@ -261,9 +265,11 @@ pub fn input(ui: *Ui, title: []const u8, intro: []const u8, initial: []const u8,
             break :blk stars;
         } else buf.items;
         const view_w: usize = @intCast(r.w - 2);
-        const off = if (pos >= view_w) pos - view_w + 1 else 0;
-        _ = ui.screen.text(r.x + 1, y, if (off < shown.len) shown[off..] else "", selected, view_w);
-        ui.screen.cursor = .{ .x = @intCast(r.x + 1 + @as(i32, @intCast(pos - off))), .y = @intCast(y) };
+        // Scrolling and the cursor count characters, not bytes (a secret shows a `*` per byte).
+        const col = term.columns(shown[0..pos]);
+        const off = if (col >= view_w) col - view_w + 1 else 0;
+        _ = ui.screen.text(r.x + 1, y, shown[term.byteAtColumn(shown, off)..], selected, view_w);
+        ui.screen.cursor = .{ .x = @intCast(r.x + 1 + @as(i32, @intCast(col - off))), .y = @intCast(y) };
         if (err_msg) |m| _ = ui.screen.text(r.x, y + 2, m, danger, @intCast(r.w));
 
         switch (try ui.key()) {
@@ -2148,4 +2154,21 @@ test "full flow with services, ssh and network screens: manual network, key past
     try done.plan.writeDryRun(&w.writer);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "left unconfigured") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "PermitRootLogin no") != null);
+}
+
+fn repeated(comptime s: []const u8, comptime n: usize) []const u8 {
+    comptime var out: []const u8 = "";
+    inline for (0..n) |_| out = out ++ s;
+    return out;
+}
+
+test "long non-ASCII input scrolls by characters and keeps the cursor in place" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    var ui = try testUi(gpa, st.allocator(), &[_]Key{.enter});
+    defer ui.screen.deinit(gpa);
+    const long = comptime repeated("é€", 60);
+    try std.testing.expectEqualStrings(long, (try input(&ui, "t", "word-without-spaces-" ++ comptime repeated("é", 100), long, .{})).?);
+    try std.testing.expect(ui.screen.cursor.?.x < ui.screen.w);
 }
