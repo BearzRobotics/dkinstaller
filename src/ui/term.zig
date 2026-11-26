@@ -82,6 +82,29 @@ pub fn decode(bytes: []const u8) ?Decoded {
     return .{ .key = .{ .char = cp }, .len = n };
 }
 
+// ------------------------------------------------------------- clean text
+
+fn isControl(c: u21) bool {
+    return c < 0x20 or (c >= 0x7f and c <= 0x9f);
+}
+
+/// Writes text from a disk, a medium or a command to a terminal: control characters other
+/// than newline and tab, and bytes that are not UTF-8, become `?`.
+pub fn writeClean(w: *Io.Writer, s: []const u8) Io.Writer.Error!void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const n: usize = std.unicode.utf8ByteSequenceLength(s[i]) catch 0;
+        const cp: ?u21 = if (n == 0 or i + n > s.len) null else std.unicode.utf8Decode(s[i..][0..n]) catch null;
+        const c = cp orelse {
+            try w.writeByte('?');
+            i += 1;
+            continue;
+        };
+        if (c != '\n' and c != '\t' and isControl(c)) try w.writeByte('?') else try w.writeAll(s[i..][0..n]);
+        i += n;
+    }
+}
+
 // ----------------------------------------------------------------- cells
 
 /// The eight ANSI colours, or the terminal default.
@@ -140,10 +163,12 @@ pub const Screen = struct {
         self.cursor = null;
     }
 
-    /// Sets one cell; out-of-range positions are ignored.
+    /// Sets one cell; out-of-range positions are ignored. A control character, which would
+    /// drive the terminal instead of being shown, becomes `?` (a tab, a space).
     pub fn put(self: *Screen, x: i32, y: i32, ch: u21, attr: Attr) void {
         if (x < 0 or y < 0 or x >= self.w or y >= self.h) return;
-        self.cells[@as(usize, @intCast(y)) * self.w + @as(usize, @intCast(x))] = .{ .ch = ch, .attr = attr };
+        const shown: u21 = if (ch == '\t') ' ' else if (isControl(ch)) '?' else ch;
+        self.cells[@as(usize, @intCast(y)) * self.w + @as(usize, @intCast(x))] = .{ .ch = shown, .attr = attr };
     }
 
     /// Writes UTF-8 text from (x, y), clipped to `max` columns. Returns the
@@ -445,4 +470,18 @@ test "render skips unchanged rows" {
     try s.render(&a.writer);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "abc") == null);
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "x") != null);
+}
+
+test "control characters never reach the terminal" {
+    const gpa = std.testing.allocator;
+    var s = try Screen.init(gpa, 20, 1, false);
+    defer s.deinit(gpa);
+    _ = s.text(0, 0, "A\x1b]0;pwned\x07B\tC", .{}, 20);
+    const t = try s.toText(gpa);
+    defer gpa.free(t);
+    try std.testing.expectEqualStrings("A?]0;pwned?B C\n", t);
+    var a: Io.Writer.Allocating = .init(gpa);
+    defer a.deinit();
+    try writeClean(&a.writer, "ok\n\x1b[2J\xc2\x9bx \xe9 é\t.");
+    try std.testing.expectEqualStrings("ok\n?[2J?x ? é\t.", a.written());
 }

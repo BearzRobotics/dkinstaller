@@ -40,13 +40,19 @@ const Plain = struct {
 
     fn onStart(ctx: ?*anyopaque, index: usize, step: dk.plan.Step, text: []const u8) void {
         const self: *Plain = @ptrCast(@alignCast(ctx.?));
-        self.out.print("[{d}/{d}] {s}\n$ {s}\n", .{ index + 1, self.total, step.desc, text }) catch {};
+        self.out.print("[{d}/{d}] ", .{ index + 1, self.total }) catch {};
+        dk.term.writeClean(self.out, step.desc) catch {};
+        self.out.writeAll("\n$ ") catch {};
+        dk.term.writeClean(self.out, text) catch {};
+        self.out.writeAll("\n") catch {};
         self.out.flush() catch {};
     }
 
     fn onLine(ctx: ?*anyopaque, line: []const u8) void {
         const self: *Plain = @ptrCast(@alignCast(ctx.?));
-        self.out.print("    {s}\n", .{line}) catch {};
+        self.out.writeAll("    ") catch {};
+        dk.term.writeClean(self.out, line) catch {};
+        self.out.writeAll("\n") catch {};
         self.out.flush() catch {};
     }
 };
@@ -289,7 +295,9 @@ pub fn main(init: std.process.Init) !u8 {
         }
         var out_buf: [4096]u8 = undefined;
         var out_w: Io.File.Writer = .init(.stdout(), io, &out_buf);
-        try plan.writeDryRun(&out_w.interface);
+        var text: Io.Writer.Allocating = .init(arena);
+        try plan.writeDryRun(&text.writer);
+        try dk.term.writeClean(&out_w.interface, text.written());
         try out_w.interface.flush();
         return 0;
     }
@@ -355,7 +363,11 @@ pub fn main(init: std.process.Init) !u8 {
         .ok => {
             for (runner.warnings.items) |w| {
                 try out_w.interface.print("warning: {s}: {s}\n", .{ w.desc, w.reason });
-                for (w.tail) |l| try out_w.interface.print("    {s}\n", .{l});
+                for (w.tail) |l| {
+                    try out_w.interface.writeAll("    ");
+                    try dk.term.writeClean(&out_w.interface, l);
+                    try out_w.interface.writeAll("\n");
+                }
             }
             try out_w.interface.print("Installation complete.\n", .{});
             try out_w.interface.flush();
@@ -377,7 +389,11 @@ pub fn main(init: std.process.Init) !u8 {
         .failed => |f| {
             runner.cleanup();
             try err.print("\nstep {d} failed: {s}\n$ {s}\n{s}\n", .{ f.index + 1, f.desc, f.text, f.reason });
-            for (f.tail) |l| try err.print("    {s}\n", .{l});
+            for (f.tail) |l| {
+                try err.writeAll("    ");
+                try dk.term.writeClean(err, l);
+                try err.writeAll("\n");
+            }
             try err.print("log: {s}\n", .{dk.execute.log_path});
             if (auto_mode) {
                 try err.print("autoinstall failed. A shell follows; the log is {s}. Type exit to leave it.\n", .{dk.execute.log_path});
