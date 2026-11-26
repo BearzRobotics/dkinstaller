@@ -3,3 +3,4 @@ zig-out/
 __pycache__/
 .claude/settings.local.json
 zig-pkg/
+docs/bugs/
