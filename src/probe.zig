@@ -132,7 +132,7 @@ pub const Ineligible = enum {
     pub fn text(self: Ineligible) []const u8 {
         return switch (self) {
             .live_medium => "holds the live medium",
-            .mounted => "has a mounted partition",
+            .mounted => "has a mounted partition, or one in use",
             .not_a_disk => "not a physical disk (loop, RAM, zram or optical)",
             .read_only => "read-only",
             .too_small => "smaller than the minimum size",
@@ -651,6 +651,11 @@ fn hasMount(v: ?json.Value) bool {
     }
 }
 
+fn hasChildren(obj: json.ObjectMap) bool {
+    const ch = obj.get("children") orelse return false;
+    return ch == .array and ch.array.items.len > 0;
+}
+
 fn trailingNumber(name: []const u8) u32 {
     var i = name.len;
     while (i > 0 and std.ascii.isDigit(name[i - 1])) i -= 1;
@@ -670,7 +675,8 @@ fn parsePartition(arena: Allocator, obj: json.ObjectMap) !Partition {
         .uuid = str(obj.get("uuid")),
         .partuuid = str(obj.get("partuuid")),
         .parttype = str(obj.get("parttype")),
-        .mounted = hasMount(obj.get("mountpoints")) or hasMount(obj.get("mountpoint")),
+        // A holder on top of the partition (LUKS, LVM, RAID, device-mapper) uses it, mounted or not.
+        .mounted = hasMount(obj.get("mountpoints")) or hasMount(obj.get("mountpoint")) or hasChildren(obj),
         .has_bootx64 = if (obj.get("has_bootx64")) |v| flag(v) else null,
     };
 }
@@ -689,11 +695,16 @@ pub fn parseLsblk(arena: Allocator, text: []const u8) ![]Disk {
         const o = dev.object;
         const name = str(o.get("name")) orelse continue;
         var parts: std.ArrayList(Partition) = .empty;
+        // A child of the disk that is not a partition holds the whole disk.
+        var held = false;
         if (o.get("children")) |ch| if (ch == .array) {
             for (ch.array.items) |c| {
                 if (c != .object) continue;
                 const ty = str(c.object.get("type")) orelse "part";
-                if (!std.mem.eql(u8, ty, "part")) continue;
+                if (!std.mem.eql(u8, ty, "part")) {
+                    held = true;
+                    continue;
+                }
                 try parts.append(arena, try parsePartition(arena, c.object));
             }
         };
@@ -708,7 +719,7 @@ pub fn parseLsblk(arena: Allocator, text: []const u8) ![]Disk {
             .table = str(o.get("pttype")),
             .fstype = str(o.get("fstype")),
             .label = str(o.get("label")),
-            .mounted = hasMount(o.get("mountpoints")),
+            .mounted = hasMount(o.get("mountpoints")) or held,
             .partitions = parts.items,
         });
     }
@@ -1023,4 +1034,21 @@ test "builtinSymbols finds =y, not =m or unset" {
     try std.testing.expectEqualStrings("BTRFS_FS", syms[0]);
     const none = try builtinSymbols(a, "CONFIG_BTRFS_FS=m\n");
     try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "a disk used through LUKS, LVM or RAID is in use" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const disks = try parseLsblk(st.allocator(),
+        \\{"blockdevices":[
+        \\{"name":"sda","type":"disk","size":1,"children":[{"name":"sda1","type":"part","size":1,
+        \\  "children":[{"name":"home","type":"crypt","mountpoints":["/mnt/home"]}]}]},
+        \\{"name":"sdb","type":"disk","size":1,"children":[{"name":"sdb1","type":"part","size":1,
+        \\  "children":[{"name":"md0","type":"raid1","mountpoints":[null]}]}]},
+        \\{"name":"sdc","type":"disk","size":1,"children":[{"name":"vg-root","type":"lvm","mountpoints":["/x"]}]},
+        \\{"name":"sdd","type":"disk","size":1,"children":[{"name":"sdd1","type":"part","size":1,"mountpoints":[null]}]}]}
+    );
+    const p: Probe = .{ .firmware = .uefi, .efivars_rw = true, .is_live = true, .live_medium_source = null, .rootfs_size = null, .kernel = null, .disks = disks };
+    for (disks[0..3]) |d| try std.testing.expectEqual(@as(?Ineligible, .mounted), ineligible(p, d, false));
+    try std.testing.expectEqual(@as(?Ineligible, null), ineligible(p, disks[3], false));
 }
