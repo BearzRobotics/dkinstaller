@@ -778,7 +778,12 @@ fn nmEthernet(b: *Builder, ids: files.Ids, ifc: answers_mod.Iface, net: answers_
 }
 
 fn nmWifi(b: *Builder, ids: files.Ids, wf: answers_mod.Wifi) ![]u8 {
-    return b.fmt(
+    return wifiKeyfile(b.arena, wf.ssid, try uuidFor(b, ids, wf.ssid), wf);
+}
+
+/// A NetworkManager keyfile for a WPA network.
+pub fn wifiKeyfile(arena: Allocator, id: []const u8, uuid: []const u8, wf: answers_mod.Wifi) ![]u8 {
+    return std.fmt.allocPrint(arena,
         \\[connection]
         \\id={s}
         \\uuid={s}
@@ -798,7 +803,7 @@ fn nmWifi(b: *Builder, ids: files.Ids, wf: answers_mod.Wifi) ![]u8 {
         \\[ipv6]
         \\method=auto
         \\
-    , .{ wf.ssid, try uuidFor(b, ids, wf.ssid), wf.ssid, if (wf.hidden) "hidden=true\n" else "", wf.psk });
+    , .{ id, uuid, wf.ssid, if (wf.hidden) "hidden=true\n" else "", wf.psk });
 }
 
 /// dhcpcd.conf lines for the interfaces (static, disabled) and DNS.

@@ -1157,12 +1157,31 @@ fn addUnique(ui: *Ui, list: *std.ArrayList([]const u8), s: []const u8) !void {
     try list.append(ui.arena, s);
 }
 
-/// Tries the connection on the live system. Returns the result line.
+/// Tries the connection on the live system. Returns the result line. The passphrase goes to
+/// NetworkManager in a root-only connection file: a command line can be read by any user. The
+/// file is in /run; after a success the live session stays connected.
 fn testWifi(ui: *Ui, wf: answers_mod.Wifi) []const u8 {
     const io = ui.io orelse return "can't test here";
-    const r = std.process.run(ui.arena, io, .{ .argv = &.{ "nmcli", "device", "wifi", "connect", wf.ssid, "password", wf.psk } }) catch return "nmcli is not available on the live system; not tested.";
-    if (r.term.success()) return "Connected.";
-    return ui.fmt("Failed: {s}", .{std.mem.trim(u8, if (r.stderr.len > 0) r.stderr else r.stdout, " \n")});
+    const id = "dk-wifi-test";
+    const dir = "/run/NetworkManager/system-connections";
+    const path = dir ++ "/" ++ id ++ ".nmconnection";
+    const text = plan_mod.wifiKeyfile(ui.arena, id, "6b2f0c3e-8d1a-4a57-9c2e-1f4b7a9d0e31", wf) catch return "out of memory";
+    Io.Dir.cwd().createDirPath(io, dir) catch return "can't write the test connection; not tested.";
+    Io.Dir.cwd().deleteFile(io, path) catch {};
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } }) catch return "can't write the test connection; not tested.";
+    const steps = [_][]const []const u8{ &.{ "nmcli", "connection", "load", path }, &.{ "nmcli", "connection", "up", "id", id } };
+    for (steps) |argv| {
+        const r = std.process.run(ui.arena, io, .{ .argv = argv }) catch {
+            Io.Dir.cwd().deleteFile(io, path) catch {};
+            return "nmcli is not available on the live system; not tested.";
+        };
+        if (!r.term.success()) {
+            _ = std.process.run(ui.arena, io, .{ .argv = &.{ "nmcli", "connection", "delete", "id", id } }) catch {};
+            Io.Dir.cwd().deleteFile(io, path) catch {};
+            return ui.fmt("Failed: {s}", .{std.mem.trim(u8, if (r.stderr.len > 0) r.stderr else r.stdout, " \n")});
+        }
+    }
+    return "Connected. The live session stays connected until it is restarted.";
 }
 
 /// The network screens: how (guided, copy the live connection, manual, skip),
