@@ -936,19 +936,19 @@ fn screenBiosBoot(ui: *Ui, d: *Draft) !bool {
     var items: std.ArrayList(Item) = .empty;
     var idx: std.ArrayList(usize) = .empty;
     for (disk.partitions, 0..) |q, i| {
-        if (q.size < 1024 * 1024) continue;
+        if (!plan_mod.biosBootCandidate(q)) continue;
         if (std.mem.eql(u8, q.path, d.root.?.path)) continue;
         if (d.esp) |e| if (std.mem.eql(u8, q.path, e.path)) continue;
         try items.append(ui.arena, .{
             .label = ui.fmt("{s}  {s}", .{ q.path, fmtSize(ui.arena, q.size) }),
-            .detail = q.fstype orelse "no filesystem",
-            .sub = "Its type will be set to BIOS boot. It must not hold data you need.",
+            .detail = "no filesystem",
+            .sub = "Its type will be set to BIOS boot and its contents overwritten.",
             .sub_attr = warn,
         });
         try idx.append(ui.arena, i);
     }
     if (items.items.len == 0) {
-        _ = try message(ui, "BIOS boot partition", &.{"Booting a GPT disk on a BIOS machine needs a BIOS boot partition of at least 1 MiB, and there is none to use. Make one with fdisk or gdisk, then run the installer again."}, danger, "Esc: back");
+        _ = try message(ui, "BIOS boot partition", &.{"Booting a GPT disk on a BIOS machine needs a BIOS boot partition. Only a partition of 1 to 16 MiB with no filesystem can be used, and there is none. Make one with fdisk or gdisk, then run the installer again."}, danger, "Esc: back");
         return false;
     }
     const pick = try menu(ui, "BIOS boot partition", "A GPT disk on a BIOS machine needs a BIOS boot partition (1 MiB or more) for dklilo's stage 2.", items.items, 0) orelse return false;
@@ -1596,7 +1596,7 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
                 .{ .text = ui.fmt("ESP {s} is kept as it is.", .{e.path}) });
         }
         if (d.set_esp_type) try lines.append(ui.arena, .{ .text = "The ESP's partition type will be changed.", .attr = warn });
-        if (d.set_bios_boot_type) try lines.append(ui.arena, .{ .text = ui.fmt("{s} will become the BIOS boot partition.", .{d.bios_boot.?.path}), .attr = warn });
+        if (d.set_bios_boot_type) try lines.append(ui.arena, .{ .text = ui.fmt("{s} will become the BIOS boot partition; its contents are OVERWRITTEN.", .{d.bios_boot.?.path}), .attr = danger });
     }
     try lines.append(ui.arena, .{ .text = ui.fmt("Boot loader: {s}   Root filesystem: {s}", .{ bl_mod.info(d.bootloader).name, fs_mod.info(d.root_fs).name }) });
     try lines.append(ui.arena, .{ .text = ui.fmt("Hostname: {s}   User: {s}   Timezone: {s}   Keymap: {s}", .{ d.hostname, d.user, d.timezone, d.keymap }) });

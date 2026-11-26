@@ -15,6 +15,15 @@ const Disk = probe_mod.Disk;
 const Partition = probe_mod.Partition;
 const Answers = answers_mod.Answers;
 
+/// The largest partition the installer will retype as BIOS boot (SPEC.md 5.3.3).
+pub const bios_boot_max_size: u64 = 16 * 1024 * 1024;
+
+/// Whether `q` may be retyped as the BIOS boot partition: its contents are overwritten, so only
+/// a small partition with no filesystem qualifies.
+pub fn biosBootCandidate(q: Partition) bool {
+    return q.size >= 1024 * 1024 and q.size <= bios_boot_max_size and q.fstype == null;
+}
+
 /// Where the target root is mounted while installing.
 pub const target = "/run/dkrescue-install/target";
 /// The install log while installing (SPEC.md 6.4).
@@ -979,6 +988,7 @@ fn planExisting(b: *Builder, p: Probe, disk: Disk, a: Answers, ids: files.Ids) B
             if (std.mem.eql(u8, q.path, root.path)) return b.refuse("root and the BIOS boot partition are the same partition", .{});
             if (esp_part) |e| if (std.mem.eql(u8, q.path, e.path)) return b.refuse("the ESP and the BIOS boot partition are the same partition", .{});
             if (q.size < MiB) return b.refuse("BIOS boot partition {s} is smaller than 1 MiB", .{q.path});
+            if (!isBiosBootType(q.parttype) and !biosBootCandidate(q)) return b.refuse("{s} can't become the BIOS boot partition: it must be at most {d} MiB with no filesystem, because its contents are overwritten", .{ q.path, bios_boot_max_size / MiB });
             if (!a.set_bios_boot_type) return b.refuse("{s} is not typed as BIOS boot (type {s}); set_bios_boot_type = true fixes that", .{ q.path, q.parttype orelse "none" });
             try type_fixes.append(arena, .{
                 .desc = "Set the partition type to BIOS boot",
@@ -1690,4 +1700,29 @@ test "the BIOS boot partition is never root, given by either name" {
     p.disks = disks;
     a.bios_boot = null;
     try std.testing.expect(contains((try build(arena, p, a, test_ids)).refused, "none found"));
+}
+
+test "only a small partition without a filesystem is retyped as BIOS boot" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const base = try biosGptFixture(arena);
+    var a = testAnswers("vda", .existing);
+    a.root = "vda1";
+    a.bios_boot = "vda2";
+    a.set_bios_boot_type = true;
+    const cases = [_]struct { size: u64, fstype: ?[]const u8 }{
+        .{ .size = 500 * 1024 * MiB, .fstype = null },
+        .{ .size = 2 * MiB, .fstype = "ntfs" },
+    };
+    for (cases) |c| {
+        var p = base;
+        const parts = try arena.dupe(Partition, base.disks[0].partitions);
+        parts[1].size = c.size;
+        parts[1].fstype = c.fstype;
+        const disks = try arena.dupe(Disk, base.disks);
+        disks[0].partitions = parts;
+        p.disks = disks;
+        try std.testing.expect(contains((try build(arena, p, a, test_ids)).refused, "contents are overwritten"));
+    }
 }

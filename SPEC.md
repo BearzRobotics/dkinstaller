@@ -200,6 +200,9 @@ answers.
     enough for dklilo's stage 2 (`dklilo install-bios` itself refuses if
     not; it has no read-only `--check` yet, see 12.6, so a failure shows up
     at the bootloader step, after formatting)
+  - the BIOS boot partition is neither root nor the ESP. One that is not
+    already typed as BIOS boot is retyped only if it is 1 to 16 MiB and has no
+    filesystem, because its contents are overwritten
 - **Wrong partition type:** a partition made with `fdisk` and left as
   "Linux filesystem" when it was meant to be the ESP or the BIOS boot
   partition is common. The installer offers to set the correct type. That
