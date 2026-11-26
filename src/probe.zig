@@ -187,9 +187,9 @@ pub const net_service_names = [_][]const u8{ "networkmanager", "wpa_supplicant",
 
 pub const nm_connections_dir = "/etc/NetworkManager/system-connections";
 
-fn detectStack(io: Io, services: []const Service) NetStack {
-    if (findService(services, "networkmanager") != null or exists(io, "/usr/sbin/NetworkManager") or exists(io, "/usr/bin/NetworkManager")) return .networkmanager;
-    if (findService(services, "dhcpcd") != null or exists(io, "/usr/sbin/dhcpcd") or exists(io, "/sbin/dhcpcd")) return .dhcpcd;
+fn detectStack(arena: Allocator, io: Io, root: []const u8, services: []const Service) NetStack {
+    if (findService(services, "networkmanager") != null or existsIn(arena, io, root, "/usr/sbin/NetworkManager") or existsIn(arena, io, root, "/usr/bin/NetworkManager")) return .networkmanager;
+    if (findService(services, "dhcpcd") != null or existsIn(arena, io, root, "/usr/sbin/dhcpcd") or existsIn(arena, io, root, "/sbin/dhcpcd")) return .dhcpcd;
     return .none;
 }
 
@@ -284,8 +284,8 @@ pub fn serviceLabel(text: []const u8) []const u8 {
 
 /// The first ordinary login (uid 1000-59999 with a /home directory) in /etc/passwd; empty if
 /// there is none (nothing to remove then).
-pub fn liveUser(arena: Allocator, io: Io) []const u8 {
-    const text = readSmall(arena, io, "/etc/passwd") orelse return "";
+pub fn liveUser(arena: Allocator, io: Io, root: []const u8) []const u8 {
+    const text = readIn(arena, io, root, "/etc/passwd") orelse return "";
     return firstOrdinaryUser(text) orelse "";
 }
 
@@ -298,10 +298,10 @@ pub fn accountNames(arena: Allocator, out: *std.ArrayList([]const u8), text: []c
     }
 }
 
-fn readAccounts(arena: Allocator, io: Io) Allocator.Error![]const []const u8 {
+fn readAccounts(arena: Allocator, io: Io, root: []const u8) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for ([_][]const u8{ "/etc/passwd", "/etc/group" }) |path| {
-        if (readSmall(arena, io, path)) |text| try accountNames(arena, &out, text);
+        if (readIn(arena, io, root, path)) |text| try accountNames(arena, &out, text);
     }
     return out.items;
 }
@@ -339,12 +339,13 @@ pub fn missingDependency(text: []const u8, services: []const Service) ?[]const u
     return null;
 }
 
-/// Reads /etc/dinit.d and /usr/lib/dinit.d (files only) and boot.d.
-pub fn readServices(arena: Allocator, io: Io) Allocator.Error![]const Service {
+/// Reads /etc/dinit.d and /usr/lib/dinit.d (files only) and boot.d of the system at `root`.
+pub fn readServices(arena: Allocator, io: Io, root: []const u8) Allocator.Error![]const Service {
     var out: std.ArrayList(Service) = .empty;
     const dirs = [_]struct { path: []const u8, usr: bool }{ .{ .path = "/etc/dinit.d", .usr = false }, .{ .path = "/usr/lib/dinit.d", .usr = true } };
     for (dirs) |dd| {
-        var d = Io.Dir.cwd().openDir(io, dd.path, .{ .iterate = true }) catch continue;
+        const dir_path = try std.fmt.allocPrint(arena, "{s}{s}", .{ root, dd.path });
+        var d = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
         defer d.close(io);
         var it = d.iterate();
         while (it.next(io) catch null) |e| {
@@ -357,12 +358,13 @@ pub fn readServices(arena: Allocator, io: Io) Allocator.Error![]const Service {
             };
             if (dup) continue;
             const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dd.path, e.name });
-            const label = if (readSmall(arena, io, path)) |t| try arena.dupe(u8, serviceLabel(t)) else "";
-            const link = try std.fmt.allocPrint(arena, "/etc/dinit.d/boot.d/{s}", .{e.name});
+            const label = if (readIn(arena, io, root, path)) |t| try arena.dupe(u8, serviceLabel(t)) else "";
+            const link = try std.fmt.allocPrint(arena, "{s}/etc/dinit.d/boot.d/{s}", .{ root, e.name });
             try out.append(arena, .{
                 .name = try arena.dupe(u8, e.name),
                 .label = label,
-                .enabled = exists(io, link),
+                // The link itself: an absolute target would be looked up outside `root`.
+                .enabled = linkPresent(io, link),
                 .in_usr = dd.usr,
                 .network = inList(&network_services, e.name),
                 .core = inList(&core_services, e.name) or std.mem.startsWith(u8, e.name, "tty"),
@@ -376,7 +378,7 @@ pub fn readServices(arena: Allocator, io: Io) Allocator.Error![]const Service {
     }.lt);
     for (out.items) |*sv| {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ if (sv.in_usr) "/usr/lib/dinit.d" else "/etc/dinit.d", sv.name });
-        if (readSmall(arena, io, path)) |t| sv.missing_dep = missingDependency(t, out.items);
+        if (readIn(arena, io, root, path)) |t| sv.missing_dep = missingDependency(t, out.items);
     }
     return out.items;
 }
@@ -825,6 +827,22 @@ fn readSmall(arena: Allocator, io: Io, path: []const u8) ?[]u8 {
     return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch null;
 }
 
+/// Where the initrd mounts the system image, unchanged by the live session (docs/ISO-REQUIREMENTS.md).
+const image_mount = "/run/live/rootfs";
+
+fn readIn(arena: Allocator, io: Io, root: []const u8, path: []const u8) ?[]u8 {
+    return readSmall(arena, io, std.fmt.allocPrint(arena, "{s}{s}", .{ root, path }) catch return null);
+}
+
+fn existsIn(arena: Allocator, io: Io, root: []const u8, path: []const u8) bool {
+    return linkPresent(io, std.fmt.allocPrint(arena, "{s}{s}", .{ root, path }) catch return false);
+}
+
+fn linkPresent(io: Io, path: []const u8) bool {
+    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return true;
+}
+
 fn exists(io: Io, path: []const u8) bool {
     Io.Dir.accessAbsolute(io, path, .{}) catch return false;
     return true;
@@ -865,7 +883,10 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         rootfs_size = std.fmt.parseInt(u64, std.mem.trim(u8, t, " \n\r\t"), 10) catch null;
     }
 
-    const services = try readServices(arena, io);
+    // What the new system will be is what the image holds, not what the live session made of
+    // it. Without the image mount, the running system is the closest thing.
+    const image: []const u8 = if (exists(io, image_mount ++ "/etc/passwd")) image_mount else "";
+    const services = try readServices(arena, io, image);
     const sfs = "/run/live/medium/live/rootfs.sfs";
     const is_live = exists(io, sfs);
     const kernel = if (is_live) findKernel(arena, io, sfs) else null;
@@ -878,15 +899,15 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         .rootfs_size = rootfs_size,
         .kernel = kernel,
         .disks = try checkEsps(arena, io, firmware, try fillMissingIds(arena, io, try parseLsblk(arena, lsblk.stdout))),
-        .live_user = liveUser(arena, io),
-        .accounts = try readAccounts(arena, io),
+        .live_user = liveUser(arena, io, image),
+        .accounts = try readAccounts(arena, io, image),
         .services = services,
-        .selinux = exists(io, "/etc/selinux/config"),
+        .selinux = existsIn(arena, io, image, "/etc/selinux/config"),
         .net_ifaces = try readNetIfaces(arena, io),
-        .net_stack = detectStack(io, services),
+        .net_stack = detectStack(arena, io, image, services),
         .live_connections = try readConnections(arena, io),
         .tools = try liveTools(arena, io),
-        .kernel_builtin = try kernelBuiltin(arena, io, kernel),
+        .kernel_builtin = try kernelBuiltin(arena, io, image, kernel),
         .paths = try livePaths(arena, io),
     };
 }
@@ -1003,12 +1024,12 @@ fn livePaths(arena: Allocator, io: Io) ![]const []const u8 {
 /// Which of `fs.kernel_symbols` are `=y` in `/boot/config-<version>` of the live system
 /// (the system image the new system is copied from has the same file). None if the
 /// config is not there: nothing is then claimed to be built in.
-fn kernelBuiltin(arena: Allocator, io: Io, kernel: ?[]const u8) ![]const []const u8 {
+fn kernelBuiltin(arena: Allocator, io: Io, root: []const u8, kernel: ?[]const u8) ![]const []const u8 {
     const k = kernel orelse return &.{};
     const prefix = "vmlinuz-";
     if (!std.mem.startsWith(u8, k, prefix)) return &.{};
     const path = try std.fmt.allocPrint(arena, "/boot/config-{s}", .{k[prefix.len..]});
-    const text = readSmall(arena, io, path) orelse return &.{};
+    const text = readIn(arena, io, root, path) orelse return &.{};
     return builtinSymbols(arena, text);
 }
 
@@ -1191,4 +1212,26 @@ test "the newest kernel is picked by version, not by string order" {
     try std.testing.expectEqualStrings("vmlinuz-6.13", pick(&.{ "vmlinuz-6.13-rc2", "vmlinuz-6.13" }));
     try std.testing.expectEqualStrings("vmlinuz-6.19-dkrescue", pick(&.{ "vmlinuz-6.19-dkrescue", "vmlinuz-6.2-dkrescue" }));
     try std.testing.expect(pickKernel("squashfs-root/boot/config-6.1\n") == null);
+}
+
+test "services and accounts are read from the image tree given" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "etc/dinit.d/boot.d");
+    try tmp.dir.createDirPath(io, "usr/lib/dinit.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "etc/dinit.d/dk-test-sshd", .data = "type = process\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "usr/lib/dinit.d/dk-test-cups", .data = "type = process\n" });
+    // An absolute link, as the image has for /usr/lib services: it points inside the image.
+    try tmp.dir.symLink(io, "/usr/lib/dinit.d/dk-test-cups", "etc/dinit.d/boot.d/dk-test-cups", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "etc/passwd", .data = "root:x:0:0::/root:/bin/sh\nimg:x:1000:1000::/home/img:/bin/sh\n" });
+    const sv = try readServices(arena, io, root);
+    try std.testing.expectEqual(@as(usize, 2), sv.len);
+    try std.testing.expect(findService(sv, "dk-test-cups").?.enabled);
+    try std.testing.expect(!findService(sv, "dk-test-sshd").?.enabled);
+    try std.testing.expectEqualStrings("img", liveUser(arena, io, root));
 }
