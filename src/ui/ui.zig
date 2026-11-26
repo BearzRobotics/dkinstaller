@@ -54,6 +54,7 @@ pub const Ui = struct {
         if (self.script_i >= self.script.len) return error.ScriptEnded;
         const k = self.script[self.script_i];
         self.script_i += 1;
+        if (k == .ctrl_c) return error.Quit;
         return k;
     }
 
@@ -1772,7 +1773,8 @@ const Progress = struct {
             }
             _ = ui.screen.text(r.x, r.y + r.h - 2, "The base system is already installed. Going on is usually right.", normal, @intCast(r.w));
             _ = ui.screen.text(r.x, r.y + r.h - 1, ui.fmt("Log: {s}", .{execute.log_path}), dim, @intCast(r.w));
-            const k = ui.key() catch return true;
+            // Ctrl-C means stop, never go on.
+            const k = ui.key() catch |e| return e != error.Quit;
             switch (k) {
                 .enter => return true,
                 .char => |c| if (c == 'q' or c == 'Q') return false,
@@ -1865,7 +1867,11 @@ fn handConfig(ui: *Ui, stack: probe_mod.NetStack) void {
             .{ .label = "Edit a config file", .detail = "with $EDITOR (vi if unset)" },
             .{ .label = "Done: continue the installation" },
         };
-        const pick = menu(ui, "Configure by hand", "The new system is mounted. Configure the network (and anything else) here; the installer carries on when you choose Done.", &items, 0) catch return orelse return;
+        // Ctrl-C (often meant for the shell just left) must not carry the install on.
+        const pick = menu(ui, "Configure by hand", "The new system is mounted. Configure the network (and anything else) here; the installer carries on when you choose Done.", &items, 0) catch |e| {
+            if (e == error.Quit) continue;
+            return;
+        } orelse return;
         switch (pick) {
             0 => inTarget(ui, stack, &.{ "/bin/bash", "-l" }, true, null),
             1 => {
@@ -1876,10 +1882,16 @@ fn handConfig(ui: *Ui, stack: probe_mod.NetStack) void {
                     list.append(ui.arena, .{ .label = f }) catch return;
                 }
                 list.append(ui.arena, .{ .label = "Type a path..." }) catch return;
-                const fp = menu(ui, "Edit a file", "Choose a file in the new system.", list.items, 0) catch return orelse continue;
+                const fp = menu(ui, "Edit a file", "Choose a file in the new system.", list.items, 0) catch |e| {
+                    if (e == error.Quit) continue;
+                    return;
+                } orelse continue;
                 var path = list.items[fp].label;
                 if (fp == list.items.len - 1) {
-                    path = (input(ui, "Edit a file", "Path inside the new system, for example /etc/hosts.", "/etc/", .{ .validate = nonEmpty }) catch return) orelse continue;
+                    path = (input(ui, "Edit a file", "Path inside the new system, for example /etc/hosts.", "/etc/", .{ .validate = nonEmpty }) catch |e| {
+                        if (e == error.Quit) continue;
+                        return;
+                    }) orelse continue;
                 }
                 inTarget(ui, stack, &.{ "/bin/sh", "-c", "exec ${EDITOR:-vi} \"$1\"", "sh", path }, false, null);
             },
@@ -1903,6 +1915,8 @@ pub fn install(ui: *Ui, io: Io, plan: plan_mod.Plan, info: []const u8, stack: pr
         .on_shell = Progress.onShell,
     });
     defer runner.deinit();
+    // However this is left early (the terminal going away), unmount what was mounted.
+    errdefer runner.cleanup();
     runner.header(info);
 
     const outcome = try runner.run(plan.steps);
@@ -1937,7 +1951,11 @@ pub fn install(ui: *Ui, io: Io, plan: plan_mod.Plan, info: []const u8, stack: pr
                         }
                     }
                 }
-                switch (try ui.key()) {
+                const k = ui.key() catch |e| {
+                    if (e == error.Quit) continue;
+                    return e;
+                };
+                switch (k) {
                     .char => |c| switch (c) {
                         'r', 'R' => return .reboot,
                         'l', 'L' => return .live,
@@ -1966,7 +1984,9 @@ pub fn install(ui: *Ui, io: Io, plan: plan_mod.Plan, info: []const u8, stack: pr
                 y = r.y + r.h - 2;
                 _ = ui.screen.text(r.x, y, ui.fmt("Log: {s}", .{execute.log_path}), normal, @intCast(r.w));
                 _ = ui.screen.text(r.x, y + 1, ui.fmt("Target mounted at {s}. Quit keeps a log copy in its /var/log.", .{plan_mod.target}), normal, @intCast(r.w));
-                switch (try ui.key()) {
+                // Ctrl-C is the same as Q: unmount, then leave.
+                const k: Key = ui.key() catch |e| if (e == error.Quit) .{ .char = 'q' } else return e;
+                switch (k) {
                     .char => |c| switch (c) {
                         's', 'S' => {
                             t.pause();
@@ -2222,4 +2242,20 @@ test "with only WiFi, Esc leaves the DNS screen and then the network screens" {
     defer ui.screen.deinit(gpa);
     var d: Draft = .{};
     try std.testing.expect(!try screenNetwork(&ui, &p, &d));
+}
+
+test "Ctrl-C at a failed soft step stops the install" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    var screen_ui = try testUi(gpa, st.allocator(), &[_]Key{});
+    defer screen_ui.screen.deinit(gpa);
+    var progress: Progress = .{ .ui = &screen_ui, .steps = &.{} };
+    const failure: execute.Failure = .{ .index = 0, .desc = "d", .text = "t", .reason = "r", .tail = &.{} };
+    // A scripted key list stands in for the terminal: Q stops, Enter goes on.
+    screen_ui.script = &.{.{ .char = 'q' }};
+    try std.testing.expect(!Progress.onSoftFail(&progress, failure));
+    screen_ui.script = &.{ .ctrl_c, .enter };
+    screen_ui.script_i = 0;
+    try std.testing.expect(!Progress.onSoftFail(&progress, failure));
 }
