@@ -1028,20 +1028,59 @@ pub fn builtinSymbols(arena: Allocator, config: []const u8) ![]const []const u8 
     return out.items;
 }
 
-/// Finds the highest `boot/vmlinuz-*` inside the system image.
+/// Finds the newest `boot/vmlinuz-*` inside the system image.
 fn findKernel(arena: Allocator, io: Io, sfs: []const u8) ?[]const u8 {
     const r = std.process.run(arena, io, .{ .argv = &.{ "unsquashfs", "-l", sfs } }) catch return null;
     if (!r.term.success()) return null;
+    return pickKernel(r.stdout);
+}
+
+/// The newest kernel in an `unsquashfs -l` listing, by version number. Backup copies are skipped.
+pub fn pickKernel(listing: []const u8) ?[]const u8 {
     var best: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, r.stdout, '\n');
-    while (lines.next()) |line| {
+    var lines = std.mem.splitScalar(u8, listing, '\n');
+    next: while (lines.next()) |line| {
         const marker = "/boot/vmlinuz-";
         const i = std.mem.indexOf(u8, line, marker) orelse continue;
         const name = line[i + "/boot/".len ..];
         if (std.mem.indexOfScalar(u8, name, '/') != null) continue;
-        if (best == null or std.mem.order(u8, name, best.?) == .gt) best = name;
+        for ([_][]const u8{ ".old", ".bak", ".orig", ".dpkg-old", "~" }) |suffix| {
+            if (std.mem.endsWith(u8, name, suffix)) continue :next;
+        }
+        if (best == null or versionOrder(name, best.?) == .gt) best = name;
     }
     return best;
+}
+
+/// Compares names with runs of digits taken as numbers (6.12 is newer than 6.9). A release
+/// candidate is older than its release.
+fn versionOrder(a: []const u8, b: []const u8) std.math.Order {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        if (std.ascii.isDigit(a[i]) and std.ascii.isDigit(b[j])) {
+            const si = i;
+            const sj = j;
+            while (i < a.len and std.ascii.isDigit(a[i])) i += 1;
+            while (j < b.len and std.ascii.isDigit(b[j])) j += 1;
+            const x = std.mem.trimStart(u8, a[si..i], "0");
+            const y = std.mem.trimStart(u8, b[sj..j], "0");
+            if (x.len != y.len) return std.math.order(x.len, y.len);
+            const o = std.mem.order(u8, x, y);
+            if (o != .eq) return o;
+        } else {
+            if (a[i] != b[j]) {
+                if (std.mem.startsWith(u8, a[i..], "-rc")) return .lt;
+                if (std.mem.startsWith(u8, b[j..], "-rc")) return .gt;
+                return std.math.order(a[i], b[j]);
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    if (std.mem.startsWith(u8, a[i..], "-rc")) return .lt;
+    if (std.mem.startsWith(u8, b[j..], "-rc")) return .gt;
+    return std.math.order(a.len - i, b.len - j);
 }
 
 // ---------------------------------------------------------------- tests
@@ -1137,4 +1176,19 @@ test "BOOTX64.EFI is found whatever its case, and its absence is known" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "efi/Boot/bootx64.efi", .data = "x" });
     try std.testing.expectEqual(@as(?bool, true), hasFileCaseless(std.testing.io, root, &want));
     try std.testing.expectEqual(@as(?bool, null), hasFileCaseless(std.testing.io, "/nonexistent-dk", &want));
+}
+
+test "the newest kernel is picked by version, not by string order" {
+    const pick = struct {
+        fn f(comptime names: []const []const u8) []const u8 {
+            comptime var listing: []const u8 = "";
+            inline for (names) |n| listing = listing ++ "squashfs-root/boot/" ++ n ++ "\n";
+            return pickKernel(listing).?;
+        }
+    }.f;
+    try std.testing.expectEqualStrings("vmlinuz-6.12.8", pick(&.{ "vmlinuz-6.9.1", "vmlinuz-6.12.8", "vmlinuz-6.12.7" }));
+    try std.testing.expectEqualStrings("vmlinuz-6.12", pick(&.{ "vmlinuz-6.12", "vmlinuz-6.12.old", "vmlinuz-6.13.bak" }));
+    try std.testing.expectEqualStrings("vmlinuz-6.13", pick(&.{ "vmlinuz-6.13-rc2", "vmlinuz-6.13" }));
+    try std.testing.expectEqualStrings("vmlinuz-6.19-dkrescue", pick(&.{ "vmlinuz-6.19-dkrescue", "vmlinuz-6.2-dkrescue" }));
+    try std.testing.expect(pickKernel("squashfs-root/boot/config-6.1\n") == null);
 }
