@@ -226,7 +226,8 @@ pub fn menu(ui: *Ui, title: []const u8, intro: []const u8, items: []const Item, 
                     }
                 }
             },
-            .enter => if (items.len > 0 and items[cur].enabled) return cur,
+            // `cur` is past the end when nothing can be chosen (no usable disk).
+            .enter => if (cur < items.len and items[cur].enabled) return cur,
             .esc => return null,
             else => {},
         }
@@ -2171,4 +2172,14 @@ test "long non-ASCII input scrolls by characters and keeps the cursor in place" 
     const long = comptime repeated("é€", 60);
     try std.testing.expectEqualStrings(long, (try input(&ui, "t", "word-without-spaces-" ++ comptime repeated("é", 100), long, .{})).?);
     try std.testing.expect(ui.screen.cursor.?.x < ui.screen.w);
+}
+
+test "Enter on a menu with nothing to choose does nothing" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    var ui = try testUi(gpa, st.allocator(), &[_]Key{ .enter, .down, .enter, .esc });
+    defer ui.screen.deinit(gpa);
+    const items = [_]Item{.{ .label = "only the live USB", .enabled = false }};
+    try std.testing.expectEqual(@as(?usize, null), try menu(&ui, "Disk", "", &items, 0));
 }
