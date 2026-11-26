@@ -33,6 +33,14 @@ const usage =
     \\
 ;
 
+const auto_fallback = "Starting the normal installer; nothing was erased.\n";
+
+/// Why the answers' time zone can't be used, or null.
+fn zoneRefusal(arena: std.mem.Allocator, io: Io, zone: []const u8) ?[]const u8 {
+    if (dk.probe.zoneUsable(arena, io, dk.probe.imageRoot(io), zone)) return null;
+    return std.fmt.allocPrint(arena, "there is no time zone {s} in the system image", .{zone}) catch "no such time zone in the system image";
+}
+
 /// Prints the unattended install's progress to standard output.
 const Plain = struct {
     out: *Io.Writer,
@@ -156,15 +164,21 @@ pub fn main(init: std.process.Init) !u8 {
             answers_path = f.path;
         } else {
             try err.print("autoinstall: no answers file ({s}); starting the normal installer\n", .{if (explicit) |e| e else "looked at the live medium and removable media"});
+            // `--answers` that names no file must not be read below.
+            answers_path = null;
         }
     }
 
     // Answers (from a file; otherwise from the screens, below)
     var file_answers: ?dk.answers.Answers = null;
-    if (answers_path) |ans_path| {
+    if (answers_path) |ans_path| read: {
         const ans_text = Io.Dir.cwd().readFileAlloc(io, ans_path, arena, .limited(1 << 20)) catch |e| {
             try err.print("can't read {s}: {s}\n", .{ ans_path, @errorName(e) });
-            return 1;
+            if (!auto_mode) return 1;
+            try err.writeAll(auto_fallback);
+            answers_path = null;
+            erase_disk = null;
+            break :read;
         };
         var diag: dk.answers.Diag = .{};
         file_answers = dk.answers.parse(arena, ans_text, &diag) catch {
@@ -172,7 +186,11 @@ pub fn main(init: std.process.Init) !u8 {
                 try err.print("{s}:{d}: {s}\n", .{ ans_path, diag.line, diag.message })
             else
                 try err.print("{s}: {s}\n", .{ ans_path, diag.message });
-            return 1;
+            if (!auto_mode) return 1;
+            try err.writeAll(auto_fallback);
+            answers_path = null;
+            erase_disk = null;
+            break :read;
         };
         if (erase_disk) |d| if (!std.mem.eql(u8, d, file_answers.?.disk)) {
             try err.print("--yes-really-erase {s} does not match the disk in {s} ({s})\n", .{ d, ans_path, file_answers.?.disk });
@@ -207,40 +225,45 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
-    // The answers' time zone must be in the image (a recorded probe has no image to look in).
-    if (probe_path == null and executing) if (file_answers) |fa| {
-        if (!dk.probe.zoneUsable(arena, io, dk.probe.imageRoot(io), fa.timezone)) {
-            try err.print("refused: there is no time zone {s} in the system image\n", .{fa.timezone});
-            return 1;
-        }
-    };
+    var entropy: [dk.files.ids_entropy]u8 = undefined;
+    io.random(&entropy);
+    const ids = try dk.files.idsFromBytes(arena, &entropy);
 
-    // Autoinstall gates: all must hold, else the normal screens.
+    // Autoinstall gates: all must hold, and the answers must give a plan, else the normal screens.
     if (auto_mode and file_answers != null) gate: {
         var link: ?[]const u8 = null;
         if (file_answers.?.confirm_erase) |c| if (std.mem.startsWith(u8, c, "/dev/disk/by-")) {
             if (Io.Dir.cwd().realPathFileAlloc(io, c, arena)) |t| link = t else |_| {}
         };
-        switch (dk.auto.check(probe, auto_flag, file_answers.?, link)) {
-            .ok => |disk| {
-                file_answers.?.disk = disk.name;
+        const why: []const u8 = switch (dk.auto.check(probe, auto_flag, file_answers.?, link)) {
+            .ok => |disk| ok: {
+                var resolved = file_answers.?;
+                resolved.disk = disk.name;
+                if (probe_path == null and executing) {
+                    if (zoneRefusal(arena, io, resolved.timezone)) |w| break :ok w;
+                }
+                switch (try dk.plan.build(arena, probe, resolved, ids)) {
+                    .refused => |w| break :ok w,
+                    .plan => {},
+                }
+                file_answers = resolved;
                 erase_disk = disk.name;
                 try err.print("autoinstall: erasing /dev/{s} as the answers file confirms\n", .{disk.name});
                 try err.flush();
-            },
-            .refused => |g| {
-                try err.print("autoinstall REFUSED: {s}.\nStarting the normal installer; nothing was erased.\n", .{g.message()});
-                file_answers = null;
-                answers_path = null;
-                erase_disk = null;
                 break :gate;
             },
+            .refused => |g| g.message(),
+        };
+        try err.print("autoinstall REFUSED: {s}.\n" ++ auto_fallback, .{why});
+        file_answers = null;
+        answers_path = null;
+        erase_disk = null;
+    } else if (probe_path == null and executing) if (file_answers) |fa| {
+        if (zoneRefusal(arena, io, fa.timezone)) |why| {
+            try err.print("refused: {s}\n", .{why});
+            return 1;
         }
-    }
-
-    var entropy: [dk.files.ids_entropy]u8 = undefined;
-    io.random(&entropy);
-    const ids = try dk.files.idsFromBytes(arena, &entropy);
+    };
 
     var missing: std.ArrayList([]const u8) = .empty;
     for (dk.plan.required_programs) |prog| {
