@@ -158,6 +158,8 @@ def main():
     child.expect(r"[#$]")
     time.sleep(1)
     prompt(child)
+    # The installed system's sudo asks for a password (the installer's policy); give it once.
+    run(child, "echo testpw | sudo -S -p '' true 2>/dev/null")
     info = run(child, "uname -r; cat /proc/cmdline; findmnt -no SOURCE,FSTYPE,OPTIONS /; sudo findmnt -no TARGET,SOURCE,FSTYPE /boot /boot/efi 2>&1; sudo ls /boot | head -14")
     (work / "installed-info.txt").write_text(info)
     print(info)
