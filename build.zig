@@ -32,5 +32,8 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(mod_tests);
     // Tests read fixtures from tests/probes relative to the build root.
     run_tests.setCwd(b.path("."));
+    // Zig does not see what they read, so a cached pass would hide a broken
+    // fixture or document: run them every time.
+    run_tests.has_side_effects = true;
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 }
