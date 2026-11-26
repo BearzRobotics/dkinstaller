@@ -339,7 +339,7 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     }
 
     const layout: Layout = switch (a.partitioning) {
-        .auto => try planAuto(b, disk, a.root_fs, ids),
+        .auto => try planAuto(b, disk, a.root_fs, a.bootloader == .grub, ids),
         .existing => try planExisting(b, p, disk, a, ids),
     };
 
@@ -1051,7 +1051,7 @@ fn waitForDevices(b: *Builder) !void {
     });
 }
 
-fn planAuto(b: *Builder, disk: Disk, root_fs: fs_mod.Fs, ids: files.Ids) BuildError!Layout {
+fn planAuto(b: *Builder, disk: Disk, root_fs: fs_mod.Fs, grub_boot: bool, ids: files.Ids) BuildError!Layout {
     const arena = b.arena;
     const esp_dev = try files.partitionPath(arena, disk.name, 2);
     const root_dev = try files.partitionPath(arena, disk.name, 3);
@@ -1059,7 +1059,7 @@ fn planAuto(b: *Builder, disk: Disk, root_fs: fs_mod.Fs, ids: files.Ids) BuildEr
     try b.cmdStdin("Write the partition table", &.{ "sfdisk", disk.path }, try files.sfdiskScript(arena, ids), false);
     try waitForDevices(b);
     try b.cmd("Format the EFI System Partition", &.{ "mkfs.vfat", "-F", "32", "-n", "ESP", "-i", ids.esp_vol_id, esp_dev });
-    try b.cmd(try b.fmt("Format the root filesystem ({s})", .{fs_mod.info(root_fs).name}), try fs_mod.mkfsArgv(arena, root_fs, "dkrescue", ids.root_fs_uuid, root_dev, false));
+    try b.cmd(try b.fmt("Format the root filesystem ({s})", .{fs_mod.info(root_fs).name}), try fs_mod.mkfsArgv(arena, root_fs, "dkrescue", ids.root_fs_uuid, root_dev, false, grub_boot));
     return .{
         .root_dev = root_dev,
         .root_partuuid = ids.root_partuuid,
@@ -1149,7 +1149,7 @@ fn planExisting(b: *Builder, p: Probe, disk: Disk, a: Answers, ids: files.Ids) B
     }
 
     try b.steps.appendSlice(arena, type_fixes.items);
-    try b.cmd(try b.fmt("Format the root filesystem ({s})", .{fs_mod.info(a.root_fs).name}), try fs_mod.mkfsArgv(arena, a.root_fs, "dkrescue", ids.root_fs_uuid, root.path, true));
+    try b.cmd(try b.fmt("Format the root filesystem ({s})", .{fs_mod.info(a.root_fs).name}), try fs_mod.mkfsArgv(arena, a.root_fs, "dkrescue", ids.root_fs_uuid, root.path, true, a.bootloader == .grub));
     if (esp_fresh) {
         try b.cmd("Format the EFI System Partition", &.{ "mkfs.vfat", "-F", "32", "-n", "ESP", "-i", ids.esp_vol_id, esp_dev.? });
     }
@@ -1403,7 +1403,7 @@ test "a boot loader that cannot be used is refused with the reason; XFS needs GR
     try std.testing.expect(std.mem.indexOf(u8, under_dklilo.refused, "dklilo cannot read xfs: choose GRUB or systemd-boot") != null);
     a.bootloader = .grub;
     const under_grub = try build(arena, p, a, test_ids);
-    try std.testing.expect(contains(try dryRun(arena, under_grub.plan), "mkfs.xfs -L dkrescue -m uuid="));
+    try std.testing.expect(contains(try dryRun(arena, under_grub.plan), "mkfs.xfs -i nrext64=0,exchange=0 -n parent=0 -L dkrescue -m uuid="));
 }
 
 test "a keymap becomes a dinit service linked into boot.d; none, no service" {

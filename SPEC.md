@@ -244,7 +244,9 @@ and cannot be picked. A filesystem is available when all three checks pass:
 live disc. No layout has a separate `/boot` partition.
 
 Formatting: `mkfs.ext{2,3,4} -L <label> -U <uuid>`, `mkfs.btrfs -f -L <label> -U
-<uuid>`, `mkfs.xfs -f -L <label> -m uuid=<uuid>`. The fstab line carries the type
+<uuid>`, `mkfs.xfs -f -L <label> -m uuid=<uuid>`. When GRUB is the boot loader, XFS is made
+with `-i nrext64=0,exchange=0 -n parent=0` (since 0.0.7): GRUB 2.12 cannot read
+XFS with those features, which `mkfs.xfs` 7.x turns on by default. The fstab line carries the type
 and `0 0` as the fsck pass for btrfs, XFS and ZFS (`1 1` for ext2/3/4). With ZFS
 the installer would create the pool and dataset itself (`zpool create`, one
 `ROOT/fenriros` dataset, `bootfs`), set the hostid and write the cache file; that

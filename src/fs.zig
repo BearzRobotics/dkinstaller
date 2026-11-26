@@ -101,8 +101,9 @@ pub fn availability(arena: Allocator, fs: Fs, tools: []const []const u8, kernel_
 }
 
 /// The command that makes the filesystem on `dev`. `force`: overwrite what is
-/// there (an existing partition that held a filesystem).
-pub fn mkfsArgv(arena: Allocator, fs: Fs, label: []const u8, uuid: []const u8, dev: []const u8, force: bool) Allocator.Error![]const []const u8 {
+/// there (an existing partition that held a filesystem). `grub_boot`: GRUB has
+/// to read `/boot` from it.
+pub fn mkfsArgv(arena: Allocator, fs: Fs, label: []const u8, uuid: []const u8, dev: []const u8, force: bool, grub_boot: bool) Allocator.Error![]const []const u8 {
     var a: std.ArrayList([]const u8) = .empty;
     switch (fs) {
         .ext4, .ext3, .ext2 => {
@@ -118,6 +119,9 @@ pub fn mkfsArgv(arena: Allocator, fs: Fs, label: []const u8, uuid: []const u8, d
         .xfs => {
             try a.append(arena, "mkfs.xfs");
             if (force) try a.append(arena, "-f");
+            // GRUB 2.12 can't read XFS with these, which mkfs.xfs turns on by
+            // default: grub-install fails with "unknown filesystem" after the erase.
+            if (grub_boot) try a.appendSlice(arena, &.{ "-i", "nrext64=0,exchange=0", "-n", "parent=0" });
             try a.appendSlice(arena, &.{ "-L", label, "-m", try std.fmt.allocPrint(arena, "uuid={s}", .{uuid}), dev });
         },
         // Not selectable (availability): the pool is made by a later release.
@@ -184,17 +188,21 @@ test "mkfs command lines" {
     var st = arenaTest();
     defer st.deinit();
     const a = st.allocator();
-    const e = try mkfsArgv(a, .ext4, "dkrescue", "u-u-i-d", "/dev/sda3", false);
+    const e = try mkfsArgv(a, .ext4, "dkrescue", "u-u-i-d", "/dev/sda3", false, false);
     try std.testing.expectEqualSlices(u8, "mkfs.ext4", e[0]);
     try std.testing.expectEqual(@as(usize, 6), e.len);
-    const e2 = try mkfsArgv(a, .ext2, "x", "u", "/dev/sda3", true);
+    const e2 = try mkfsArgv(a, .ext2, "x", "u", "/dev/sda3", true, false);
     try std.testing.expectEqualStrings("mkfs.ext2", e2[0]);
     try std.testing.expectEqualStrings("-F", e2[1]);
-    const b = try mkfsArgv(a, .btrfs, "x", "u", "/dev/sda3", true);
+    const b = try mkfsArgv(a, .btrfs, "x", "u", "/dev/sda3", true, false);
     try std.testing.expectEqualStrings("mkfs.btrfs", b[0]);
     try std.testing.expectEqualStrings("-f", b[1]);
-    const x = try mkfsArgv(a, .xfs, "x", "u", "/dev/sda3", false);
+    const x = try mkfsArgv(a, .xfs, "x", "u", "/dev/sda3", false, false);
     try std.testing.expectEqualStrings("uuid=u", x[4]);
+    const xg = try mkfsArgv(a, .xfs, "x", "u", "/dev/sda3", false, true);
+    const wanted = [_][]const u8{ "mkfs.xfs", "-i", "nrext64=0,exchange=0", "-n", "parent=0", "-L", "x", "-m", "uuid=u", "/dev/sda3" };
+    try std.testing.expectEqual(wanted.len, xg.len);
+    for (wanted, xg) |w, got| try std.testing.expectEqualStrings(w, got);
 }
 
 test "parse and info" {
