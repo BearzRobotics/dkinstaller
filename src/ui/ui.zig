@@ -1720,7 +1720,7 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
         @tagName(sh.root_login),
         if (sh.password_auth) "allowed" else "off",
         if (sh.authorized_key != null) "given" else if (sh.generate_key) "generated" else "none",
-    }), .attr = if (!sh.password_auth and sh.authorized_key == null and !sh.generate_key) warn else normal });
+    }), .attr = if (!sh.password_auth and sh.authorized_key == null) warn else normal });
     if (a.ntp) |v| try lines.append(ui.arena, .{ .text = ui.fmt("NTP: {s}", .{if (v) "on" else "off"}) });
     if (a.firewall) |v| try lines.append(ui.arena, .{ .text = ui.fmt("Firewall: {s}", .{if (v) "on" else "off"}) });
     if (a.selinux) |m| try lines.append(ui.arena, .{ .text = ui.fmt("SELinux mode: {s}", .{@tagName(m)}) });
