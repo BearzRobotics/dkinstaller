@@ -46,21 +46,21 @@ printed.
 
 ## Complete example
 
-`tests/auto/example.toml` (checked by `--dry-run` in the tests):
+`tests/auto/example.toml` (the unit tests plan it, and check that this copy matches):
 
 ```toml
 # dkinstall.toml: a complete autoinstall answers file (docs/AUTOINSTALL.md).
 # Passwords are crypt(3) hashes: openssl passwd -6
 
 [install]
-# The disk: a kernel name (nvme0n1), a path (/dev/nvme0n1), first-nonremovable
+# The disk: a kernel name (nvme0n1) or a path (/dev/nvme0n1). With --auto also first-nonremovable
 # (first installable disk not on USB) or largest (biggest installable disk).
 disk = "largest"
 # Existing partitions instead: partitioning = "existing" and a [partitions] section.
 partitioning = "auto"
-# The root filesystem: ext4 (the default), ext3, ext2 or btrfs. xfs and zfs are listed but refused for now
-# (dklilo cannot read XFS, ZFS needs an initramfs); a filesystem whose tools are not on the live disc, or that
-# the installed kernel cannot mount without an initramfs, is refused with the reason (SPEC.md 5.3.4).
+# The root filesystem: ext4 (the default), ext3, ext2, btrfs or xfs (not with dklilo, which cannot read it).
+# zfs is refused (it needs an initramfs), as is a filesystem whose tools are not on the live disc, or that
+# the installed kernel cannot mount without one, with the reason (SPEC.md 5.3.4).
 #root_fs = "ext4"
 # REQUIRED for an autoinstall. Must name the disk the plan erases: its path, its
 # kernel name, or a /dev/disk/by-id/... link to it. A selector is not enough.
@@ -118,10 +118,13 @@ kind = "dhcp"
 name = "eth2"
 kind = "disabled"
 
-[packages]
 # Extra packages from a repository medium (apks/<arch>/ on /mnt/cdrom or --repo).
-install = ["curl", "htop"]
-keep_repo = false
+# Without such a medium the install is refused, so the section is commented out.
+#[packages]
+#install = ["curl", "htop"]
+#keep_repo = false
+# Only for a medium signed with a key the system does not already trust.
+#trust_medium_key = false
 
 [post]
 # Run last, each with sh -c in a chroot of the new system (/proc is not mounted).
@@ -137,7 +140,7 @@ is never printed or logged, but keep the file private.
 ## Try it without erasing anything
 
     dkrescue-install --auto --cmdline tests/auto/cmdline-auto \
-        --answers tests/auto/example.toml --probe tests/probes/uefi-nvme-blank.json --dry-run
+        --answers tests/auto/example.toml --probe tests/probes/uefi-services.json --dry-run
 
 ## What the image has to do
 

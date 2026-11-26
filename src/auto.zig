@@ -246,3 +246,31 @@ test "every gate: flag, confirm_erase present, disk resolves, not the live mediu
     // Selectors skip it as well.
     try std.testing.expect(!std.mem.eql(u8, resolveDisk(p, "largest").?.name, "sdb"));
 }
+
+fn readTest(arena: Allocator, path: []const u8) ![]u8 {
+    return Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena, .limited(1 << 20));
+}
+
+test "every example answers file parses and plans, and the documented copy matches" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const ids: @import("files.zig").Ids = .{ .root_fs_uuid = "11111111-2222-3333-4444-555555555555", .esp_vol_id = "ABCD1234", .root_partuuid = "r", .esp_partuuid = "e", .bios_partuuid = "b" };
+    const plan_mod = @import("plan.zig");
+    for ([_][]const u8{ "bios-mbr-fdisk", "bios-sata-windows", "uefi-nvme-blank", "uefi-sata-fdisk", "uefi-services" }) |name| {
+        var diag: answers_mod.Diag = .{};
+        const a = try answers_mod.parse(arena, try readTest(arena, try std.fmt.allocPrint(arena, "tests/probes/{s}.answers.toml", .{name})), &diag);
+        const r = try plan_mod.build(arena, try fixture(arena, try std.fmt.allocPrint(arena, "{s}.json", .{name})), a, ids);
+        try std.testing.expect(r == .plan);
+    }
+    // The documented dry run: --auto on the services fixture.
+    const text = try readTest(arena, "tests/auto/example.toml");
+    var diag: answers_mod.Diag = .{};
+    var a = try answers_mod.parse(arena, text, &diag);
+    const p = try fixture(arena, "uefi-services.json");
+    const disk = check(p, true, a, null).ok;
+    a.disk = disk.name;
+    try std.testing.expect((try plan_mod.build(arena, p, a, ids)) == .plan);
+    const doc = try readTest(arena, "docs/AUTOINSTALL.md");
+    try std.testing.expect(std.mem.indexOf(u8, doc, try std.fmt.allocPrint(arena, "```toml\n{s}```\n", .{text})) != null);
+}
