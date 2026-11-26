@@ -1149,7 +1149,10 @@ fn pskError(s: []const u8) ?[]const u8 {
 fn scanWifi(ui: *Ui, p: Probe) ![]const []const u8 {
     const io = ui.io orelse return &.{};
     var out: std.ArrayList([]const u8) = .empty;
-    if (std.process.run(ui.arena, io, .{ .argv = &.{ "nmcli", "-t", "-f", "SSID", "device", "wifi", "list" } })) |r| {
+    if (std.process.run(ui.arena, io, .{
+        .argv = // Unescaped: otherwise a `:` in a name comes out as `\:`.
+        &.{ "nmcli", "--escape", "no", "-t", "-f", "SSID", "device", "wifi", "list" },
+    })) |r| {
         if (r.term.success()) {
             var it = std.mem.splitScalar(u8, r.stdout, '\n');
             while (it.next()) |l| if (l.len > 0 and answers_mod.validSsid(l)) try addUnique(ui, &out, l);
