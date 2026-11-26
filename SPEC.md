@@ -1,6 +1,6 @@
 # dkrescue-install — Specification
 
-Status: **Draft v0.1** (program version 0.0.6). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.1** (program version 0.0.7). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -39,8 +39,6 @@ halfway, the log shows exactly where, and the rest can be finished by hand.
 - Installing alongside another operating system in free space
   (**post-v1**: "use free space", and adding Windows to the boot menu).
 - Encrypted root, LVM or RAID as the install target.
-- btrfs as the root filesystem (needs an initramfs or `BTRFS_FS` built in;
-  see 5.6).
 - A graphical installer.
 - Network installs. The install is offline: the system comes from the live medium, and extra packages (5.8) from the live medium or a mounted package repository (a disc or USB stick). Nothing is downloaded. (WiFi and DHCP settings written to the new system, 5.9, are configuration, not a download.)
 
@@ -125,7 +123,8 @@ transport (NVMe, SATA, USB) and the partitions and filesystems on it, from
 
 - the disk holding the live medium (the parent of the device mounted at
   `/run/live/medium`)
-- disks with any partition mounted
+- disks with any partition mounted or in use (anything on top of the disk or a
+  partition: LUKS, LVM, RAID, device-mapper)
 - loop, RAM, zram and optical devices, and read-only disks
 - disks smaller than the minimum size (5.2.1)
 
@@ -225,12 +224,11 @@ and cannot be picked. A filesystem is available when all three checks pass:
    in. A filesystem that is only a module needs an initramfs, which installed
    systems do not have yet (docs/initramfs.md in the dkbuild repository), so it is
    shown as `needs an initramfs (not available yet)`. ZFS is never built in.
-3. **dklilo can read `/boot`.** dklilo reads ext2/3/4, btrfs and FAT but not XFS
-   or ZFS. In this release those two are **listed but cannot be chosen**: the
-   reason shown is that `/boot` would need a separate partition or another boot
-   loader, which the installer does not offer yet. (A later release adds a boot
-   loader choice, GRUB reading XFS, and a separate `/boot`; dklilo's rules for
-   finding its config on a separate partition on UEFI have to be checked first.)
+3. **The chosen boot loader can read `/boot`.** dklilo reads ext2/3/4, btrfs
+   and FAT but not XFS or ZFS; GRUB also reads XFS; under systemd-boot the
+   kernels are on the ESP, so any root works. The boot loader (`bootloader` in
+   the answers file: `dklilo`, the default, `grub` or `systemd-boot`) is chosen
+   on the screen before this one.
 
 | Choice | Needs on the live disc | Package | Kernel | `/boot` |
 |---|---|---|---|---|
@@ -238,12 +236,12 @@ and cannot be picked. A filesystem is available when all three checks pass:
 | ext3 | `mkfs.ext3` | e2fsprogs | built in (the ext4 driver) | on root |
 | ext2 | `mkfs.ext2` | e2fsprogs | built in (the ext4 driver) | on root |
 | btrfs | `mkfs.btrfs` | btrfs-progs | built in from linux r4 (a module before) | on root |
-| XFS | `mkfs.xfs` | xfsprogs | built in from linux r4 | **not selectable yet** (dklilo cannot read it) |
+| XFS | `mkfs.xfs` | xfsprogs | built in from linux r4 | on root with GRUB, on the ESP with systemd-boot; not with dklilo |
 | ZFS | `zpool`, `zfs` | zfs | module (linux-lts only); needs an initramfs with ZFS | **not selectable yet** |
 | FAT32 | `mkfs.vfat` | dosfstools | built in | the ESP only (never the root) |
 
-`mkfs.vfat` is always needed (the ESP, 5.3.1) and `mkfs.ext4` is needed for the
-separate `/boot`; both are on every live disc.
+`mkfs.vfat` (the ESP, 5.3.1) and `mkfs.ext4` are required programs, on every
+live disc. No layout has a separate `/boot` partition.
 
 Formatting: `mkfs.ext{2,3,4} -L <label> -U <uuid>`, `mkfs.btrfs -f -L <label> -U
 <uuid>`, `mkfs.xfs -f -L <label> -m uuid=<uuid>`. The fstab line carries the type
@@ -264,10 +262,10 @@ One screen per item, each with a sensible default:
 |---|---|---|
 | Hostname | `dkrescue` | Checked against RFC 1123 hostname rules |
 | Root password | none (must be entered twice) | |
-| User name | none (must be entered) | Checked against `useradd`'s rules |
+| User name | none (must be entered) | Checked against `useradd`'s rules; `root` and names of existing accounts and groups are refused (the live user's is free: it is removed first) |
 | User password | none (must be entered twice) | |
 | Timezone | `UTC` | `/usr/share/zoneinfo` |
-| Console keymap | the one loaded now | `/usr/share/keymaps` |
+| Console keymap | `us` (the installer writes its keymap service even for this) | `/usr/share/keymaps` |
 
 The user goes into `wheel`, `video` and `render`. An empty root password
 isn't accepted: on an installed system, root is locked if the user prefers
@@ -320,7 +318,7 @@ area below a progress list. The steps, in order:
    boot creates one.
 6. **Users:** `chpasswd -R <target>` for root; `useradd -R <target> -m -G
    wheel,video,render -s /bin/bash <name>` and `chpasswd -R` for the user;
-   `userdel -R <target> -r <live user>` removes the live disc's user (read
+   `userdel -R <target> -r <live user>`, run **before** `useradd`, removes the live disc's user (read
    from the live `/etc/passwd`: the first login with uid 1000-59999 and a
    `/home/` directory; `rescue` on the rescue image, `live` on dkde).
 6a. **Live desktop login** (when the files exist; a failure stops the
@@ -372,8 +370,10 @@ The installer never retries a step that changes a disk on its own.
 After the keymap, each screen can be skipped and each starts at "as the
 image has it". Everything goes through the plan: the dry run lists it, and
 nothing is written before the summary is confirmed. A screen only appears
-when the image has what it configures (the live system is the image, so
-its `/etc/dinit.d`, `/usr/lib/dinit.d` and `boot.d` are read).
+when the image has what it configures. Services, accounts, the live user,
+SELinux, the network stack and the kernel config are read from the image as
+the initrd mounts it (`/run/live/rootfs`), so changes made in the live
+session don't count; without that mount, the running system is read.
 
 - **Network** (5.9).
 - **Services.** Every dinit service of the image with the first comment line
@@ -382,7 +382,8 @@ its `/etc/dinit.d`, `/usr/lib/dinit.d` and `boot.d` are read).
   Services needed to boot are shown but not switchable. A service whose
   `depends-on`/`depends-ms`/`waits-for` names a service the image lacks
   (the dkde image's `cupsd` needs `avahi-daemon`) can't be enabled: dinit
-  stops the boot with "could not load dependency" (seen in QEMU). Enabling does what
+  stops the boot with "could not load dependency" (seen in QEMU); the same
+  goes for a service that needs it through others. Enabling does what
   dkbuild's image step does: `ln -sfn ../NAME boot.d/NAME` (service in
   `/etc/dinit.d`) or `ln -sfn /usr/lib/dinit.d/NAME boot.d/NAME`; disabling
   removes the link. Only differences from the image become steps.
@@ -390,7 +391,7 @@ its `/etc/dinit.d`, `/usr/lib/dinit.d` and `boot.d` are read).
   is switched on or off; the screens don't ask again): root login (`no` default, `prohibit-password`,
   `yes`), password login, and a key for the new user: pasted, read from a
   `*.pub` file on a mounted medium (`/mnt/cdrom`, `/media/*`, or a device
-  the screen mounts read-only at `/mnt/cdrom`; never the target disk), or
+  the screen mounts read-only at `/mnt/dkinstall-keys`; never the target disk), or
   generated (ed25519, the fingerprint is shown on the last screen). A
   pasted or read key is checked with `ssh-keygen -l -f` before it is
   accepted. Settings go in `/etc/ssh/sshd_config.d/10-dkinstall.conf`;
@@ -398,14 +399,16 @@ its `/etc/dinit.d`, `/usr/lib/dinit.d` and `boot.d` are read).
   `Include /etc/ssh/sshd_config.d/*.conf` when it has none. Host keys are made
   with `ssh-keygen -A -f TARGET`. `authorized_keys` is written mode 0600 in a
   0700 `.ssh`, chowned inside a chroot. Password login off with sshd on and
-  no key is a lockout: the screen asks for confirmation, the plan refuses it
-  unless `allow_lockout` is set.
+  no given key is a lockout: the screen asks for confirmation, the plan refuses
+  it unless `allow_lockout` is set. A generated key doesn't count: its private
+  half (no passphrase) exists only on the new system. An `[ssh]` section on an
+  image without sshd is refused.
 - **SELinux.** NTP and the firewall are services, so they are chosen in the
   services list only (the answers file also has `ntp` and `firewall` keys).
   SELinux mode (`permissive` default, `enforcing`,
   `disabled`: `SELINUX=` in `/etc/selinux/config`, with `sed`).
-- **Timezone** is checked against the live system's `/usr/share/zoneinfo`
-  when it exists. **Hostname** is followed by an optional **domain**;
+- **Timezone** must be a file in the image's `/usr/share/zoneinfo` when it
+  has one, for the screens and answers files alike. **Hostname** is followed by an optional **domain**;
   `/etc/hosts` gets `host.domain host`.
 
 SELinux labelling: when `/etc/selinux/config` and
@@ -442,10 +445,18 @@ written; the system's own default, DHCP on wired interfaces).
   `[wifi-security] key-mgmt=wpa-psk psk=`), or, with dhcpcd, lines appended to
   `dhcpcd.conf` (`static ip_address`, `routers`, `domain_name_servers`,
   `noipv4 noipv6` for disabled) and a `network={}` block in
-  `wpa_supplicant.conf`. A DHCP interface without DNS needs no file.
+  `wpa_supplicant.conf`. A DHCP interface without DNS needs no file. DNS and
+  the search domain apply to WiFi too (with dhcpcd, each wireless interface
+  gets an `interface` block). They are added to what DHCP gives. Each server
+  goes in its address family's section; a static address of one family
+  leaves the other on `auto` if it has a server (a static IPv6 address
+  otherwise turns IPv4 off). With dhcpcd a static IPv6 gateway is only noted
+  in a comment.
   The WiFi passphrase is never in the dry run, the summary or the log
-  (`write` steps with `secret`, `tee` with hidden stdin). SSID and passphrase
-  may not contain `"` or `\`.
+  (`write` steps with `secret`; an append that prints nothing, with hidden
+  stdin: never `tee`, which copies its input to the log). SSID and passphrase
+  may not contain `"` or `\`. The optional test connect hands NetworkManager a
+  root-only connection file, never a command-line argument.
 - *Copy*: `cp -p` of the chosen live connection file into the target.
 - *Manual (nothing)*: no files; the network services present
   (networkmanager, wpa_supplicant, dhcpcd) are disabled through the same
@@ -509,10 +520,12 @@ confirm_erase` naming the disk the plan erases (path, kernel name, or a
 itself), and a target that is not the live medium (a disk with a mounted
 partition, such as the answers medium, is refused as always). A missing or
 mismatching gate prints which and starts the normal screens; nothing is
-erased. Discovery order: `--answers`/`dkinstall.answers=PATH` (no fallback if
+erased. So does an answers file that is missing, doesn't parse, or gives no
+plan. Discovery order: `--answers`/`dkinstall.answers=PATH` (no fallback if
 missing), `<live medium>/install/answers.toml`, `dkinstall.toml` on an
-already mounted medium, then on each candidate device mounted read-only at
-`/mnt/dkinstall-auto`. `first-nonremovable` treats USB-transport disks as
+already mounted medium, then on each candidate device mounted read-only (ext4
+with `noload`) at `/mnt/dkinstall-auto`, unmounted again if the gates
+refuse. `first-nonremovable` treats USB-transport disks as
 removable. At the end, after unmounting, `[install] when_done` = `reboot`
 (default), `poweroff` or `shell`; on failure a shell is left and the log path
 printed, exit code 1. `[post] commands` run last, each with `sh -c` in a
@@ -542,8 +555,9 @@ tested without a disk.
 
 A `Step` is a description shown to the user, plus one of:
 
-- a command: an `argv` array, run directly with no shell, so no quoting
-  problems with paths
+- a command: an `argv` array, run directly, so no quoting problems with
+  paths. The few steps that need a shell run `sh -c` with a fixed script and
+  pass paths as its arguments
 - a file write: a path and its full contents, from `files`
 
 **Everything the installer does to the target is a `Step`.** `--dry-run`
@@ -564,7 +578,8 @@ missing one makes that filesystem unavailable instead of stopping the installer.
 
 Everything (each step, its command line, its output and exit code) goes to
 `/run/dkrescue-install/install.log` while installing, and is copied to the
-target's `/var/log/dkrescue-install.log` at the end. Passwords never appear
+target's `/var/log/dkrescue-install.log` at the end. Both are mode 0600.
+Passwords never appear
 in the log or on screen: they're passed to `chpasswd` on its standard input.
 
 ## 7. Command line
@@ -578,7 +593,7 @@ in the log or on screen: they're passed to `chpasswd` on its standard input.
 | `--probe FILE` | Uses a recorded probe fixture (`tests/probes/*.json`) instead of reading the machine. For tests and `--dry-run`; refused without `--dry-run` |
 | `--auto` | Autoinstall (5.11, docs/AUTOINSTALL.md). `--cmdline FILE` reads the command line from FILE (tests) |
 | `--repo PATH` | A package repository medium (5.10) |
-| `--chroot-run CMD` | Runs `CMD` in the new system mounted at the install target, with `/proc /sys /dev /run` bound in (for tests and repairs) |
+| `--chroot-run CMD` | Runs `CMD` in the new system mounted at the install target, with `/proc /sys /dev /run` bound in (for tests and repairs). Refused with `--dry-run`, or when nothing is mounted there |
 | `--ascii` | ASCII box drawing |
 
 The answers file holds passwords as hashes (`openssl passwd -6` format),
@@ -589,8 +604,8 @@ sections: `[network]`, `[services]`, `[ssh]`, `[packages]`; optional
 
 ## 8. Testing
 
-- **Unit tests** for `plan` and `files`, against probe data recorded from
-  real machines (UEFI and BIOS, NVMe and SATA, empty and Windows disks):
+- **Unit tests** for `plan` and `files`, against probe fixtures modelled on
+  `lsblk` output (UEFI and BIOS, NVMe and SATA, empty and Windows disks):
   the steps produced, the `sfdisk` script, `fstab`, `dklilo.conf`, and
   every refusal (the live disk, a mounted disk, a disk too small).
 - **QEMU, unattended**, using `--answers` and `--yes-really-erase`:

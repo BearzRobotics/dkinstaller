@@ -60,6 +60,9 @@ Everything below was checked in the image and the installer relies on it.
 
 **Live layout (5.1).** The initrd mounts the ISO (iso9660, label
 `DKRESCUE`) at `/run/live/medium` and the squashfs at `/run/live/rootfs`.
+Since 0.0.7 the installer reads services, accounts and the kernel config
+from `/run/live/rootfs`, so keep that mount visible (without it, it reads the
+running system).
 `/run/live/medium/live/rootfs.sfs` exists. The installer's "am I on the live
 disc" check is exactly that file, and it copies the system from it with
 `unsquashfs`, not from the running overlay. If the initrd changes where it
@@ -68,8 +71,8 @@ with it.
 
 **Kernel in the system image (5.6 step 8).** `/boot/vmlinuz-6.19-dkrescue`
 is in `rootfs.sfs`. The installer picks the `vmlinuz-*` file there for
-`dklilo.conf`. There must be exactly one such file, or the choice is
-ambiguous. The installed system boots **without an initramfs**
+`dklilo.conf`. There should be exactly one such file; with several, it takes the newest version (since 0.0.7), which may not be the one
+you meant. The installed system boots **without an initramfs**
 (`root=PARTUUID=…`), so these must stay built into the kernel, not modules:
 
 ```

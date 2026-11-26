@@ -10,7 +10,8 @@ Because that erases a disk by itself, it needs **all** of these:
    answers file was read from).
 
 If any is missing or wrong the installer prints which, erases nothing and
-starts the normal screens. Nothing else triggers an unattended erase.
+starts the normal screens. So does an answers file that is missing, doesn't
+parse, or can't be turned into a plan. Nothing else triggers an unattended erase.
 
 ## Kernel parameters
 
@@ -135,6 +136,12 @@ commands = ["echo \"installed by dkinstall\" > /etc/motd", "ln -sf /usr/share/zo
 
 Not covered: one user only; no locale (only keymap and timezone); no
 by-label disk selection; `manual-shell` network is skipped when unattended.
+Things that are refused before anything is written: a user name the system
+already has, a time zone that isn't in the image, a repository whose signing
+key the image doesn't trust (unless `[packages] trust_medium_key = true`), and
+`password_auth = false` without an `authorized_key` (a `generate_key` pair
+doesn't count; set `[ssh] allow_lockout = true` to go on).
+
 The WiFi passphrase is the one secret in plain text (it has no hash form); it
 is never printed or logged, but keep the file private.
 
