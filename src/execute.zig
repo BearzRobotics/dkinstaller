@@ -81,7 +81,12 @@ pub const Runner = struct {
         var r: Runner = .{ .gpa = gpa, .io = io, .arena = .init(gpa), .observer = observer };
         errdefer r.arena.deinit();
         if (std.fs.path.dirname(path)) |dir| try Io.Dir.cwd().createDirPath(io, dir);
-        r.log = try Io.Dir.cwd().createFile(io, path, .{});
+        // The log can quote the answers' commands: it is for root only. The copy on the new
+        // system is made with `cp`, which keeps this mode.
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .permissions = .fromMode(0o600) });
+        errdefer file.close(io);
+        try file.setPermissions(io, .fromMode(0o600));
+        r.log = file;
         return r;
     }
 
@@ -210,7 +215,7 @@ pub const Runner = struct {
         defer self.gpa.free(text);
         const dest = plan_mod.target ++ "/var/log/dkrescue-install-failed.log";
         Io.Dir.cwd().createDirPath(self.io, plan_mod.target ++ "/var/log") catch return;
-        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = dest, .data = text }) catch return;
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = dest, .data = text, .flags = .{ .permissions = .fromMode(0o600) } }) catch return;
         self.logPrint("\n== log copy kept at {s}\n", .{dest});
     }
 
@@ -769,4 +774,37 @@ test "percentage lines are thinned in the log" {
     defer testing.allocator.free(logged);
     try testing.expect(std.mem.count(u8, logged, "\n") < 30);
     try testing.expect(std.mem.indexOf(u8, logged, "\n100\n") != null);
+}
+
+test "the planned wpa_supplicant step keeps the passphrase out of the log and the screen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sink: TestSink = .{};
+    defer sink.deinit();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const log = try std.fmt.allocPrint(testing.allocator, "{s}/install.log", .{dir});
+    defer testing.allocator.free(log);
+    const conf = try std.fmt.allocPrint(testing.allocator, "{s}/wpa_supplicant.conf", .{dir});
+    defer testing.allocator.free(conf);
+    var r = try Runner.init(testing.allocator, testing.io, log, .{ .ctx = &sink, .on_line = TestSink.onLine });
+    defer r.deinit();
+    // The same command the plan builds, aimed at a file here, and really run.
+    const o = try r.run(&.{.{ .desc = "wifi", .action = .{ .command = .{
+        .argv = &.{ "sh", "-c", plan_mod.append_private, "sh", conf },
+        .stdin = "network={\n    psk=\"s3cretpassphrase\"\n}\n",
+        .secret_stdin = true,
+    } } }});
+    try testing.expect(o == .ok);
+    const written = try tmp.dir.readFileAlloc(testing.io, "wpa_supplicant.conf", testing.allocator, .limited(1000));
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "s3cretpassphrase") != null);
+    const logged = try tmp.dir.readFileAlloc(testing.io, "install.log", testing.allocator, .limited(10000));
+    defer testing.allocator.free(logged);
+    try testing.expect(std.mem.indexOf(u8, logged, "s3cretpassphrase") == null);
+    try testing.expectEqual(@as(usize, 0), sink.lines.items.len);
+    for ([_][]const u8{ "install.log", "wpa_supplicant.conf" }) |name| {
+        const st = try tmp.dir.statFile(testing.io, name, .{});
+        try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
 }

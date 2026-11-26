@@ -758,6 +758,9 @@ fn dhcpcdConf(b: *Builder, net: answers_mod.Network) ![]u8 {
     return o.items;
 }
 
+/// `sh -c` script that appends standard input to the file `$1` and prints nothing.
+pub const append_private = "umask 077 && cat >> \"$1\"";
+
 /// Network configuration (the network screens). The stack present in the
 /// image decides the file format: NetworkManager keyfiles, or dhcpcd.conf and
 /// wpa_supplicant.conf. Nothing is written for "as the image has it".
@@ -820,7 +823,9 @@ fn planNetwork(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!voi
             if (net.wifi) |wf| {
                 const wconf = try b.fmt("\nnetwork={{\n    ssid=\"{s}\"\n    psk=\"{s}\"\n{s}}}\n", .{ wf.ssid, wf.psk, if (wf.hidden) "    scan_ssid=1\n" else "" });
                 try b.cmd("Create /etc/wpa_supplicant", &.{ "mkdir", "-p", target ++ "/etc/wpa_supplicant" });
-                try b.cmdStdin("Add the WiFi network to wpa_supplicant.conf (passphrase hidden)", &.{ "tee", "-a", target ++ "/etc/wpa_supplicant/wpa_supplicant.conf" }, wconf, true);
+                // Not `tee`: it copies its input to its output, which is logged and shown. The umask keeps a
+                // new file private from the moment it exists.
+                try b.cmdStdin("Add the WiFi network to wpa_supplicant.conf (passphrase hidden)", &.{ "sh", "-c", append_private, "sh", target ++ "/etc/wpa_supplicant/wpa_supplicant.conf" }, wconf, true);
                 try b.cmd("Restrict wpa_supplicant.conf", &.{ "chmod", "600", target ++ "/etc/wpa_supplicant/wpa_supplicant.conf" });
             }
         },
@@ -1524,8 +1529,8 @@ test "network: default DHCP writes nothing; dhcpcd target gets dhcpcd.conf and w
     try std.testing.expect(contains(out, "static routers=10.0.0.1"));
     try std.testing.expect(contains(out, "static domain_name_servers=9.9.9.9"));
     try std.testing.expect(contains(out, "interface eth1\nnoipv4"));
-    try std.testing.expect(contains(out, "wpa_supplicant.conf"));
-    try std.testing.expect(contains(out, "# stdin: (hidden)"));
+    try std.testing.expect(contains(out, "sh -c 'umask 077 && cat >> \"$1\"' sh /run/dkrescue-install/target/etc/wpa_supplicant/wpa_supplicant.conf   # stdin: (hidden)"));
+    try std.testing.expect(!contains(out, "tee -a /run/dkrescue-install/target/etc/wpa_supplicant"));
     try std.testing.expect(!contains(out, "s3cretpassphrase"));
 }
 
