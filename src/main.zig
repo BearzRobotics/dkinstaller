@@ -116,6 +116,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     const executing = !dry_run;
+    if (dry_run and chroot_cmd != null) {
+        try err.print("--chroot-run runs its command; it can't be combined with --dry-run\n", .{});
+        return 2;
+    }
     if (executing and probe_path != null) {
         try err.print("--probe is for --dry-run only: a recorded probe is never combined with execution\n", .{});
         return 2;
@@ -136,6 +140,10 @@ pub fn main(init: std.process.Init) !u8 {
     if (chroot_cmd) |cmd| {
         if (std.os.linux.geteuid() != 0) {
             try err.print("--chroot-run must run as root\n", .{});
+            return 1;
+        }
+        if (!dk.execute.isMountPoint(arena, io, dk.plan.target)) {
+            try err.print("--chroot-run: nothing is mounted at {s}\n", .{dk.plan.target});
             return 1;
         }
         if (dk.execute.chrootRun(init.gpa, io, &.{ "/bin/sh", "-c", cmd })) |why| {

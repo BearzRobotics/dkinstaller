@@ -510,6 +510,22 @@ pub fn shellBanner(arena: Allocator, stack: probe_mod.NetStack) ![]const u8 {
     , .{ plan_mod.target, stack_text });
 }
 
+/// Whether `/proc/self/mounts` text lists something mounted at `path`.
+pub fn mountsList(mounts: []const u8, path: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, mounts, '\n');
+    while (lines.next()) |l| {
+        var f = std.mem.tokenizeScalar(u8, l, ' ');
+        _ = f.next() orelse continue;
+        if (std.mem.eql(u8, f.next() orelse continue, path)) return true;
+    }
+    return false;
+}
+
+pub fn isMountPoint(arena: Allocator, io: Io, path: []const u8) bool {
+    const text = Io.Dir.cwd().readFileAlloc(io, "/proc/self/mounts", arena, .limited(1 << 20)) catch return false;
+    return mountsList(text, path);
+}
+
 /// Mounts the finished install again (root, and the ESP if there is one),
 /// runs `chrootRun`, and unmounts. For the final screen's shell.
 pub fn shellInInstalled(gpa: Allocator, io: Io, plan: plan_mod.Plan, argv: []const []const u8) ?[]const u8 {
@@ -842,4 +858,11 @@ test "a change of propagation is not recorded as a new mount" {
     try testing.expectEqual(@as(usize, 1), r.mounted.items.len);
     r.trackMounts(cmdStep("unbind", &.{ "umount", "-R", "/t/sys" }));
     try testing.expectEqual(@as(usize, 0), r.mounted.items.len);
+}
+
+test "a mount point is found by its whole path" {
+    const mounts = "/dev/sda3 /run/dkrescue-install/target ext4 rw 0 0\nproc /proc proc rw 0 0\n";
+    try testing.expect(mountsList(mounts, "/run/dkrescue-install/target"));
+    try testing.expect(!mountsList(mounts, "/run/dkrescue-install"));
+    try testing.expect(!mountsList("", "/proc"));
 }
