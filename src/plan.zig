@@ -702,8 +702,12 @@ fn planConfig(b: *Builder, p: Probe, a: Answers) BuildError!void {
 
     const ssh = a.ssh orelse return;
     const have_key = ssh.authorized_key != null or ssh.generate_key;
-    if (!ssh.password_auth and ssh_on and !have_key and !ssh.allow_lockout) {
-        return b.refuse("sshd would allow only keys and no key is set up: nobody could log in over ssh. Give a key, allow passwords, or confirm the lockout", .{});
+    // A generated key lets nobody in from outside: its private half exists only on the new system.
+    if (!ssh.password_auth and ssh_on and ssh.authorized_key == null and !ssh.allow_lockout) {
+        return if (ssh.generate_key)
+            b.refuse("sshd would allow only keys, and the generated private key is only on the new system: nobody can log in over ssh until it is copied off at the console. Give a key, allow passwords, or confirm the lockout (allow_lockout)", .{})
+        else
+            b.refuse("sshd would allow only keys and no key is set up: nobody could log in over ssh. Give a key, allow passwords, or confirm the lockout", .{});
     }
     try b.file("Write the sshd drop-in", target ++ "/etc/ssh/sshd_config.d/10-dkinstall.conf", try sshdDropIn(arena, ssh), 0o644);
     // The image's sshd_config may not read the drop-in directory: add the line (once).
@@ -1597,6 +1601,9 @@ test "ssh: drop-in, host keys, authorized_keys, generated key" {
     try std.testing.expect(contains(out, "ln -sfn ../sshd"));
     a.ssh.?.authorized_key = null;
     a.ssh.?.generate_key = true;
+    // Passwords are off here, so the only private key would be locked inside the machine.
+    try std.testing.expect(contains((try buildSvc(arena, a)).refused, "copied off at the console"));
+    a.ssh.?.allow_lockout = true;
     out = try dryRun(arena, (try buildSvc(arena, a)).plan);
     try std.testing.expect(contains(out, "ssh-keygen -t ed25519 -N '' -C dakota@dkrescue -f /run/dkrescue-install/target/home/dakota/.ssh/id_ed25519"));
     try std.testing.expect(contains(out, "cp /run/dkrescue-install/target/home/dakota/.ssh/id_ed25519.pub"));

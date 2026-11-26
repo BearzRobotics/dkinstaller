@@ -1550,8 +1550,12 @@ fn screenSsh(ui: *Ui, p: *Probe, d: *Draft) !bool {
                 step = 5;
             },
             else => {
-                if (!s.password_auth and s.authorized_key == null and !s.generate_key) {
-                    const ok = try yesNo(ui, "No way to log in over ssh", "Passwords are off and no key is set up: nobody could log in over ssh. Go on anyway?", "go on, I will add a key later", "go back and choose a key or allow passwords", false) orelse {
+                if (!s.password_auth and s.authorized_key == null) {
+                    const why: []const u8 = if (s.generate_key)
+                        "Passwords are off, and the generated private key exists only on the new system: nobody can log in over ssh until you copy ~/.ssh/id_ed25519 off it at the console. It has no passphrase. Go on?"
+                    else
+                        "Passwords are off and no key is set up: nobody could log in over ssh. Go on anyway?";
+                    const ok = try yesNo(ui, "No way to log in over ssh yet", why, if (s.generate_key) "go on, I will copy the key at the console" else "go on, I will add a key later", "go back and choose a key or allow passwords", false) orelse {
                         step = 4;
                         continue;
                     };
