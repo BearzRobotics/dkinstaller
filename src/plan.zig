@@ -748,41 +748,35 @@ fn uuidFor(b: *Builder, ids: files.Ids, name: []const u8) ![]u8 {
     return files.uuidFromBytes(b.arena, digest[0..16]);
 }
 
-fn joinSemi(b: *Builder, list: []const []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (list) |x| {
-        try out.appendSlice(b.arena, x);
-        try out.append(b.arena, ';');
-    }
-    return out.items;
-}
-
 /// A NetworkManager keyfile for one wired interface.
 fn nmEthernet(b: *Builder, ids: files.Ids, ifc: answers_mod.Iface, net: answers_mod.Network) ![]u8 {
     var o: std.ArrayList(u8) = .empty;
     try o.appendSlice(b.arena, try b.fmt("[connection]\nid=dk-{s}\nuuid={s}\ntype=ethernet\ninterface-name={s}\n", .{ ifc.name, try uuidFor(b, ids, ifc.name), ifc.name }));
     if (ifc.kind == .disabled) try o.appendSlice(b.arena, "autoconnect=false\n");
     try o.appendSlice(b.arena, "\n[ethernet]\n");
-    var v4: std.ArrayList([]const u8) = .empty;
-    var v6: std.ArrayList([]const u8) = .empty;
-    for (net.dns) |d| {
-        if (answers_mod.isV6(d)) try v6.append(b.arena, d) else try v4.append(b.arena, d);
-    }
     const addr = ifc.address;
     for ([_]bool{ false, true }) |six| {
         try o.appendSlice(b.arena, if (six) "\n[ipv6]\n" else "\n[ipv4]\n");
-        const dns = if (six) v6.items else v4.items;
+        var has_dns = false;
+        for (net.dns) |d| has_dns = has_dns or answers_mod.isV6(d) == six;
+        var off = ifc.kind == .disabled;
         switch (ifc.kind) {
             .disabled => try o.appendSlice(b.arena, if (six) "method=ignore\n" else "method=disabled\n"),
             .dhcp => try o.appendSlice(b.arena, "method=auto\n"),
             .static => {
                 if (addr != null and answers_mod.isV6(addr.?) == six) {
                     try o.appendSlice(b.arena, try b.fmt("method=manual\naddress1={s}{s}{s}\n", .{ addr.?, if (ifc.gateway != null) "," else "", ifc.gateway orelse "" }));
-                } else try o.appendSlice(b.arena, if (six) "method=auto\n" else "method=disabled\n");
+                } else if (six or has_dns) {
+                    // A DNS server of the other family needs that family on.
+                    try o.appendSlice(b.arena, "method=auto\n");
+                } else {
+                    try o.appendSlice(b.arena, "method=disabled\n");
+                    off = true;
+                }
             },
         }
-        if (ifc.kind != .disabled and dns.len > 0) try o.appendSlice(b.arena, try b.fmt("dns={s}\n", .{try joinSemi(b, dns)}));
-        if (ifc.kind != .disabled and net.search != null) try o.appendSlice(b.arena, try b.fmt("dns-search={s};\n", .{net.search.?}));
+        // NetworkManager takes no DNS settings in a section that is off.
+        if (!off) try o.appendSlice(b.arena, try dnsLines(b.arena, net.dns, net.search, six));
     }
     return o.items;
 }
@@ -2012,4 +2006,18 @@ test "DNS and the search domain reach a WiFi connection, with or without wired i
     p.net_stack = .dhcpcd;
     const out = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
     try std.testing.expect(contains(out, "interface wlan0\nstatic domain_name_servers=9.9.9.9 2620:fe::fe\nstatic domain_search=lab.test\n"));
+}
+
+test "static IPv6: no DNS under a disabled IPv4; an IPv4 server turns IPv4 on" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var a = svcAnswers();
+    a.network = .{ .ifaces = &.{.{ .name = "eth0", .kind = .static, .address = "2001:db8::5/64" }}, .search = "lab.test" };
+    var out = try dryRun(arena, (try buildSvc(arena, a)).plan);
+    try std.testing.expect(contains(out, "| [ipv4]\n    | method=disabled\n    | \n"));
+    a.network.?.dns = &.{"9.9.9.9"};
+    out = try dryRun(arena, (try buildSvc(arena, a)).plan);
+    try std.testing.expect(contains(out, "| [ipv4]\n    | method=auto\n    | dns=9.9.9.9;\n"));
+    try std.testing.expect(!contains(out, "method=disabled"));
 }
