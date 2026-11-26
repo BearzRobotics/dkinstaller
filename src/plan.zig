@@ -787,12 +787,27 @@ fn nmEthernet(b: *Builder, ids: files.Ids, ifc: answers_mod.Iface, net: answers_
     return o.items;
 }
 
-fn nmWifi(b: *Builder, ids: files.Ids, wf: answers_mod.Wifi) ![]u8 {
-    return wifiKeyfile(b.arena, wf.ssid, try uuidFor(b, ids, wf.ssid), wf);
+fn nmWifi(b: *Builder, ids: files.Ids, wf: answers_mod.Wifi, net: answers_mod.Network) ![]u8 {
+    return wifiKeyfile(b.arena, wf.ssid, try uuidFor(b, ids, wf.ssid), wf, net.dns, net.search);
+}
+
+/// The `dns=` and `dns-search=` lines of one address family's section.
+fn dnsLines(arena: Allocator, dns: []const []const u8, search: ?[]const u8, six: bool) ![]const u8 {
+    var o: std.ArrayList(u8) = .empty;
+    var any = false;
+    for (dns) |d| if (answers_mod.isV6(d) == six) {
+        if (!any) try o.appendSlice(arena, "dns=");
+        any = true;
+        try o.appendSlice(arena, d);
+        try o.append(arena, ';');
+    };
+    if (any) try o.append(arena, '\n');
+    if (search) |s| try o.appendSlice(arena, try std.fmt.allocPrint(arena, "dns-search={s};\n", .{s}));
+    return o.items;
 }
 
 /// A NetworkManager keyfile for a WPA network.
-pub fn wifiKeyfile(arena: Allocator, id: []const u8, uuid: []const u8, wf: answers_mod.Wifi) ![]u8 {
+pub fn wifiKeyfile(arena: Allocator, id: []const u8, uuid: []const u8, wf: answers_mod.Wifi, dns: []const []const u8, search: ?[]const u8) ![]u8 {
     return std.fmt.allocPrint(arena,
         \\[connection]
         \\id={s}
@@ -809,11 +824,27 @@ pub fn wifiKeyfile(arena: Allocator, id: []const u8, uuid: []const u8, wf: answe
         \\
         \\[ipv4]
         \\method=auto
-        \\
+        \\{s}
         \\[ipv6]
         \\method=auto
-        \\
-    , .{ id, uuid, wf.ssid, if (wf.hidden) "hidden=true\n" else "", wf.psk });
+        \\{s}
+    , .{ id, uuid, wf.ssid, if (wf.hidden) "hidden=true\n" else "", wf.psk, try dnsLines(arena, dns, search, false), try dnsLines(arena, dns, search, true) });
+}
+
+/// For dhcpcd, DNS and the search domain live in interface blocks, so with WiFi each wireless
+/// interface without settings of its own gets one.
+fn withWifiIfaces(b: *Builder, p: Probe, net: answers_mod.Network) !answers_mod.Network {
+    if (net.wifi == null or (net.dns.len == 0 and net.search == null)) return net;
+    var list: std.ArrayList(answers_mod.Iface) = .empty;
+    try list.appendSlice(b.arena, net.ifaces);
+    next: for (p.net_ifaces) |w| {
+        if (!w.wireless) continue;
+        for (net.ifaces) |have| if (std.mem.eql(u8, have.name, w.name)) continue :next;
+        try list.append(b.arena, .{ .name = w.name, .kind = .dhcp });
+    }
+    var out = net;
+    out.ifaces = list.items;
+    return out;
 }
 
 /// dhcpcd.conf lines for the interfaces (static, disabled) and DNS.
@@ -884,7 +915,7 @@ fn planNetwork(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!voi
     for (net.ifaces) |ifc| {
         if (ifc.kind == .static and (ifc.address == null)) return b.refuse("static interface {s} has no address", .{ifc.name});
     }
-    if (net.dns.len > 0 and net.ifaces.len == 0) return b.refuse("DNS servers need an interface to apply to", .{});
+    if (net.dns.len > 0 and net.ifaces.len == 0 and net.wifi == null) return b.refuse("DNS servers need an interface to apply to", .{});
     switch (p.net_stack) {
         .networkmanager => {
             var made = false;
@@ -898,14 +929,14 @@ fn planNetwork(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!voi
                 if (!made) try b.cmd("Create the NetworkManager connections directory", &.{ "mkdir", "-p", "-m", "700", conns });
                 try b.steps.append(arena, .{ .desc = try b.fmt("NetworkManager WiFi connection for {s}", .{wf.ssid}), .action = .{ .write_file = .{
                     .path = try b.fmt("{s}/wifi-{s}.nmconnection", .{ conns, try sanitize(arena, wf.ssid) }),
-                    .contents = try nmWifi(b, ids, wf),
+                    .contents = try nmWifi(b, ids, wf, net),
                     .mode = 0o600,
                     .secret = true,
                 } } });
             }
         },
         .dhcpcd => {
-            const conf = try dhcpcdConf(b, net);
+            const conf = try dhcpcdConf(b, try withWifiIfaces(b, p, net));
             if (std.mem.indexOf(u8, conf, "interface ") != null) {
                 try b.cmdStdin("Append the interface settings to dhcpcd.conf", &.{ "tee", "-a", target ++ "/etc/dhcpcd.conf" }, conf, false);
             }
@@ -1960,4 +1991,25 @@ test "network steps only warn; [ssh] on an image without sshd is refused before 
     var b = svcAnswers();
     b.ssh = .{ .root_login = .no };
     try std.testing.expect(contains((try build(arena, plain, b, test_ids)).refused, "no sshd"));
+}
+
+test "DNS and the search domain reach a WiFi connection, with or without wired interfaces" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-services.json");
+    var a = svcAnswers();
+    a.network = .{ .dns = &.{ "9.9.9.9", "2620:fe::fe" }, .search = "lab.test", .wifi = .{ .ssid = "Home", .psk = "password123" } };
+    var found = false;
+    for ((try build(arena, p, a, test_ids)).plan.steps) |s| switch (s.action) {
+        .write_file => |f| if (f.secret) {
+            found = contains(f.contents, "[ipv4]\nmethod=auto\ndns=9.9.9.9;\ndns-search=lab.test;\n") and
+                contains(f.contents, "[ipv6]\nmethod=auto\ndns=2620:fe::fe;\ndns-search=lab.test;\n");
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
+    p.net_stack = .dhcpcd;
+    const out = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    try std.testing.expect(contains(out, "interface wlan0\nstatic domain_name_servers=9.9.9.9 2620:fe::fe\nstatic domain_search=lab.test\n"));
 }

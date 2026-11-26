@@ -1181,7 +1181,7 @@ fn testWifi(ui: *Ui, wf: answers_mod.Wifi) []const u8 {
     const id = "dk-wifi-test";
     const dir = "/run/NetworkManager/system-connections";
     const path = dir ++ "/" ++ id ++ ".nmconnection";
-    const text = plan_mod.wifiKeyfile(ui.arena, id, "6b2f0c3e-8d1a-4a57-9c2e-1f4b7a9d0e31", wf) catch return "out of memory";
+    const text = plan_mod.wifiKeyfile(ui.arena, id, "6b2f0c3e-8d1a-4a57-9c2e-1f4b7a9d0e31", wf, &.{}, null) catch return "out of memory";
     Io.Dir.cwd().createDirPath(io, dir) catch return "can't write the test connection; not tested.";
     Io.Dir.cwd().deleteFile(io, path) catch {};
     Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } }) catch return "can't write the test connection; not tested.";
@@ -1321,8 +1321,9 @@ fn screenNetwork(ui: *Ui, p: *Probe, d: *Draft) !bool {
                 for (p.net_ifaces) |ifc| if (ifc.wireless) {
                     any_wifi = true;
                 };
-                if (net.ifaces.len == 0 and net.dns.len > 0) net.dns = &.{};
                 if (!any_wifi) {
+                    // Nothing to apply them to.
+                    if (net.ifaces.len == 0) net.dns = &.{};
                     d.network = net;
                     return true;
                 }
@@ -1340,6 +1341,7 @@ fn screenNetwork(ui: *Ui, p: *Probe, d: *Draft) !bool {
                 };
                 if (pick == 0) {
                     net.wifi = null;
+                    if (net.ifaces.len == 0) net.dns = &.{};
                     d.network = net;
                     return true;
                 }
