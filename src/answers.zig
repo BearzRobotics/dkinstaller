@@ -276,7 +276,7 @@ pub fn validHash(h: []const u8) bool {
 
 /// Zone names are relative paths under /usr/share/zoneinfo.
 pub fn validTimezone(tz: []const u8) bool {
-    if (tz.len == 0 or tz[0] == '/' or tz[0] == '.') return false;
+    if (tz.len == 0 or tz[0] == '/' or tz[0] == '.' or tz[tz.len - 1] == '/') return false;
     if (std.mem.indexOf(u8, tz, "..") != null) return false;
     for (tz) |c| if (!std.ascii.isAlphanumeric(c) and c != '/' and c != '_' and c != '-' and c != '+') return false;
     return true;

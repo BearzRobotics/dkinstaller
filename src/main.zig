@@ -207,6 +207,14 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
+    // The answers' time zone must be in the image (a recorded probe has no image to look in).
+    if (probe_path == null and executing) if (file_answers) |fa| {
+        if (!dk.probe.zoneUsable(arena, io, dk.probe.imageRoot(io), fa.timezone)) {
+            try err.print("refused: there is no time zone {s} in the system image\n", .{fa.timezone});
+            return 1;
+        }
+    };
+
     // Autoinstall gates: all must hold, else the normal screens.
     if (auto_mode and file_answers != null) gate: {
         var link: ?[]const u8 = null;

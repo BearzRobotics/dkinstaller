@@ -897,6 +897,21 @@ fn readSmall(arena: Allocator, io: Io, path: []const u8) ?[]u8 {
 /// Where the initrd mounts the system image, unchanged by the live session (docs/ISO-REQUIREMENTS.md).
 const image_mount = "/run/live/rootfs";
 
+/// The tree the new system is copied from, as far as it can be seen.
+pub fn imageRoot(io: Io) []const u8 {
+    return if (exists(io, image_mount ++ "/etc/passwd")) image_mount else "";
+}
+
+/// Whether the system at `root` has the time zone: true also when it has no zoneinfo at all
+/// (nothing to check against). A directory such as `Europe` is not a zone.
+pub fn zoneUsable(arena: Allocator, io: Io, root: []const u8, zone: []const u8) bool {
+    const info = std.fmt.allocPrint(arena, "{s}/usr/share/zoneinfo", .{root}) catch return false;
+    if (!isDir(io, info)) return true;
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ info, zone }) catch return false;
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .file;
+}
+
 fn readIn(arena: Allocator, io: Io, root: []const u8, path: []const u8) ?[]u8 {
     return readSmall(arena, io, std.fmt.allocPrint(arena, "{s}{s}", .{ root, path }) catch return null);
 }
@@ -952,7 +967,7 @@ pub fn live(arena: Allocator, io: Io) !Probe {
 
     // What the new system will be is what the image holds, not what the live session made of
     // it. Without the image mount, the running system is the closest thing.
-    const image: []const u8 = if (exists(io, image_mount ++ "/etc/passwd")) image_mount else "";
+    const image = imageRoot(io);
     const services = try readServices(arena, io, image);
     const sfs = "/run/live/medium/live/rootfs.sfs";
     const is_live = exists(io, sfs);
@@ -1318,4 +1333,20 @@ test "a missing dependency is found through the services in between, cycles incl
     markMissingDependencies(&svcs, &.{ "depends-on: b\n", "waits-for: c\ndepends-on: a\n", "depends-ms = gone\n", "depends-on: d\n" });
     for (svcs[0..3]) |s| try std.testing.expectEqualStrings("gone", s.missing_dep.?);
     try std.testing.expect(svcs[3].missing_dep == null);
+}
+
+test "a zone must be a file in the image's zoneinfo, when it has one" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try std.testing.expect(zoneUsable(arena, io, root, "Europe/Nowhere"));
+    try tmp.dir.createDirPath(io, "usr/share/zoneinfo/Europe");
+    try tmp.dir.writeFile(io, .{ .sub_path = "usr/share/zoneinfo/Europe/Berlin", .data = "x" });
+    try std.testing.expect(zoneUsable(arena, io, root, "Europe/Berlin"));
+    try std.testing.expect(!zoneUsable(arena, io, root, "Europe/Nowhere"));
+    try std.testing.expect(!zoneUsable(arena, io, root, "Europe"));
 }

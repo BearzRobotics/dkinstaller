@@ -1110,14 +1110,11 @@ fn screenKeepRepo(ui: *Ui, d: *Draft) !bool {
     return true;
 }
 
-/// True when zoneinfo is there and has no such zone (a bare image with no
-/// zoneinfo accepts any valid name).
+/// True when the image has zoneinfo and no such zone in it (one without zoneinfo accepts any
+/// valid name).
 fn zoneMissing(ui: *Ui, zone: []const u8) bool {
     const io = ui.io orelse return false;
-    Io.Dir.accessAbsolute(io, "/usr/share/zoneinfo", .{}) catch return false;
-    const path = ui.fmt("/usr/share/zoneinfo/{s}", .{zone});
-    Io.Dir.accessAbsolute(io, path, .{}) catch return true;
-    return false;
+    return !probe_mod.zoneUsable(ui.arena, io, probe_mod.imageRoot(io), zone);
 }
 
 // ---- services, ssh, other
