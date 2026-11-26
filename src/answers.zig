@@ -268,7 +268,9 @@ pub fn validUsername(name: []const u8) bool {
 /// A crypt(3) hash such as `$6$salt$hash`. Rejects anything that is
 /// obviously a plain-text password.
 pub fn validHash(h: []const u8) bool {
-    if (h.len < 8 or h[0] != '$') return false;
+    if (h.len < 8 or h[0] != '$' or h[h.len - 1] == '$') return false;
+    // The characters of crypt(3) strings. A colon or newline would corrupt chpasswd's input.
+    for (h) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "./$=,+-_", c) == null) return false;
     const second = std.mem.indexOfScalarPos(u8, h, 1, '$') orelse return false;
     if (second == 1) return false;
     return std.mem.indexOfScalarPos(u8, h, second + 1, '$') != null;
@@ -565,6 +567,10 @@ test "validators" {
     try std.testing.expect(!validUsername("1abc"));
     try std.testing.expect(validHash("$6$salt$abcdef"));
     try std.testing.expect(!validHash("hunter2"));
+    try std.testing.expect(validHash("$y$j9T$F5Jx5fExrKuHp53xLKQ..1$tnSYvahCwPBHKZUspmcxMfb0.WiB9W.zEaKlOBL35rC"));
+    try std.testing.expect(validHash("$6$rounds=5000$salt$abc/def."));
+    try std.testing.expect(validHash("$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA+/"));
+    for ([_][]const u8{ "$6$salt$ab\nroot2:x", "$6$salt$ab:cd", "$6$salt$ab cd", "$6$salt$" }) |bad| try std.testing.expect(!validHash(bad));
     try std.testing.expect(validTimezone("Europe/Berlin"));
     try std.testing.expect(!validTimezone("../etc/passwd"));
 }
