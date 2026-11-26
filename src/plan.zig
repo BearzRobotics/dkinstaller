@@ -975,7 +975,11 @@ fn planNetwork(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!voi
 /// Extra packages from the repository medium: `apk --root` with only that
 /// repository, offline. Failure is a warning (the base system is complete).
 fn planRepoPackages(b: *Builder, p: Probe, a: Answers) BuildError!void {
-    if (a.packages.len == 0) return;
+    if (a.packages.len == 0) {
+        // Nothing to install, but a medium the screens mounted is still to be let go.
+        if (p.repo) |r| if (r.mounted_dev != null) try unmountRepo(b, r.root);
+        return;
+    }
     const repo = p.repo orelse return b.refuse("packages were chosen but no repository medium was found (--repo PATH, or mount one at /mnt/cdrom)", .{});
     for (a.packages) |name| {
         if (!answers_mod.validPackageName(name)) return b.refuse("invalid package name: {s}", .{name});
@@ -1015,10 +1019,14 @@ fn planRepoPackages(b: *Builder, p: Probe, a: Answers) BuildError!void {
         , .{ rel, if (std.mem.eql(u8, repo.index, "Packages.adb")) "/Packages.adb" else "" });
         try b.cmdStdin("Keep the repository (commented out) in the new system", &.{ "tee", "-a", target ++ "/etc/apk/repositories" }, line, false);
     }
+    if (repo.mounted_dev) |_| try unmountRepo(b, repo.root);
+}
+
+fn unmountRepo(b: *Builder, root: []const u8) !void {
     // Soft: a busy medium must not stop the install short of its boot loader.
-    if (repo.mounted_dev) |_| try b.steps.append(arena, .{
+    try b.steps.append(b.arena, .{
         .desc = "Unmount the repository medium",
-        .action = .{ .command = .{ .argv = try arena.dupe([]const u8, &.{ "umount", repo.root }) } },
+        .action = .{ .command = .{ .argv = try b.arena.dupe([]const u8, &.{ "umount", root }) } },
         .soft = true,
     });
 }
@@ -2058,4 +2066,15 @@ test "keyfile values keep leading spaces, and a byte-list lookalike SSID stays i
     try std.testing.expect(contains(t, "id=\\sx\n") and contains(t, "ssid=\\sx\n") and contains(t, "psk=\\s\\spassword1\n"));
     try std.testing.expectEqualStrings("49;59;50;59;", try keyfileSsid(arena, "1;2;"));
     try std.testing.expectEqualStrings("a;b", try keyfileSsid(arena, "a;b"));
+}
+
+test "a repository the screens mounted is unmounted even when no packages were chosen" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-nvme-blank.json");
+    p.repo = (try probe_mod.findRepo(arena, std.testing.io, "tests/repos/no-sets", "x86_64")).?;
+    p.repo.?.mounted_dev = "/dev/sr1";
+    const out = try dryRun(arena, (try build(arena, p, svcAnswers(), test_ids)).plan);
+    try std.testing.expect(contains(out, "umount tests/repos/no-sets\n"));
 }

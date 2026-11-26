@@ -625,7 +625,7 @@ pub fn findRepo(arena: Allocator, io: Io, explicit: ?[]const u8, arch: []const u
 
 /// Where public key files are looked for (mounted media, one level of
 /// sub-directories too: /media/<label>/).
-pub const key_roots = [_][]const u8{ "/mnt/cdrom", "/mnt/repo", "/mnt/usb", "/media", "/run/media" };
+pub const key_roots = [_][]const u8{ "/mnt/cdrom", "/mnt/dkinstall-keys", "/mnt/repo", "/mnt/usb", "/media", "/run/media" };
 
 /// `*.pub` files directly in `roots` and one directory below them.
 pub fn findPubFiles(arena: Allocator, io: Io, roots: []const []const u8) Allocator.Error![]const []const u8 {

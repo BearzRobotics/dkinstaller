@@ -1004,7 +1004,11 @@ fn screenRepoPick(ui: *Ui, p: *Probe, env: Env, d: *Draft) !bool {
             });
         }
         const pick = try menu(ui, "Package repository", "Extra packages can be installed from a repository disc or USB stick (apks/<arch>/ with a signed index). Choose the device that holds it; it is mounted read-only at " ++ probe_mod.repo_mount_point ++ ". The target disk is never offered.", items.items, 0) orelse return false;
-        if (pick == 0) return true;
+        if (pick == 0) {
+            dropRepo(ui, p, d);
+            return true;
+        }
+        dropRepo(ui, p, d);
         const c = cands[pick - 1];
         if (mountRepo(ui, p, c.path)) |why| {
             _ = try message(ui, "Package repository", &.{ui.fmt("{s}: {s}", .{ c.path, why })}, warn, "Enter: back");
@@ -1014,10 +1018,25 @@ fn screenRepoPick(ui: *Ui, p: *Probe, env: Env, d: *Draft) !bool {
     }
 }
 
+/// Lets go of a repository these screens mounted, and of what was chosen from it. One the
+/// installer was started with stays.
+fn dropRepo(ui: *Ui, p: *Probe, d: *Draft) void {
+    const repo = p.repo orelse return;
+    if (repo.mounted_dev == null) return;
+    if (ui.io) |io| _ = std.process.run(ui.arena, io, .{ .argv = &.{ "umount", repo.root } }) catch {};
+    p.repo = null;
+    d.packages = &.{};
+    d.keep_repo = false;
+    d.trust_medium_key = false;
+}
+
+/// Where a disc or stick with a key file is mounted; not the repository's mount point, which
+/// it would hide.
+const key_mount_point = "/mnt/dkinstall-keys";
+
 /// Mounts `dev` read-only and looks for a repository on it. Returns why not,
 /// or null with `p.repo` set.
-fn mountDevice(ui: *Ui, dev: []const u8) ?[]const u8 {
-    const mp = probe_mod.repo_mount_point;
+fn mountDevice(ui: *Ui, dev: []const u8, mp: []const u8) ?[]const u8 {
     const io = ui.io orelse return "can't mount here";
     Io.Dir.cwd().createDirPath(io, mp) catch {};
     const r = std.process.run(ui.arena, io, .{ .argv = &.{ "mount", "-o", "ro", dev, mp } }) catch return "mount could not run";
@@ -1027,7 +1046,7 @@ fn mountDevice(ui: *Ui, dev: []const u8) ?[]const u8 {
 
 fn mountRepo(ui: *Ui, p: *Probe, dev: []const u8) ?[]const u8 {
     const mp = probe_mod.repo_mount_point;
-    if (mountDevice(ui, dev)) |why| return why;
+    if (mountDevice(ui, dev, mp)) |why| return why;
     const io = ui.io.?;
     const repo = probe_mod.repoAt(ui.arena, io, mp, probe_mod.repoArch()) catch null;
     if (repo) |rp| {
@@ -1052,7 +1071,7 @@ fn screenPackages(ui: *Ui, repo: probe_mod.Repo, d: *Draft) !bool {
     const title = ui.fmt("Additional packages from {s}", .{repo.root});
     if (repo.sets.len == 0) {
         while (true) {
-            const typed = try input(ui, title, "This repository has no package sets. Type the names of the packages to install, separated by spaces, or leave empty for none.", "", .{ .validate = packageError }) orelse return false;
+            const typed = try input(ui, title, "This repository has no package sets. Type the names of the packages to install, separated by spaces, or leave empty for none.", try std.mem.join(ui.arena, " ", d.packages), .{ .validate = packageError }) orelse return false;
             var list: std.ArrayList([]const u8) = .empty;
             var it = std.mem.tokenizeAny(u8, typed, " \t,");
             while (it.next()) |t| try list.append(ui.arena, t);
@@ -1063,7 +1082,16 @@ fn screenPackages(ui: *Ui, repo: probe_mod.Repo, d: *Draft) !bool {
         }
     }
     const ticked = try ui.arena.alloc(bool, repo.sets.len);
-    @memset(ticked, false);
+    // A set stays ticked when this screen is come back to.
+    for (repo.sets, ticked) |set, *t| {
+        t.* = set.packages.len > 0;
+        for (set.packages) |want| {
+            const chosen = for (d.packages) |have| {
+                if (std.mem.eql(u8, have, want)) break true;
+            } else false;
+            if (!chosen) t.* = false;
+        }
+    }
     var cur: usize = 0;
     while (true) {
         var items: std.ArrayList(Item) = .empty;
@@ -1435,7 +1463,7 @@ fn pickKeyFile(ui: *Ui, p: *Probe, d: *Draft) !?[]const u8 {
         var items: std.ArrayList(Item) = .empty;
         for (found) |f| try items.append(ui.arena, .{ .label = f });
         try items.append(ui.arena, .{ .label = "Type a path...", .detail = "a key file on a medium that is already mounted" });
-        try items.append(ui.arena, .{ .label = "Mount a disc or USB stick...", .detail = "read-only at " ++ probe_mod.repo_mount_point });
+        try items.append(ui.arena, .{ .label = "Mount a disc or USB stick...", .detail = "read-only at " ++ key_mount_point });
         const pick = try menu(ui, "Key file", "Public key files found on mounted media (/mnt/cdrom, /media, ...).", items.items, 0) orelse return null;
         var path: []const u8 = undefined;
         if (pick < found.len) {
@@ -1447,7 +1475,9 @@ fn pickKeyFile(ui: *Ui, p: *Probe, d: *Draft) !?[]const u8 {
             var ci: std.ArrayList(Item) = .empty;
             for (cands) |c| try ci.append(ui.arena, .{ .label = c.path, .detail = ui.fmt("{s}  {s}  {s}", .{ c.fstype, c.label orelse "", fmtSize(ui.arena, c.size) }) });
             const cp = try menu(ui, "Mount", "Choose the device to mount read-only. The target disk is not offered.", ci.items, 0) orelse continue;
-            if (mountDevice(ui, cands[cp].path)) |why| _ = try message(ui, "Mount", &.{why}, warn, "Enter: back");
+            // One key medium at a time.
+            _ = std.process.run(ui.arena, io, .{ .argv = &.{ "umount", key_mount_point } }) catch {};
+            if (mountDevice(ui, cands[cp].path, key_mount_point)) |why| _ = try message(ui, "Mount", &.{why}, warn, "Enter: back");
             continue;
         }
         const text = Io.Dir.cwd().readFileAlloc(io, path, ui.arena, .limited(64 * 1024)) catch {
@@ -2264,4 +2294,18 @@ test "Ctrl-C at a failed soft step stops the install" {
     screen_ui.script = &.{ .ctrl_c, .enter };
     screen_ui.script_i = 0;
     try std.testing.expect(!Progress.onSoftFail(&progress, failure));
+}
+
+test "choosing no extra packages forgets a repository the screens mounted" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-nvme-blank.json");
+    p.repo = .{ .root = "/mnt/cdrom", .dir = "/mnt/cdrom/apks/x86_64", .rel_dir = "apks/x86_64", .index = "Packages.adb", .mounted_dev = "/dev/sr1" };
+    var ui = try testUi(gpa, arena, &[_]Key{.enter});
+    defer ui.screen.deinit(gpa);
+    var d: Draft = .{ .packages = &.{"curl"}, .keep_repo = true };
+    try std.testing.expect(try screenRepoPick(&ui, &p, .{ .is_root = true, .dry_run = true, .ids = test_ids }, &d));
+    try std.testing.expect(p.repo == null and d.packages.len == 0 and !d.keep_repo);
 }
