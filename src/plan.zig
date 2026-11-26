@@ -263,6 +263,15 @@ fn isBiosBootType(t: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(s, files.guid_bios_boot);
 }
 
+/// Whether `useradd` would fail because the system already has `name`. The live user's name
+/// is free: that account is removed first.
+pub fn userTaken(p: Probe, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "root")) return true;
+    if (std.mem.eql(u8, name, p.live_user)) return false;
+    for (p.accounts) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
 /// Builds the plan for `answers` on the machine described by `p`.
 /// `ids` supplies the UUIDs for filesystems and partitions that don't exist yet.
 pub fn build(arena: Allocator, p: Probe, a: Answers, ids: files.Ids) Allocator.Error!Result {
@@ -308,6 +317,7 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     if (probe_mod.ineligible(p, disk, a.partitioning == .auto)) |why| {
         return b.refuse("{s} can't be used: {s}", .{ disk.path, why.text() });
     }
+    if (userTaken(p, a.user)) return b.refuse("the user name {s} is already taken by an account or group in the system", .{a.user});
     const kernel = p.kernel orelse return b.refuse("no vmlinuz-* kernel found in the system image", .{});
 
     // The root filesystem (SPEC.md 5.3.4): its tools are on the live disc and the
@@ -372,12 +382,13 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
 
     // 6. Users
     try b.cmdStdin("Set the root password", chpasswdArgv(a.root_pw), try b.fmt("root:{s}\n", .{pwText(a.root_pw)}), true);
+    // Before `useradd`: the chosen name may be the live user's.
+    if (p.live_user.len > 0) try b.cmd("Remove the live disc's user", &.{ "userdel", "-R", target, "-r", p.live_user });
     try b.cmd("Create the user", &.{ "useradd", "-R", target, "-m", "-G", "wheel,video,render", "-s", "/bin/bash", a.user });
     try b.cmdStdin("Set the user's password", chpasswdArgv(a.user_pw), try b.fmt("{s}:{s}\n", .{ a.user, pwText(a.user_pw) }), true);
-    if (!std.mem.eql(u8, p.live_user, a.user)) try b.cmd("Remove the live disc's user", &.{ "userdel", "-R", target, "-r", p.live_user });
     // The image logs the live user in on tty1 by itself (`agetty --autologin <user>` in /etc/dinit.d/tty1). In the new
     // system that user is gone (or is the chosen user, who now has a password): a plain login prompt instead.
-    try b.steps.append(arena, .{
+    if (p.live_user.len > 0) try b.steps.append(arena, .{
         .desc = "Turn off the live disc's automatic login on tty1",
         .action = .{ .command = .{ .argv = try arena.dupe([]const u8, &.{ "sed", "-i", try b.fmt("s| --autologin {s} | |", .{p.live_user}), target ++ "/etc/dinit.d/tty1" }) } },
         .when = .{ .exists = &.{target ++ "/etc/dinit.d/tty1"} },
@@ -1793,4 +1804,28 @@ test "the keep-file script restores the file even when the command fails" {
         defer gpa.free(now);
         try std.testing.expectEqualStrings("other system", now);
     }
+}
+
+test "a user name that is taken is refused; the live user's name works because it is removed first" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-nvme-blank.json");
+    var names: std.ArrayList([]const u8) = .empty;
+    try probe_mod.accountNames(arena, &names, "root:x:0:0::/root:/bin/sh\ndaemon:x:1:1::/:/bin/false\nrescue:x:1000:1000::/home/rescue:/bin/sh\nwheel:x:10:\n");
+    p.accounts = names.items;
+    var a = testAnswers("nvme0n1", .auto);
+    for ([_][]const u8{ "root", "daemon", "wheel" }) |name| {
+        a.user = name;
+        try std.testing.expect(contains((try build(arena, p, a, test_ids)).refused, "already taken"));
+    }
+    a.user = "rescue";
+    const out = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    const del = std.mem.indexOf(u8, out, "userdel -R /run/dkrescue-install/target -r rescue").?;
+    const add = std.mem.indexOf(u8, out, "/bin/bash rescue").?;
+    try std.testing.expect(del < add);
+    p.live_user = "";
+    a.user = "dakota";
+    const none = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    try std.testing.expect(!contains(none, "userdel") and !contains(none, "--autologin"));
 }

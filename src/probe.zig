@@ -83,6 +83,8 @@ pub const Probe = struct {
     /// The live system's own login (removed from the new system): "rescue" on
     /// the rescue image, "live" on the dkde image; read from its /etc/passwd.
     live_user: []const u8 = "rescue",
+    /// User and group names the system already has: `useradd` can't make another by that name.
+    accounts: []const []const u8 = &.{},
     /// The dinit services of the system image (the live system is the image).
     services: []const Service = &.{},
     /// The image has /etc/selinux/config.
@@ -280,10 +282,28 @@ pub fn serviceLabel(text: []const u8) []const u8 {
     return "";
 }
 
-/// The first ordinary login (uid 1000-59999 with a /home directory) in /etc/passwd.
+/// The first ordinary login (uid 1000-59999 with a /home directory) in /etc/passwd; empty if
+/// there is none (nothing to remove then).
 pub fn liveUser(arena: Allocator, io: Io) []const u8 {
-    const text = readSmall(arena, io, "/etc/passwd") orelse return "rescue";
-    return firstOrdinaryUser(text) orelse "rescue";
+    const text = readSmall(arena, io, "/etc/passwd") orelse return "";
+    return firstOrdinaryUser(text) orelse "";
+}
+
+/// Appends the names (first field) of a passwd or group file.
+pub fn accountNames(arena: Allocator, out: *std.ArrayList([]const u8), text: []const u8) Allocator.Error!void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |l| {
+        const colon = std.mem.indexOfScalar(u8, l, ':') orelse continue;
+        if (colon > 0 and l[0] != '#') try out.append(arena, l[0..colon]);
+    }
+}
+
+fn readAccounts(arena: Allocator, io: Io) Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for ([_][]const u8{ "/etc/passwd", "/etc/group" }) |path| {
+        if (readSmall(arena, io, path)) |text| try accountNames(arena, &out, text);
+    }
+    return out.items;
 }
 
 pub fn firstOrdinaryUser(text: []const u8) ?[]const u8 {
@@ -746,6 +766,7 @@ pub fn fromFixture(arena: Allocator, text: []const u8) !Probe {
         .services = try fixtureServices(arena, o.get("services")),
         .selinux = if (o.get("selinux")) |v| flag(v) else false,
         .live_user = str(o.get("live_user")) orelse "rescue",
+        .accounts = try fixtureStrings(arena, o.get("accounts")),
         .net_ifaces = try fixtureIfaces(arena, o.get("net_ifaces")),
         .net_stack = if (str(o.get("net_stack"))) |t| (std.meta.stringToEnum(NetStack, t) orelse .none) else .none,
         .live_connections = try fixtureStrings(arena, o.get("live_connections")),
@@ -858,6 +879,7 @@ pub fn live(arena: Allocator, io: Io) !Probe {
         .kernel = kernel,
         .disks = try checkEsps(arena, io, firmware, try fillMissingIds(arena, io, try parseLsblk(arena, lsblk.stdout))),
         .live_user = liveUser(arena, io),
+        .accounts = try readAccounts(arena, io),
         .services = services,
         .selinux = exists(io, "/etc/selinux/config"),
         .net_ifaces = try readNetIfaces(arena, io),

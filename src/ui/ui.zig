@@ -546,8 +546,12 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
             },
             .user => {
                 if (try input(ui, "User", "Name of the user to create. The user is put in the wheel, video and render groups and can use sudo.", d.user, .{ .validate = userError })) |v| {
-                    d.user = v;
-                    go = .user_pw;
+                    if (plan_mod.userTaken(p, v)) {
+                        _ = try message(ui, "User", &.{ui.fmt("The system already has an account or group named {s}. Choose another name.", .{v})}, warn, "Enter: back");
+                    } else {
+                        d.user = v;
+                        go = .user_pw;
+                    }
                 }
             },
             .user_pw => {
