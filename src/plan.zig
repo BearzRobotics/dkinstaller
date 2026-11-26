@@ -967,12 +967,17 @@ fn planExisting(b: *Builder, p: Probe, disk: Disk, a: Answers, ids: files.Ids) B
     if (p.firmware == .bios and gpt) {
         var found: ?Partition = null;
         for (disk.partitions) |q| if (isBiosBootType(q.parttype) and q.size >= MiB) {
+            // A partition about to be formatted is not a BIOS boot partition, whatever its type says.
+            if (std.mem.eql(u8, q.path, root.path)) continue;
+            if (esp_part) |e| if (std.mem.eql(u8, q.path, e.path)) continue;
             found = q;
             break;
         };
         if (found == null) {
             const name = a.bios_boot orelse return b.refuse("BIOS boot on a GPT disk needs a BIOS boot partition (1 MiB or more); none found", .{});
             const q = disk.findPartition(name) orelse return b.refuse("BIOS boot partition {s} is not on {s}", .{ name, disk.path });
+            if (std.mem.eql(u8, q.path, root.path)) return b.refuse("root and the BIOS boot partition are the same partition", .{});
+            if (esp_part) |e| if (std.mem.eql(u8, q.path, e.path)) return b.refuse("the ESP and the BIOS boot partition are the same partition", .{});
             if (q.size < MiB) return b.refuse("BIOS boot partition {s} is smaller than 1 MiB", .{q.path});
             if (!a.set_bios_boot_type) return b.refuse("{s} is not typed as BIOS boot (type {s}); set_bios_boot_type = true fixes that", .{ q.path, q.parttype orelse "none" });
             try type_fixes.append(arena, .{
@@ -1647,4 +1652,42 @@ test "post-install commands run in the chroot as soft steps, after configuration
     try std.testing.expect(contains(out, ". Post-install command: ln -s a b"));
     try std.testing.expect(std.mem.indexOf(u8, out, "echo hi").? < std.mem.indexOf(u8, out, "dklilo").?);
     try std.testing.expect(contains(out, "failure here is a warning"));
+}
+
+fn biosGptFixture(arena: Allocator) !Probe {
+    var p = try loadFixture(arena, "bios-mbr-fdisk.json");
+    const parts = try arena.alloc(Partition, 2);
+    parts[0] = p.disks[0].partitions[0];
+    parts[1] = .{ .name = "vda2", .path = "/dev/vda2", .number = 2, .size = 2 * MiB };
+    const disks = try arena.dupe(Disk, p.disks);
+    disks[0].table = "gpt";
+    disks[0].partitions = parts;
+    p.disks = disks;
+    return p;
+}
+
+test "the BIOS boot partition is never root, given by either name" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try biosGptFixture(arena);
+    var a = testAnswers("vda", .existing);
+    a.root = "vda1";
+    a.set_bios_boot_type = true;
+    for ([_][]const u8{ "vda1", "/dev/vda1" }) |name| {
+        a.bios_boot = name;
+        const r = try build(arena, p, a, test_ids);
+        try std.testing.expect(contains(r.refused, "same partition"));
+    }
+    a.bios_boot = "vda2";
+    const ok = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    try std.testing.expect(contains(ok, "sfdisk --part-type /dev/vda 2 " ++ files.guid_bios_boot));
+    // Root already typed as BIOS boot does not count as the BIOS boot partition.
+    const parts = try arena.dupe(Partition, p.disks[0].partitions);
+    parts[0].parttype = files.guid_bios_boot;
+    const disks = try arena.dupe(Disk, p.disks);
+    disks[0].partitions = parts;
+    p.disks = disks;
+    a.bios_boot = null;
+    try std.testing.expect(contains((try build(arena, p, a, test_ids)).refused, "none found"));
 }
