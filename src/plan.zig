@@ -395,6 +395,8 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
         .soft = true,
     });
 
+    try planGreetd(b);
+
     // 7. sudo
     const sudo_new = target ++ "/etc/sudoers.d/00-wheel.new";
     try b.file("Write the sudo policy", sudo_new, files.sudoers_wheel, 0o440);
@@ -428,6 +430,36 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     try b.cmd("Flush to disk", &.{"sync"});
     if (layout.esp_dev != null) try b.cmd("Unmount the EFI System Partition", &.{ "umount", esp_mnt });
     try b.cmd("Unmount the root filesystem", &.{ "umount", target });
+}
+
+/// `sh -c` script for a desktop live image's greetd config `$1`: removes `[initial_session]` (a
+/// login without a password). An image that had one is a live desktop, whose issue text `$2`
+/// tells how to use the live system, so a plain one replaces it.
+pub const greetd_cleanup =
+    \\if grep -q '^[[:space:]]*\[initial_session\]' "$1"; then
+    \\  printf '%s\n\n' 'Welcome (\l)' > "$2" || exit 1
+    \\  sed -i '/^[[:space:]]*\[initial_session\]/,/^[[:space:]]*\[/{/^[[:space:]]*\[initial_session\]/d;/^[[:space:]]*\[/!d;}' "$1" || exit 1
+    \\fi
+;
+
+/// `sed` expression that takes the `nullok` option (empty passwords allowed) out of a PAM file.
+pub const pam_no_nullok = "/^[[:space:]]*#/!s/[[:space:]]nullok\\(_secure\\)\\{0,1\\}\\([[:space:]]\\|$\\)/\\2/g";
+
+/// The live desktop's login settings must not reach the installed system. Not soft: leaving
+/// them lets someone in without a password.
+fn planGreetd(b: *Builder) !void {
+    const cfg = target ++ "/etc/greetd/config.toml";
+    const pam = target ++ "/etc/pam.d/greetd";
+    try b.steps.append(b.arena, .{
+        .desc = "Turn off the live disc's automatic graphical login",
+        .action = .{ .command = .{ .argv = try b.arena.dupe([]const u8, &.{ "sh", "-c", greetd_cleanup, "sh", cfg, target ++ "/etc/issue" }) } },
+        .when = .{ .exists = &.{cfg} },
+    });
+    try b.steps.append(b.arena, .{
+        .desc = "Stop the graphical login accepting empty passwords",
+        .action = .{ .command = .{ .argv = try b.arena.dupe([]const u8, &.{ "sed", "-i", pam_no_nullok, pam }) } },
+        .when = .{ .exists = &.{pam} },
+    });
 }
 
 /// Where the kernel files wait while the ESP is mounted over /boot (systemd-boot).
@@ -1828,4 +1860,51 @@ test "a user name that is taken is refused; the live user's name works because i
     a.user = "dakota";
     const none = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
     try std.testing.expect(!contains(none, "userdel") and !contains(none, "--autologin"));
+}
+
+test "greetd cleanup: initial_session, nullok and the live issue text go; the rest stays" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cfg = try std.fmt.allocPrint(arena, "{s}/config.toml", .{dir});
+    const issue = try std.fmt.allocPrint(arena, "{s}/issue", .{dir});
+    const pam = try std.fmt.allocPrint(arena, "{s}/greetd", .{dir});
+    const run = struct {
+        fn f(al: Allocator, argv: []const []const u8) !void {
+            const r = try std.process.run(al, std.testing.io, .{ .argv = argv });
+            try std.testing.expect(r.term.success());
+        }
+    }.f;
+    const read = struct {
+        fn f(al: Allocator, path: []const u8) ![]u8 {
+            return Io.Dir.cwd().readFileAlloc(std.testing.io, path, al, .limited(4096));
+        }
+    }.f;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = "[terminal]\nvt = 1\n\n[initial_session]\ncommand = \"dkde\"\nuser = \"live\"\n\n[default_session]\ncommand = \"greet\"\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "issue", .data = "Log in as live with no password\n" });
+    try run(arena, &.{ "sh", "-c", greetd_cleanup, "sh", cfg, issue });
+    try std.testing.expectEqualStrings("[terminal]\nvt = 1\n\n[default_session]\ncommand = \"greet\"\n", try read(arena, cfg));
+    try std.testing.expectEqualStrings("Welcome (\\l)\n\n", try read(arena, issue));
+    // The section last in the file; and without one, nothing changes.
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = "[terminal]\nvt = 1\n[initial_session]\nuser = \"live\"\n" });
+    try run(arena, &.{ "sh", "-c", greetd_cleanup, "sh", cfg, issue });
+    try std.testing.expectEqualStrings("[terminal]\nvt = 1\n", try read(arena, cfg));
+    try tmp.dir.writeFile(io, .{ .sub_path = "issue", .data = "mine\n" });
+    try run(arena, &.{ "sh", "-c", greetd_cleanup, "sh", cfg, issue });
+    try std.testing.expectEqualStrings("mine\n", try read(arena, issue));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "greetd", .data = "# nullok stays in a comment nullok\nauth required pam_unix.so nullok try_first_pass\nauth required pam_unix.so nullok_secure\npassword required pam_unix.so sha512 nullok\n" });
+    try run(arena, &.{ "sed", "-i", pam_no_nullok, pam });
+    try std.testing.expectEqualStrings("# nullok stays in a comment nullok\nauth required pam_unix.so try_first_pass\nauth required pam_unix.so\npassword required pam_unix.so sha512\n", try read(arena, pam));
+
+    const p = try loadFixture(arena, "uefi-nvme-blank.json");
+    const out = try dryRun(arena, (try build(arena, p, testAnswers("nvme0n1", .auto), test_ids)).plan);
+    try std.testing.expect(contains(out, "target/etc/greetd/config.toml"));
+    for ((try build(arena, p, testAnswers("nvme0n1", .auto), test_ids)).plan.steps) |s| {
+        if (std.mem.indexOf(u8, s.desc, "graphical") != null) try std.testing.expect(!s.soft);
+    }
 }

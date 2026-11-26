@@ -323,6 +323,10 @@ area below a progress list. The steps, in order:
    `userdel -R <target> -r <live user>` removes the live disc's user (read
    from the live `/etc/passwd`: the first login with uid 1000-59999 and a
    `/home/` directory; `rescue` on the rescue image, `live` on dkde).
+6a. **Live desktop login** (when the files exist; a failure stops the
+   install): `[initial_session]` is removed from `/etc/greetd/config.toml`,
+   and an image that had one also gets a plain `/etc/issue`; `nullok` is
+   taken out of `/etc/pam.d/greetd`.
 7. **sudo:** `/etc/sudoers.d/00-wheel` is replaced with
    `%wheel ALL=(ALL:ALL) ALL`. The live disc's password-free policy says in
    its own comment that it must not reach an installed system; this is
