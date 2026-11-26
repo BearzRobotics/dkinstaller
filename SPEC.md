@@ -350,8 +350,8 @@ area below a progress list. The steps, in order:
      read-only efivars that combination is refused.
    - **BIOS:** `dklilo install-bios --yes <disk>`.
    - `dklilo check <target>/boot/dklilo.conf` must pass.
-9. **Finish:** the log is copied to the target's `/var/log/dkrescue-install.log`
-   (6.4), SELinux mode and labelling (5.8), then `sync`, unmount the ESP and root, and show "Installation
+9. **Finish:** SELinux mode and labelling (5.8), then the log is copied to the
+   target's `/var/log/dkrescue-install.log` (6.4, mode 0600), `sync`, unmount the ESP and root, and show "Installation
    complete" with the choice to reboot or return to the live system.
 
 ### 5.7 When a step fails

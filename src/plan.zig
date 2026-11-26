@@ -433,8 +433,10 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     }
 
     // 9. Finish
-    try b.cmd("Copy the install log to the new system", &.{ "cp", log_path, target_log });
     try planSelinux(b, a, layout.esp_dev != null, esp_at);
+    // After everything that can warn, so the copy holds it. (The copy itself is not labelled
+    // by the `setfiles` run above.)
+    try b.cmd("Copy the install log to the new system", &.{ "cp", log_path, target_log });
     try b.cmd("Flush to disk", &.{"sync"});
     if (layout.esp_dev != null) try b.cmd("Unmount the EFI System Partition", &.{ "umount", esp_mnt });
     try b.cmd("Unmount the root filesystem", &.{ "umount", target });
@@ -1536,6 +1538,8 @@ test "SELinux: label step is conditional and never fatal; mode is written" {
     try std.testing.expect(contains(out, "failure here is a warning"));
     try std.testing.expect(contains(out, "touch /run/dkrescue-install/target/.autorelabel"));
     try std.testing.expect(contains(out, "s/^SELINUX=.*/SELINUX=enforcing/"));
+    // The log copy comes after the labelling steps, so it holds their warnings.
+    try std.testing.expect(std.mem.indexOf(u8, out, "cp /run/dkrescue-install/install.log").? > std.mem.indexOf(u8, out, "touch /run/dkrescue-install/target/.autorelabel").?);
     // The setfiles step is soft; the kernel command line is untouched.
     try std.testing.expect(!contains(out, "selinux=1"));
     // Disabled: the mode is written and nothing is labelled.
