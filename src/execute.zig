@@ -531,23 +531,42 @@ pub fn isMountPoint(arena: Allocator, io: Io, path: []const u8) bool {
 pub fn shellInInstalled(gpa: Allocator, io: Io, plan: plan_mod.Plan, argv: []const []const u8) ?[]const u8 {
     const t = plan_mod.target;
     Io.Dir.cwd().createDirPath(io, t) catch {};
-    if (!runQuiet(io, &.{ "mount", plan.root_dev, t })) return "can't mount the new system";
-    var esp_mounted = false;
+    if (!mountQuiet(io, plan.root_dev, t, plan.root_options)) return "can't mount the new system";
+    // The other partitions, parents first, so that files written in the shell land on them.
+    var mounted: usize = 0;
+    var path_buf: [512]u8 = undefined;
+    defer {
+        while (mounted > 0) {
+            mounted -= 1;
+            const at = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ t, plan.mounts[mounted].at }) catch continue;
+            _ = runQuiet(io, &.{ "umount", at });
+        }
+        _ = runQuiet(io, &.{ "umount", t });
+    }
+    for (plan.mounts) |m| {
+        const at = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ t, m.at }) catch return "a mount point is too long";
+        if (!mountQuiet(io, m.dev, at, m.options)) return "can't mount one of the new system's partitions";
+        mounted += 1;
+    }
     var esp_buf: [256]u8 = undefined;
     const esp_mnt = std.fmt.bufPrint(&esp_buf, "{s}{s}", .{ t, plan.esp_at }) catch return "the ESP mount point is too long";
     if (plan.esp_dev) |esp| {
-        esp_mounted = runQuiet(io, &.{ "mount", esp, esp_mnt });
         // A shell without it would put boot files where the firmware never looks.
-        if (!esp_mounted) {
-            _ = runQuiet(io, &.{ "umount", t });
-            return "can't mount the new system's EFI System Partition";
-        }
+        if (!runQuiet(io, &.{ "mount", esp, esp_mnt })) return "can't mount the new system's EFI System Partition";
     }
     const r = chrootRun(gpa, io, argv);
     _ = runQuiet(io, &.{"sync"});
-    if (esp_mounted) _ = runQuiet(io, &.{ "umount", esp_mnt });
-    _ = runQuiet(io, &.{ "umount", t });
+    // Before the deferred unmounts: the ESP may be inside one of them.
+    if (plan.esp_dev != null) _ = runQuiet(io, &.{ "umount", esp_mnt });
     return r;
+}
+
+/// `mount` as the install did it: with the asked-for options, if any.
+fn mountQuiet(io: Io, dev: []const u8, at: []const u8, options: ?[]const u8) bool {
+    const o = options orelse return runQuiet(io, &.{ "mount", dev, at });
+    var buf: [256]u8 = undefined;
+    const all = std.fmt.bufPrint(&buf, "{s}" ++ plan_mod.install_mount_flags, .{o}) catch return false;
+    return runQuiet(io, &.{ "mount", "-o", all, dev, at });
 }
 
 fn runQuiet(io: Io, argv: []const []const u8) bool {
@@ -585,22 +604,29 @@ pub fn isPercent(line: []const u8) bool {
 /// passwords). For `Runner.header`.
 pub fn describeRun(arena: Allocator, p: probe_mod.Probe, a: answers_mod.Answers) Allocator.Error![]const u8 {
     const disk = p.findDisk(a.disk);
-    return std.fmt.allocPrint(arena,
-        \\firmware: {s}   efivars writable: {}
+    const head = try std.fmt.allocPrint(arena,
+        \\firmware: {s}   efivars writable: {}   install for: {s}
         \\disk: /dev/{s}  {d} bytes  {s}
         \\partitioning: {s}   root: {s}   esp: {s}   format esp: {}
         \\hostname: {s}   user: {s}   timezone: {s}   keymap: {s}
         \\passwords: not logged
         \\
     , .{
-        if (p.firmware == .uefi) "UEFI" else "BIOS", p.efivars_rw,
-        a.disk,                                      if (disk) |d| d.size else 0,
-        if (disk) |d| d.model orelse "" else "",     @tagName(a.partitioning),
-        a.root orelse "-",                           a.esp orelse "-",
-        a.format_esp,                                a.hostname,
-        a.user,                                      a.timezone,
-        a.keymap orelse "-",
+        if (p.firmware == .uefi) "UEFI" else "BIOS",                        p.efivars_rw,
+        if (a.firmware == .bios or p.firmware == .bios) "BIOS" else "UEFI", a.disk,
+        if (disk) |d| d.size else 0,                                        if (disk) |d| d.model orelse "" else "",
+        @tagName(a.partitioning),                                           a.root orelse "-",
+        a.esp orelse "-",                                                   a.format_esp,
+        a.hostname,                                                         a.user,
+        a.timezone,                                                         a.keymap orelse "-",
     });
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, head);
+    if (a.root_options) |o| try out.appendSlice(arena, try std.fmt.allocPrint(arena, "root options: {s}\n", .{o}));
+    for (a.mounts) |m| try out.appendSlice(arena, try std.fmt.allocPrint(arena, "mount: {s} at {s}   format: {s}   options: {s}\n", .{
+        m.device, m.at, if (m.format) @tagName(m.fs) else "no", m.options orelse "(usual)",
+    }));
+    return out.items;
 }
 
 // ---------------------------------------------------------------- tests

@@ -4,8 +4,10 @@
 //! File format: TOML, one table per section. The complete, commented example is
 //! tests/auto/example.toml (also in docs/AUTOINSTALL.md). Sections:
 //!
-//!     [install]     disk, partitioning ("auto" or "existing"), root_fs, bootloader, confirm_erase, when_done
-//!     [partitions]  root, esp, bios_boot, format_esp, set_esp_type, set_bios_boot_type
+//!     [install]     disk, partitioning ("auto" or "existing"), firmware, root_fs, bootloader,
+//!                   confirm_erase, when_done
+//!     [partitions]  root, esp, bios_boot, format_esp, set_esp_type, set_bios_boot_type, root_options,
+//!                   and one [[partitions.mount]] (device, at, format, fs, options) per extra mount
 //!     [system]      hostname, domain, root_hash, user, user_hash, timezone, keymap,
 //!                   ntp, firewall, selinux
 //!     [services]    enable = ["name"], disable = ["name"]
@@ -22,12 +24,19 @@
 
 const std = @import("std");
 const fs_mod = @import("fs.zig");
+const mounts_mod = @import("mounts.zig");
 const bl_mod = @import("bootloader.zig");
 const toml = @import("toml");
 const Allocator = std.mem.Allocator;
 
+pub const Mount = mounts_mod.Mount;
+
 /// How the disk is partitioned (manual `cfdisk` ends up as `existing`).
 pub const Partitioning = enum { auto, existing };
+
+/// Which kind of boot the new system is installed for: the one the live system
+/// booted with, or BIOS whatever that was (a machine that can boot both ways).
+pub const FirmwareChoice = enum { auto, bios };
 
 /// A password as given: an answers file holds only hashes; the screens
 /// hold what was typed and pass it to `chpasswd` on standard input.
@@ -189,6 +198,7 @@ pub const Answers = struct {
     /// Kernel name of the target disk, e.g. "nvme0n1".
     disk: []const u8,
     partitioning: Partitioning,
+    firmware: FirmwareChoice = .auto,
     /// The root filesystem (SPEC.md 5.3.4): ext4 by default.
     root_fs: fs_mod.Fs = .ext4,
     /// The boot loader (SPEC.md 5.6.8): dklilo by default.
@@ -197,6 +207,10 @@ pub const Answers = struct {
     root: ?[]const u8 = null,
     esp: ?[]const u8 = null,
     bios_boot: ?[]const u8 = null,
+    /// Existing path only: the root's fstab options (null: the filesystem's usual ones), and
+    /// further partitions, on any disk, that the new system mounts.
+    root_options: ?[]const u8 = null,
+    mounts: []const mounts_mod.Mount = &.{},
     /// Format the (existing) ESP. Root is always formatted.
     format_esp: bool = false,
     /// Rewrite the partition type of the chosen ESP / BIOS boot partition.
@@ -332,7 +346,7 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
     };
 
     const install = try p.section(root, "install") orelse return fail(diag, "[install] is required");
-    try p.only(install, &.{ "disk", "partitioning", "root_fs", "bootloader", "confirm_erase", "when_done" }, "install");
+    try p.only(install, &.{ "disk", "partitioning", "firmware", "root_fs", "bootloader", "confirm_erase", "when_done" }, "install");
     a.disk = try p.str(install, "install", "disk") orelse return fail(diag, "[install] disk is required");
     a.partitioning = try p.enumv(Partitioning, install, "install", "partitioning", "auto or existing") orelse
         return fail(diag, "[install] partitioning is required");
@@ -341,11 +355,15 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
         a.confirm_erase = v;
     }
     if (try p.enumv(WhenDone, install, "install", "when_done", "reboot, poweroff or shell")) |v| a.when_done = v;
+    if (try p.enumv(FirmwareChoice, install, "install", "firmware", "auto or bios")) |v| a.firmware = v;
     if (try p.enumv(fs_mod.Fs, install, "install", "root_fs", "ext4, ext3, ext2, btrfs, xfs or zfs")) |v| a.root_fs = v;
     if (try p.enumv(bl_mod.Bootloader, install, "install", "bootloader", "dklilo, grub or systemd-boot")) |v| a.bootloader = v;
 
     if (try p.section(root, "partitions")) |t| {
-        try p.only(t, &.{ "root", "esp", "bios_boot", "format_esp", "set_esp_type", "set_bios_boot_type" }, "partitions");
+        try p.only(t, &.{ "root", "esp", "bios_boot", "format_esp", "set_esp_type", "set_bios_boot_type", "root_options", "mount" }, "partitions");
+        a.root_options = try p.str(t, "partitions", "root_options");
+        if (a.root_options) |o| if (mounts_mod.optionsError(o) != null) return fail(diag, "invalid root_options (comma-separated, no spaces)");
+        a.mounts = try parseMounts(arena, &p, t);
         a.root = try p.str(t, "partitions", "root");
         a.esp = try p.str(t, "partitions", "esp");
         a.bios_boot = try p.str(t, "partitions", "bios_boot");
@@ -472,8 +490,43 @@ pub fn parse(arena: Allocator, text: []const u8, diag: *Diag) !Answers {
         a.post = try p.strings(t, "post", "commands", nonEmpty, "empty command");
     }
 
+    if (a.partitioning == .auto and (a.mounts.len > 0 or a.root_options != null)) return fail(diag, "root_options and [[partitions.mount]] are only for partitioning = \"existing\"");
     if (a.partitioning == .existing and a.root == null) return fail(diag, "[partitions] root is required for existing partitioning");
     return a;
+}
+
+/// The `[[partitions.mount]]` tables.
+fn parseMounts(arena: Allocator, p: *Parser, t: *const toml.Table) ![]const mounts_mod.Mount {
+    const diag = p.diag;
+    const v = t.get("mount") orelse return &.{};
+    const shape = "[partitions] mount must be an array of tables: [[partitions.mount]]";
+    const arr = switch (v) {
+        .array => |x| x,
+        else => return fail(diag, shape),
+    };
+    var list: std.ArrayList(mounts_mod.Mount) = .empty;
+    const what = "partitions.mount";
+    for (arr.items.items) |item| {
+        const it = switch (item) {
+            .table => |x| x,
+            else => return fail(diag, shape),
+        };
+        try p.only(it, &.{ "device", "at", "format", "fs", "options" }, what);
+        var m: mounts_mod.Mount = .{
+            .device = try p.str(it, what, "device") orelse return fail(diag, "[[partitions.mount]] needs a device"),
+            .at = try p.str(it, what, "at") orelse return fail(diag, "[[partitions.mount]] needs at = \"/DIRECTORY\""),
+        };
+        if (mounts_mod.pathError(m.at)) |why| return fail(diag, try std.fmt.allocPrint(arena, "[[partitions.mount]] at: {s}", .{why}));
+        if (try p.boolean(it, what, "format")) |b| m.format = b;
+        if (try p.enumv(fs_mod.Fs, it, what, "fs", "ext4, ext3, ext2, btrfs, xfs or zfs")) |f| {
+            if (!m.format) return fail(diag, "[[partitions.mount]] fs is only used with format = true");
+            m.fs = f;
+        }
+        m.options = try p.str(it, what, "options");
+        if (m.options) |o| if (mounts_mod.optionsError(o) != null) return fail(diag, "invalid mount options (comma-separated, no spaces)");
+        try list.append(arena, m);
+    }
+    return list.items;
 }
 
 fn nonEmpty(s: []const u8) bool {
@@ -553,6 +606,28 @@ const Parser = struct {
 fn fail(diag: *Diag, msg: []const u8) error{BadAnswers} {
     diag.message = msg;
     return error.BadAnswers;
+}
+
+test "extra mounts and the firmware choice in an answers file" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var diag: Diag = .{};
+    const system = "[system]\nroot_hash = \"$6$saltsalt$rootrootrootroot\"\nuser = \"u\"\nuser_hash = \"$6$saltsalt$useruseruseruser\"\n";
+    const head = "[install]\ndisk = \"sda\"\npartitioning = \"existing\"\nfirmware = \"bios\"\n" ++ system ++ "[partitions]\nroot = \"sda2\"\nroot_options = \"noatime\"\n";
+    const a = try parse(arena, head ++ "[[partitions.mount]]\ndevice = \"sdb1\"\nat = \"/home\"\n[[partitions.mount]]\ndevice = \"sdb2\"\nat = \"/var\"\nformat = true\nfs = \"btrfs\"\noptions = \"noatime\"\n", &diag);
+    try std.testing.expectEqual(FirmwareChoice.bios, a.firmware);
+    try std.testing.expectEqualStrings("noatime", a.root_options.?);
+    try std.testing.expectEqual(@as(usize, 2), a.mounts.len);
+    try std.testing.expect(!a.mounts[0].format and a.mounts[1].format and a.mounts[1].fs == .btrfs);
+    for ([_][]const u8{
+        "[[partitions.mount]]\ndevice = \"sdb1\"\n",
+        "[[partitions.mount]]\ndevice = \"sdb1\"\nat = \"/etc\"\n",
+        "[[partitions.mount]]\ndevice = \"sdb1\"\nat = \"/a\"\nfs = \"ext4\"\n",
+        "[[partitions.mount]]\ndevice = \"sdb1\"\nat = \"/a\"\noptions = \"a b\"\n",
+    }) |bad| try std.testing.expectError(error.BadAnswers, parse(arena, try std.mem.concat(arena, u8, &.{ head, bad }), &diag));
+    // Only for manual partitioning.
+    try std.testing.expectError(error.BadAnswers, parse(arena, "[install]\ndisk = \"sda\"\npartitioning = \"auto\"\n" ++ system ++ "[partitions]\nroot_options = \"noatime\"\n", &diag));
 }
 
 test "validators" {

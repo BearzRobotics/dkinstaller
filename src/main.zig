@@ -30,6 +30,7 @@ const usage =
     \\                     /run/live/medium are tried
     \\  --probe FILE       use a recorded probe fixture (only with --dry-run)
     \\  --ascii            ASCII box drawing
+    \\  -h, --help         show this text
     \\
 ;
 
@@ -89,6 +90,12 @@ pub fn main(init: std.process.Init) !u8 {
         const arg: []const u8 = args[i];
         if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            var help_buf: [1024]u8 = undefined;
+            var help_w: Io.File.Writer = .init(.stdout(), io, &help_buf);
+            try help_w.interface.writeAll(usage);
+            try help_w.interface.flush();
+            return 0;
         } else if (std.mem.eql(u8, arg, "--ascii")) {
             ascii = true;
         } else if (std.mem.eql(u8, arg, "--auto")) {
@@ -300,6 +307,12 @@ pub fn main(init: std.process.Init) !u8 {
     var ui: dk.ui.Ui = undefined;
     var have_ui = false;
     defer if (have_ui) ui.screen.deinit(init.gpa);
+
+    // --yes-really-erase names one disk; nothing else may be formatted without a confirmation.
+    if (erase_disk != null) if (file_answers) |fa| if (probe.findDisk(fa.disk)) |d| if (dk.auto.formatsElsewhere(d, fa)) {
+        try err.print("refused: {s}\n", .{dk.auto.Gate.other_disk_format.message()});
+        return 1;
+    };
 
     var run_answers: ?dk.answers.Answers = file_answers;
     const plan: dk.plan.Plan = if (file_answers) |answers| blk: {

@@ -56,10 +56,29 @@ pub fn fstabFor(arena: Allocator, root_fs: fs_mod.Fs, root_uuid: []const u8, esp
 
 /// As `fstabFor`, with the ESP mounted at `esp_at` (`/boot/efi`; `/boot` for systemd-boot).
 pub fn fstabAt(arena: Allocator, root_fs: fs_mod.Fs, root_uuid: []const u8, esp_uuid: ?[]const u8, esp_at: []const u8) ![]u8 {
+    return fstabWith(arena, root_fs, root_uuid, null, &.{}, esp_uuid, esp_at);
+}
+
+/// An fstab line for a partition besides the root and the ESP.
+pub const FstabEntry = struct {
+    uuid: []const u8,
+    at: []const u8,
+    fstype: []const u8,
+    options: []const u8,
+    /// The fsck pass (0: not checked).
+    pass: u8,
+};
+
+/// The whole fstab. `extra` is in mounting order (`mount -a` goes line by line, so a parent is
+/// first); the ESP follows it, since /boot/efi is inside a separate /boot.
+pub fn fstabWith(arena: Allocator, root_fs: fs_mod.Fs, root_uuid: []const u8, root_options: ?[]const u8, extra: []const FstabEntry, esp_uuid: ?[]const u8, esp_at: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     const fi = fs_mod.info(root_fs);
-    const root = try std.fmt.allocPrint(arena, "UUID={s}  /          {s}  {s}    {d} {d}\n", .{ root_uuid, fi.fstab_type, fi.fstab_options, fi.fsck_pass, fi.fsck_pass });
+    const root = try std.fmt.allocPrint(arena, "UUID={s}  /          {s}  {s}    {d} {d}\n", .{ root_uuid, fi.fstab_type, root_options orelse fi.fstab_options, fi.fsck_pass, fi.fsck_pass });
     try out.appendSlice(arena, root);
+    for (extra) |e| {
+        try out.appendSlice(arena, try std.fmt.allocPrint(arena, "UUID={s}  {s}  {s}  {s}  0 {d}\n", .{ e.uuid, e.at, e.fstype, e.options, e.pass }));
+    }
     if (esp_uuid) |u| {
         const esp = try std.fmt.allocPrint(arena, "UUID={s}  {s}  vfat  umask=0077  0 2\n", .{ u, esp_at });
         try out.appendSlice(arena, esp);
@@ -132,22 +151,24 @@ pub fn keymapService(arena: Allocator, keymap: []const u8) ![]u8 {
 /// `/boot/dklilo.conf`, in dklilo's syntax (docs/dklilo.conf.5.md): `image`
 /// starts an entry, `label`, `root` and `append` belong to it. `kernel` is
 /// the file name found under `/boot`.
-pub fn dkliloConf(arena: Allocator, kernel: []const u8, root_partuuid: []const u8) ![]u8 {
+/// `separate_boot`: /boot is its own partition. Paths are relative to the filesystem the file is
+/// on, so there the kernel is at the top.
+pub fn dkliloConf(arena: Allocator, kernel: []const u8, root_partuuid: []const u8, separate_boot: bool) ![]u8 {
     return std.fmt.allocPrint(arena,
         \\timeout = 50
         \\default = dkrescue
         \\
-        \\image = /boot/{[k]s}
+        \\image = {[d]s}/{[k]s}
         \\    label = dkrescue
         \\    root = PARTUUID={[r]s}
         \\    append = "ro quiet"
         \\
-        \\image = /boot/{[k]s}
+        \\image = {[d]s}/{[k]s}
         \\    label = dkrescue-safe
         \\    root = PARTUUID={[r]s}
         \\    append = "ro nomodeset"
         \\
-    , .{ .k = kernel, .r = root_partuuid });
+    , .{ .k = kernel, .r = root_partuuid, .d = if (separate_boot) "" else "/boot" });
 }
 
 /// The `sfdisk` script for the automatic layout (SPEC.md 5.3.1).
@@ -213,7 +234,7 @@ test "keymap service" {
 test "dklilo.conf" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const s = try dkliloConf(arena_state.allocator(), "vmlinuz-6.12", "abc");
+    const s = try dkliloConf(arena_state.allocator(), "vmlinuz-6.12", "abc", false);
     try std.testing.expect(std.mem.indexOf(u8, s, "image = /boot/vmlinuz-6.12") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "root = PARTUUID=abc") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "nomodeset") != null);

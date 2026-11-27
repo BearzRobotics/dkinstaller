@@ -60,6 +60,9 @@ printed.
 disk = "largest"
 # Existing partitions instead: partitioning = "existing" and a [partitions] section.
 partitioning = "auto"
+# auto (the default): install for the way the live system booted. bios: install for BIOS/legacy boot
+# even when the live system booted with UEFI. (There is no "uefi": a BIOS boot cannot make UEFI boot entries.)
+#firmware = "auto"
 # The root filesystem: ext4 (the default), ext3, ext2, btrfs or xfs (not with dklilo, which cannot read it).
 # zfs is refused (it needs an initramfs), as is a filesystem whose tools are not on the live disc, or that
 # the installed kernel cannot mount without one, with the reason (SPEC.md 5.3.4).
@@ -69,6 +72,22 @@ partitioning = "auto"
 confirm_erase = "/dev/nvme0n1"
 # reboot (default), poweroff or shell, after everything is unmounted.
 when_done = "reboot"
+
+# With partitioning = "existing" only. Partitions may be on any disk; each is kept unless format = true
+# (/boot, /var, /opt and /root must be formatted). An autoinstall formats only on the confirmed disk.
+#[partitions]
+#root = "nvme0n1p3"
+#esp = "nvme0n1p1"
+#root_options = "defaults,noatime"
+#[[partitions.mount]]
+#device = "sda1"
+#at = "/home"
+#options = "defaults,nofail"
+#[[partitions.mount]]
+#device = "nvme0n1p4"
+#at = "/var"
+#format = true
+#fs = "ext4"
 
 [system]
 hostname = "node01"

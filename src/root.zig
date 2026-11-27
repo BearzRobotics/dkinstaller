@@ -5,6 +5,7 @@ pub const auto = @import("auto.zig");
 pub const answers = @import("answers.zig");
 pub const plan = @import("plan.zig");
 pub const files = @import("files.zig");
+pub const mounts = @import("mounts.zig");
 pub const fs = @import("fs.zig");
 pub const bootloader = @import("bootloader.zig");
 pub const execute = @import("execute.zig");
@@ -17,6 +18,7 @@ test {
     _ = answers;
     _ = plan;
     _ = files;
+    _ = mounts;
     _ = fs;
     _ = bootloader;
     _ = execute;

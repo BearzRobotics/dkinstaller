@@ -95,6 +95,7 @@ pub const Gate = enum {
     no_such_disk,
     confirm_mismatch,
     live_medium,
+    other_disk_format,
 
     pub fn message(self: Gate) []const u8 {
         return switch (self) {
@@ -103,6 +104,7 @@ pub const Gate = enum {
             .no_such_disk => "[install] disk matches no disk that can be installed to",
             .confirm_mismatch => "[install] confirm_erase does not name the disk the plan would erase",
             .live_medium => "the chosen disk holds the live medium",
+            .other_disk_format => "a [[partitions.mount]] formats a partition on another disk than the one confirm_erase names",
         };
     }
 };
@@ -155,7 +157,15 @@ pub fn check(p: Probe, flag: bool, a: answers_mod.Answers, link_target: ?[]const
     const disk = resolveDisk(p, a.disk) orelse return .{ .refused = .no_such_disk };
     if (p.holdsLiveMedium(disk)) return .{ .refused = .live_medium };
     if (!confirmMatches(confirm, disk, link_target)) return .{ .refused = .confirm_mismatch };
+    if (formatsElsewhere(disk, a)) return .{ .refused = .other_disk_format };
     return .{ .ok = disk };
+}
+
+/// Whether a mount formats a partition that is not on `disk`. With no typed confirmation, only
+/// the disk that was named may lose data.
+pub fn formatsElsewhere(disk: Disk, a: answers_mod.Answers) bool {
+    for (a.mounts) |m| if (m.format and disk.findPartition(m.device) == null) return true;
+    return false;
 }
 
 // ---------------------------------------------------------------- tests
@@ -284,4 +294,15 @@ test "every example answers file parses and plans, and the documented copy match
 test "searching a medium never replays an ext4 journal" {
     try std.testing.expectEqualStrings("ro,noload", mountOptions("ext4"));
     try std.testing.expectEqualStrings("ro", mountOptions("vfat"));
+}
+
+test "an unattended install formats nothing on another disk than the confirmed one" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const p = try fixture(st.allocator(), "uefi-nvme-blank.json");
+    var a = ans("nvme0n1", "nvme0n1");
+    a.mounts = &.{.{ .device = "sdz1", .at = "/data" }};
+    try std.testing.expect(check(p, true, a, null) == .ok);
+    a.mounts = &.{.{ .device = "sdz1", .at = "/data", .format = true }};
+    try std.testing.expectEqual(Gate.other_disk_format, check(p, true, a, null).refused);
 }

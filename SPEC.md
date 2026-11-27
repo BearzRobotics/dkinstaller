@@ -1,6 +1,6 @@
 # dkrescue-install — Specification
 
-Status: **Draft v0.1** (program version 0.0.7). Anything marked **OPEN** is an undecided question.
+Status: **Draft v0.1** (program version 0.0.8). Anything marked **OPEN** is an undecided question.
 Resolve it here before writing code that depends on it.
 
 ---
@@ -112,6 +112,10 @@ point before 5.5. Nothing is written until 5.5 is confirmed.
 - On UEFI, `/sys/firmware/efi/efivars` must be mounted read-write, so
   dklilo can create the boot entry. If it isn't, the installer says so and
   offers a removable-media install only (5.6).
+- After a UEFI boot, a **Boot mode** screen follows the checks: UEFI (as
+  detected, the default) or BIOS, for machines that boot both ways. BIOS makes
+  every later choice, the plan and the install as after a BIOS boot (answers
+  file: `[install] firmware = "bios"`). A BIOS boot gets no such screen.
 - Every external program the plan will run exists (6.3). A missing one is
   reported by name before anything else happens.
 
@@ -255,6 +259,53 @@ listed but not selectable.
 
 The choice is `root_fs` in the answers file (`ext4` by default) and a screen
 after the partitioning choice.
+
+#### 5.3.5 Mount points (manual partitioning only)
+
+With existing partitions (also after `cfdisk`), a **Mount points** screen
+follows the partition choices. It adds partitions, from any disk but the live
+medium's, to the new system's `fstab`, and sets mount options for them and for
+`/`. `cfdisk` runs only on the target disk: other disks are partitioned
+beforehand. Answers file: `[partitions] root_options` and
+`[[partitions.mount]]`.
+
+- A partition is **kept** unless formatting is chosen. `/boot`, `/var`, `/opt`,
+  `/root` and what is under them are always formatted (the install writes
+  there). A kept partition holds ext2/3/4, btrfs, XFS or FAT (not FAT on
+  `/home`). Files in a kept home directory are not given to the new user's ID.
+- The copy leaves kept partitions out (`unsquashfs -excludes`), so their files,
+  owner and permissions stay, and what the image has at that path is not put
+  there. The user and ssh steps still write to a kept `/home`. SELinux labelling
+  skips kept partitions other than `/home` (a first-boot relabel, used when the
+  image has no `setfiles`, does not skip them).
+- A kept `/home` is looked at before anything is changed: no directory named
+  like the live user (it is removed with that user) and, when an ssh key is to
+  be set up, no `.ssh` of the new user.
+- Nothing is mounted at or under the live user's or the new user's home
+  directory.
+- Refused: `/etc`, `/usr`, `/bin`, `/sbin`, `/lib*` (needed before `fstab` is
+  mounted, with no initramfs), `/proc`, `/sys`, `/dev`, `/run`, anything under
+  `/boot`, and formatting an EFI System or BIOS boot partition.
+- `/boot` must be on the target disk, at least 256 MiB, on a filesystem the
+  boot loader reads; not with systemd-boot, whose `/boot` is the ESP. With
+  dklilo its kernel paths are relative to that partition, and `install-bios`
+  gets `--config-partition`. The root filesystem choices are the same as
+  without it.
+- Options are a comma-separated list. The install mounts with them too (with
+  `rw,exec,suid,dev` added), so that `subvol=` means the same during the install
+  and after. Options that were typed are tried with a
+  mount **before the copy**: the new system's boot stops if `mount -a` fails.
+  (`nofail` lets it start without that disk.)
+- With a separate `/var` or `/var/log`, the installed `filesystems` service
+  (which runs `mount -a` at boot) logs to `/run/dinit-filesystems.log` instead
+  of `/var/log`, where the mount would hide it. `/run` is cleared at each boot.
+  A separate `/var` also leaves an empty `/var/log` on the root: a service whose
+  log directory is missing never starts.
+- Partitions are mounted before the copy, parents first; in `fstab` too, with
+  the ESP after them.
+- The summary lists every one, and the typed confirmation names those formatted
+  on other disks. With no typed confirmation (autoinstall,
+  `--yes-really-erase`), formatting on another disk is refused.
 
 ### 5.4 System settings
 

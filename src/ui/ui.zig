@@ -14,6 +14,7 @@ const answers_mod = @import("../answers.zig");
 const plan_mod = @import("../plan.zig");
 const files = @import("../files.zig");
 const fs_mod = @import("../fs.zig");
+const mounts_mod = @import("../mounts.zig");
 const bl_mod = @import("../bootloader.zig");
 const execute = @import("../execute.zig");
 
@@ -402,6 +403,7 @@ pub const Done = struct {
 
 const Scr = enum {
     checks,
+    firmware,
     disk,
     partitioning,
     bootloader,
@@ -412,6 +414,7 @@ const Scr = enum {
     esp_type,
     esp_format,
     bios_boot,
+    mounts,
     hostname,
     root_pw,
     user,
@@ -429,6 +432,8 @@ const Scr = enum {
 
 const Draft = struct {
     disk: ?Disk = null,
+    /// Install for BIOS although the live system booted with UEFI.
+    force_bios: bool = false,
     partitioning: answers_mod.Partitioning = .auto,
     /// Partition by hand with cfdisk first, then continue as with existing partitions.
     manual: bool = false,
@@ -442,6 +447,9 @@ const Draft = struct {
     format_esp: bool = false,
     set_esp_type: bool = false,
     set_bios_boot_type: bool = false,
+    /// Manual partitioning only: further mount points, and the root's fstab options.
+    mounts: []const answers_mod.Mount = &.{},
+    root_options: ?[]const u8 = null,
     hostname: []const u8 = "dkrescue",
     root_pw: []const u8 = "",
     user: []const u8 = "",
@@ -466,6 +474,8 @@ const Draft = struct {
         self.format_esp = false;
         self.set_esp_type = false;
         self.set_bios_boot_type = false;
+        self.mounts = &.{};
+        self.root_options = null;
     }
 };
 
@@ -512,14 +522,22 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
     var stack: std.ArrayList(Scr) = .empty;
     try stack.append(ui.arena, .checks);
 
+    // How the live system booted; `p.firmware` is what the new system is installed for.
+    const booted = p_in.firmware;
     while (stack.items.len > 0) {
+        p.firmware = if (d.force_bios) .bios else booted;
         const cur = stack.items[stack.items.len - 1];
         var go: ?Scr = null; // next screen; null = Esc, go back
         switch (cur) {
             .checks => {
-                const ok = try screenChecks(ui, p, env);
+                // About the live system, not the new one: how it really booted.
+                const ok = try screenChecks(ui, p_in, env);
                 if (ok == .quit) return null;
-                if (ok == .go) go = .disk;
+                // A BIOS boot has no choice: UEFI boot entries can't be made from it.
+                if (ok == .go) go = if (booted == .uefi) .firmware else .disk;
+            },
+            .firmware => {
+                if (try screenFirmware(ui, &d)) go = .disk;
             },
             .disk => {
                 if (try screenDisk(ui, p, &d)) go = .partitioning;
@@ -549,7 +567,10 @@ pub fn run(ui: *Ui, p_in: Probe, env: Env) !?Done {
                 if (try screenEspFormat(ui, &d)) go = afterEsp(p, &d, .esp_format);
             },
             .bios_boot => {
-                if (try screenBiosBoot(ui, &d)) go = .hostname;
+                if (try screenBiosBoot(ui, &d)) go = .mounts;
+            },
+            .mounts => {
+                if (try screenMounts(ui, p, &d)) go = .hostname;
             },
             .hostname => {
                 if (try input(ui, "Hostname", "Name for this computer.", d.hostname, .{ .validate = hostnameError })) |v| {
@@ -672,10 +693,10 @@ fn afterEsp(p: Probe, d: *Draft, from: Scr) Scr {
     }
     // BIOS on GPT needs a BIOS boot partition.
     if (p.firmware == .bios) if (d.disk) |disk| if (disk.table) |t| if (std.mem.eql(u8, t, "gpt")) {
-        for (disk.partitions) |q| if (isBiosBootType(q.parttype)) return .hostname;
+        for (disk.partitions) |q| if (isBiosBootType(q.parttype)) return .mounts;
         return .bios_boot;
     };
-    return .hostname;
+    return .mounts;
 }
 
 const CheckResult = enum { go, back, quit };
@@ -717,6 +738,22 @@ fn screenChecks(ui: *Ui, p: Probe, env: Env) !CheckResult {
     try lines.append(ui.arena, .{ .text = "Nothing is written to any disk until you confirm the summary.", .attr = bold });
     const ok = try viewer(ui, "Checks", lines.items, "Enter: continue   Esc: quit");
     return if (ok) .go else .quit;
+}
+
+fn screenFirmware(ui: *Ui, d: *Draft) !bool {
+    const items = [_]Item{
+        .{ .label = "UEFI (detected)", .sub = "The live system booted with UEFI." },
+        .{ .label = "BIOS (legacy)", .sub = "For a computer that will boot the new system in BIOS/legacy mode." },
+    };
+    const pick = try menu(ui, "Boot mode", "How will this computer boot the new system?", &items, if (d.force_bios) 1 else 0) orelse return false;
+    const bios = pick == 1;
+    if (bios != d.force_bios) {
+        // Which partitions are needed, and which boot loaders work, depend on it.
+        d.force_bios = bios;
+        d.resetPartitions();
+        if (!bl_mod.info(d.bootloader).bios) d.bootloader = .dklilo;
+    }
+    return true;
 }
 
 fn screenDisk(ui: *Ui, p: Probe, d: *Draft) !bool {
@@ -860,8 +897,14 @@ fn screenBootloader(ui: *Ui, p: Probe, d: *Draft) !bool {
     const pick = try menu(ui, "Boot loader", "Which boot loader should start the new system? Greyed ones say what is missing.", items.items, @backingInt(d.bootloader)) orelse return false;
     d.bootloader = bl_mod.all[pick];
     // A root chosen under another loader may not be readable by this one: back to ext4, the one every loader reads.
-    if (!bl_mod.canReadRoot(d.bootloader, d.root_fs)) d.root_fs = .ext4;
+    if (!bl_mod.canReadRoot(d.bootloader, d.root_fs)) setRootFs(d, .ext4);
     return true;
+}
+
+fn setRootFs(d: *Draft, root_fs: fs_mod.Fs) void {
+    // Options are particular to a filesystem, and are only tried once the root has been formatted.
+    if (root_fs != d.root_fs) d.root_options = null;
+    d.root_fs = root_fs;
 }
 
 fn screenRootFs(ui: *Ui, p: Probe, d: *Draft) !bool {
@@ -884,7 +927,7 @@ fn screenRootFs(ui: *Ui, p: Probe, d: *Draft) !bool {
         }
     }
     const pick = try menu(ui, "Root filesystem", "What should / be formatted as? Greyed ones say what is missing.", items.items, @backingInt(d.root_fs)) orelse return false;
-    d.root_fs = fs_mod.all[pick];
+    setRootFs(d, fs_mod.all[pick]);
     return true;
 }
 
@@ -977,6 +1020,166 @@ fn screenBiosBoot(ui: *Ui, d: *Draft) !bool {
     d.bios_boot = disk.partitions[idx.items[pick]];
     d.set_bios_boot_type = true;
     return true;
+}
+
+/// A partition that could be given a mount point, and the disk it is on.
+const Candidate = struct { disk: Disk, part: Partition };
+
+/// Whether the partition is already the root, the ESP or the BIOS boot partition.
+fn inUse(d: *const Draft, q: Partition) bool {
+    for ([_]?Partition{ d.root, d.esp, d.bios_boot }) |o| if (o) |used| if (std.mem.eql(u8, used.path, q.path)) return true;
+    return false;
+}
+
+fn findMount(d: *const Draft, q: Partition) ?usize {
+    for (d.mounts, 0..) |m, i| if (std.mem.eql(u8, m.device, q.path)) return i;
+    return null;
+}
+
+/// 5.3.5: the mount points besides /, the ESP and the BIOS boot partition, and fstab options.
+/// Nothing is written: the choices only go into the answers.
+fn screenMounts(ui: *Ui, p: Probe, d: *Draft) !bool {
+    // Going back and choosing another root or ESP can take a partition that had a mount point.
+    var kept: std.ArrayList(answers_mod.Mount) = .empty;
+    for (d.mounts) |m| {
+        var taken = false;
+        for ([_]?Partition{ d.root, d.esp, d.bios_boot }) |o| if (o) |used| if (std.mem.eql(u8, used.path, m.device)) {
+            taken = true;
+        };
+        if (!taken) try kept.append(ui.arena, m);
+    }
+    d.mounts = kept.items;
+
+    var cur: usize = 0;
+    while (true) {
+        var items: std.ArrayList(Item) = .empty;
+        try items.append(ui.arena, .{ .label = "Continue", .sub = if (d.mounts.len == 0) "No other mount points." else "Done with mount points." });
+        try items.append(ui.arena, .{ .label = "Add a mount point", .sub = "For example /home, /var or /boot, on any disk." });
+        try items.append(ui.arena, .{ .label = "Mount options for /", .detail = d.root_options orelse fs_mod.info(d.root_fs).fstab_options });
+        for (d.mounts) |m| try items.append(ui.arena, .{
+            .label = ui.fmt("{s}  on {s}", .{ m.at, m.device }),
+            .sub = ui.fmt("{s}; options: {s}", .{
+                if (m.format) ui.fmt("FORMAT as {s}", .{fs_mod.info(m.fs).name}) else "keep what is on it",
+                m.options orelse "the usual ones",
+            }),
+            .sub_attr = if (m.format) warn else dim,
+        });
+        const pick = try menu(ui, "Mount points", "Partitions to put in fstab besides /. Choose one in the list to change or remove it. Partition other disks before starting the installer.", items.items, cur) orelse return false;
+        cur = pick;
+        switch (pick) {
+            0 => return true,
+            1 => try addMount(ui, p, d),
+            2 => {
+                if (try input(ui, "Mount options for /", "A comma-separated list, as in fstab. Leave empty for the usual options. They are tried before anything is copied.", d.root_options orelse "", .{ .validate = optionsOrEmptyError })) |v| {
+                    d.root_options = if (v.len == 0) null else v;
+                }
+            },
+            else => try editMount(ui, d, pick - 3),
+        }
+    }
+}
+
+fn optionsOrEmptyError(s: []const u8) ?[]const u8 {
+    return if (s.len == 0) null else mounts_mod.optionsError(s);
+}
+
+const options_intro = "A comma-separated list, as in fstab. Leave empty for the usual options. Add nofail for a data disk the system should start without: otherwise a mount that fails stops the boot.";
+
+fn editMount(ui: *Ui, d: *Draft, index: usize) !void {
+    const m = d.mounts[index];
+    const items = [_]Item{ .{ .label = "Change its mount options" }, .{ .label = "Remove this mount point", .sub = "To change anything else, remove it and add it again." } };
+    const pick = try menu(ui, ui.fmt("{s} on {s}", .{ m.at, m.device }), "", &items, 0) orelse return;
+    var list: std.ArrayList(answers_mod.Mount) = .empty;
+    try list.appendSlice(ui.arena, d.mounts);
+    if (pick == 0) {
+        const v = try input(ui, ui.fmt("Mount options for {s}", .{m.at}), options_intro, m.options orelse "", .{ .validate = optionsOrEmptyError }) orelse return;
+        list.items[index].options = if (v.len == 0) null else v;
+    } else _ = list.orderedRemove(index);
+    d.mounts = list.items;
+}
+
+/// Asks for a partition, a mount point, whether to format it, and options. Esc drops it all.
+fn addMount(ui: *Ui, p: Probe, d: *Draft) !void {
+    var found: std.ArrayList(Candidate) = .empty;
+    var items: std.ArrayList(Item) = .empty;
+    for (p.disks) |disk| {
+        if (!std.mem.eql(u8, disk.kind, "disk") or p.holdsLiveMedium(disk) or disk.read_only) continue;
+        for (disk.partitions) |q| {
+            if (q.mounted or isBiosBootType(q.parttype) or inUse(d, q) or findMount(d, q) != null) continue;
+            try found.append(ui.arena, .{ .disk = disk, .part = q });
+            try items.append(ui.arena, .{
+                .label = ui.fmt("{s}  {s}", .{ q.path, fmtSize(ui.arena, q.size) }),
+                .detail = ui.fmt("{s}{s}{s}{s}", .{
+                    q.fstype orelse "no filesystem",
+                    if (q.label != null) " \"" else "",
+                    q.label orelse "",
+                    if (q.label != null) "\"" else "",
+                }),
+                .sub = ui.fmt("on /dev/{s} {s}", .{ disk.name, disk.model orelse "" }),
+            });
+        }
+    }
+    if (found.items.len == 0) {
+        _ = try message(ui, "Add a mount point", &.{"There is no other partition that can be used."}, warn, "Enter or Esc: back");
+        return;
+    }
+    const pick = try menu(ui, "Add a mount point", "Which partition?", items.items, 0) orelse return;
+    const c = found.items[pick];
+
+    var at: []const u8 = "";
+    while (true) {
+        at = try input(ui, "Mount point", ui.fmt("Where should {s} be mounted? For example /home.", .{c.part.path}), at, .{ .validate = mounts_mod.pathError }) orelse return;
+        var why: ?[]const u8 = null;
+        for (d.mounts) |m| if (std.mem.eql(u8, m.at, at)) {
+            why = ui.fmt("Another partition is already mounted at {s}.", .{at});
+        };
+        if (p.live_user.len > 0 and mounts_mod.within(at, ui.fmt("/home/{s}", .{p.live_user}))) why = "That is in the live disc's user's home directory, which is removed. Mount /home instead.";
+        if (std.mem.eql(u8, at, "/boot")) {
+            if (d.bootloader == .@"systemd-boot") why = "With systemd-boot, /boot is the EFI System Partition.";
+            if (!std.mem.eql(u8, c.disk.path, d.disk.?.path)) why = "/boot must be on the disk being installed to, where the boot loader looks.";
+        }
+        const w = why orelse break;
+        _ = try message(ui, "Mount point", &.{w}, warn, "Enter or Esc: back");
+    }
+
+    const boot = std.mem.eql(u8, at, "/boot");
+    const fat = std.mem.eql(u8, c.part.fstype orelse "", "vfat");
+    const keep_why: ?[]const u8 = if (!mounts_mod.mayKeep(at))
+        "The install puts the new system's files here, so it must be formatted."
+    else if (!mounts_mod.keepableFs(c.part.fstype orelse ""))
+        "It has no filesystem the installer can mount."
+    else if (fat and std.mem.eql(u8, at, "/home"))
+        "/home can't be on FAT, which has no file owners."
+    else
+        null;
+    const protected = isEspType(c.part.parttype);
+    const choices = [_]Item{
+        .{ .label = "Keep what is on it", .sub = keep_why orelse "Nothing on it is erased.", .enabled = keep_why == null },
+        .{ .label = "Format it", .sub = if (protected) "An EFI System Partition is not formatted here." else "Everything on it is lost.", .sub_attr = warn, .enabled = !protected },
+    };
+    const how = try menu(ui, ui.fmt("{s} on {s}", .{ at, c.part.path }), "", &choices, if (keep_why == null) 0 else 1) orelse return;
+
+    var mount: answers_mod.Mount = .{ .device = c.part.path, .at = at, .format = how == 1 };
+    if (mount.format) {
+        var fss: std.ArrayList(Item) = .empty;
+        for (fs_mod.all) |f| {
+            const bc: fs_mod.BootCheck = .{ .readable = !boot or bl_mod.canReadRoot(d.bootloader, f), .loader = bl_mod.info(d.bootloader).name };
+            switch (try fs_mod.availability(ui.arena, f, p.tools, p.kernel_builtin, bc)) {
+                .ok => try fss.append(ui.arena, .{ .label = fs_mod.info(f).title }),
+                .unusable => |why| try fss.append(ui.arena, .{ .label = fs_mod.info(f).title, .sub = why, .sub_attr = warn, .enabled = false }),
+            }
+        }
+        const f = try menu(ui, "Filesystem", ui.fmt("What should {s} be formatted as?", .{c.part.path}), fss.items, 0) orelse return;
+        mount.fs = fs_mod.all[f];
+    }
+    const o = try input(ui, ui.fmt("Mount options for {s}", .{at}), options_intro, "", .{ .validate = optionsOrEmptyError }) orelse return;
+    mount.options = if (o.len == 0) null else o;
+
+    var list: std.ArrayList(answers_mod.Mount) = .empty;
+    try list.appendSlice(ui.arena, d.mounts);
+    try list.append(ui.arena, mount);
+    std.mem.sort(answers_mod.Mount, list.items, {}, mounts_mod.before);
+    d.mounts = list.items;
 }
 
 fn screenPassword(ui: *Ui, title: []const u8, out: *[]const u8) !bool {
@@ -1648,6 +1851,9 @@ fn buildAnswers(ui: *Ui, d: *const Draft, p: Probe) !answers_mod.Answers {
         .format_esp = d.format_esp,
         .set_esp_type = d.set_esp_type,
         .set_bios_boot_type = d.set_bios_boot_type,
+        .firmware = if (d.force_bios) .bios else .auto,
+        .root_options = if (d.partitioning == .existing) d.root_options else null,
+        .mounts = if (d.partitioning == .existing) d.mounts else &.{},
         .hostname = d.hostname,
         .root_pw = .{ .plain = d.root_pw },
         .user = d.user,
@@ -1691,6 +1897,11 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
         }
         if (d.set_esp_type) try lines.append(ui.arena, .{ .text = "The ESP's partition type will be changed.", .attr = warn });
         if (d.set_bios_boot_type) try lines.append(ui.arena, .{ .text = ui.fmt("{s} will become the BIOS boot partition; its contents are OVERWRITTEN.", .{d.bios_boot.?.path}), .attr = danger });
+        if (a.root_options) |o| try lines.append(ui.arena, .{ .text = ui.fmt("Mount options for /: {s}", .{o}) });
+        for (a.mounts) |m| try lines.append(ui.arena, if (m.format)
+            .{ .text = ui.fmt("{s} will be FORMATTED ({s}) and mounted at {s}.", .{ m.device, fs_mod.info(m.fs).name, m.at }), .attr = danger }
+        else
+            .{ .text = ui.fmt("{s} is kept and mounted at {s}.", .{ m.device, m.at }) });
     }
     try lines.append(ui.arena, .{ .text = ui.fmt("Boot loader: {s}   Root filesystem: {s}", .{ bl_mod.info(d.bootloader).name, fs_mod.info(d.root_fs).name }) });
     try lines.append(ui.arena, .{ .text = ui.fmt("Hostname: {s}   User: {s}   Timezone: {s}   Keymap: {s}", .{ d.hostname, d.user, d.timezone, d.keymap }) });
@@ -1727,7 +1938,10 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
     if (d.packages.len > 0) {
         try lines.append(ui.arena, .{ .text = ui.fmt("Extra packages: {d} from {s}{s}", .{ d.packages.len, if (p.repo) |r| r.root else "?", if (d.keep_repo) " (repository kept, commented out)" else "" }) });
     }
-    try lines.append(ui.arena, .{ .text = ui.fmt("Firmware: {s}", .{if (p.firmware == .uefi) "UEFI" else "BIOS"}) });
+    try lines.append(ui.arena, if (d.force_bios)
+        .{ .text = "Firmware: BIOS (your choice; the live system booted with UEFI)", .attr = warn }
+    else
+        .{ .text = ui.fmt("Firmware: {s}", .{if (p.firmware == .uefi) "UEFI" else "BIOS"}) });
     try lines.append(ui.arena, .{ .text = "" });
     try lines.append(ui.arena, .{ .text = "Commands that will run:", .attr = bold });
 
@@ -1741,7 +1955,7 @@ fn screenSummary(ui: *Ui, p: Probe, env: Env, d: *const Draft) !?Done {
 
     if (!try viewer(ui, "Summary", lines.items, "Up/Down, PgUp/PgDn: scroll   Enter: continue   Esc: back")) return null;
 
-    const prompt = ui.fmt("This will erase data on /dev/{s}. To go on, type the disk's name ({s}) and press Enter.", .{ disk.name, disk.name });
+    const prompt = try confirmPrompt(ui, disk, plan);
     const typed = try input(ui, "Confirm", prompt, "", .{ .expect = disk.name, .mismatch = "That is not the disk's name." });
     if (typed == null) return null;
     return .{ .answers = a, .plan = plan };
@@ -2062,8 +2276,15 @@ pub fn confirmPlan(ui: *Ui, disk: Disk, plan: plan_mod.Plan) !bool {
     var it = std.mem.splitScalar(u8, w.written(), '\n');
     while (it.next()) |l| try lines.append(ui.arena, .{ .text = l, .attr = if (std.mem.startsWith(u8, l, "# ")) bold else normal });
     if (!try viewer(ui, "Summary", lines.items, "Up/Down, PgUp/PgDn: scroll   Enter: continue   Esc: quit")) return false;
-    const prompt = ui.fmt("This will erase data on /dev/{s}. To go on, type the disk's name ({s}) and press Enter.", .{ disk.name, disk.name });
+    const prompt = try confirmPrompt(ui, disk, plan);
     return (try input(ui, "Confirm", prompt, "", .{ .expect = disk.name, .mismatch = "That is not the disk's name." })) != null;
+}
+
+/// What the typed confirmation says. Partitions formatted on other disks are named, since the
+/// name typed is only the target disk's.
+fn confirmPrompt(ui: *Ui, disk: Disk, plan: plan_mod.Plan) ![]const u8 {
+    const also = if (plan.other_formats.len == 0) "" else ui.fmt(" and FORMAT {s}", .{try std.mem.join(ui.arena, ", ", plan.other_formats)});
+    return ui.fmt("This will erase data on /dev/{s}{s}. To go on, type the disk's name ({s}) and press Enter.", .{ disk.name, also, disk.name });
 }
 
 // ----------------------------------------------------------------- tests
@@ -2101,8 +2322,8 @@ test "full flow, automatic layout, ends at a typed confirmation" {
 
     // checks Enter, disk (first = nvme0n1) Enter, auto Enter, hostname Enter, domain Enter,
     // root pw x2, user, user pw x2, timezone, keymap, summary Enter, confirm.
-    // checks, disk, partitioning, boot loader (default dklilo), root filesystem (default ext4), hostname, domain
-    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter, .enter } ++
+    // checks, boot mode, disk, partitioning, boot loader (default dklilo), root filesystem (default ext4), hostname, domain
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter, .enter, .enter } ++
         testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
         testKeys("dakota") ++ [_]Key{.enter} ++
         testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++
@@ -2123,9 +2344,9 @@ test "Esc goes back one screen at a time" {
     defer st.deinit();
     const arena = st.allocator();
     const p = try loadFixture(arena, "uefi-nvme-blank.json");
-    // checks, disk, partitioning, boot loader, root filesystem, hostname; Esc back through each of them to the checks;
-    // Esc to checks; Esc quits.
-    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .esc, .esc, .esc, .esc, .esc, .esc };
+    // checks, boot mode, disk, partitioning, boot loader, root filesystem, hostname; Esc back through each of
+    // them to the checks; Esc quits.
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter, .esc, .esc, .esc, .esc, .esc, .esc, .esc };
     var ui = try testUi(gpa, arena, &keys);
     defer ui.screen.deinit(gpa);
     const done = try run(&ui, p, .{ .is_root = true, .dry_run = true, .ids = test_ids });
@@ -2139,7 +2360,7 @@ test "ineligible disks are shown with a reason" {
     defer st.deinit();
     const arena = st.allocator();
     const p = try loadFixture(arena, "uefi-nvme-blank.json");
-    var ui = try testUi(gpa, arena, &[_]Key{.enter});
+    var ui = try testUi(gpa, arena, &[_]Key{ .enter, .enter });
     defer ui.screen.deinit(gpa);
     _ = run(&ui, p, .{ .is_root = true, .dry_run = true, .ids = test_ids }) catch |e| {
         try std.testing.expectEqual(error.ScriptEnded, e);
@@ -2148,6 +2369,72 @@ test "ineligible disks are shown with a reason" {
     defer gpa.free(t);
     try std.testing.expect(std.mem.indexOf(u8, t, "holds the live medium") != null);
     try std.testing.expect(std.mem.indexOf(u8, t, "has a mounted partition") != null);
+}
+
+test "choosing BIOS on a UEFI boot makes a BIOS install and says so" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try loadFixture(arena, "uefi-nvme-blank.json");
+    // checks, boot mode (down: BIOS), disk, partitioning, boot loader, root filesystem, hostname, domain
+    const keys = [_]Key{ .enter, .down, .enter, .enter, .enter, .enter, .enter, .enter, .enter } ++
+        testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
+        testKeys("dakota") ++ [_]Key{.enter} ++
+        testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++
+        [_]Key{ .enter, .enter, .enter } ++
+        testKeys("nvme0n1") ++ [_]Key{.enter};
+    var ui = try testUi(gpa, arena, &keys);
+    defer ui.screen.deinit(gpa);
+    const done = (try run(&ui, p, .{ .is_root = true, .dry_run = true, .ids = test_ids })).?;
+    try std.testing.expectEqual(answers_mod.FirmwareChoice.bios, done.answers.firmware);
+    var w: Io.Writer.Allocating = .init(arena);
+    try done.plan.writeDryRun(&w.writer);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "dklilo install-bios --yes /dev/nvme0n1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "install-uefi") == null);
+}
+
+test "the mount points screen: add a formatted /home, set root options, continue" {
+    const gpa = std.testing.allocator;
+    var st = std.heap.ArenaAllocator.init(gpa);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try loadFixture(arena, "uefi-sata-fdisk.json");
+    var disk = p.findDisk("sda").?;
+    var parts: std.ArrayList(Partition) = .empty;
+    try parts.appendSlice(arena, disk.partitions);
+    try parts.append(arena, .{ .name = "sda3", .path = "/dev/sda3", .number = 3, .size = 1 << 30 });
+    disk.partitions = parts.items;
+    p.disks = try arena.dupe(Disk, &.{disk});
+    var d: Draft = .{ .disk = disk, .partitioning = .existing, .root = disk.partitions[1], .esp = disk.partitions[0] };
+    // Add (2nd item); the only free partition; "/etc" is refused until fixed; format; ext4; no options.
+    // Then the root's options, then Continue (the cursor starts back on the row last used).
+    const keys = [_]Key{ .down, .enter, .enter } ++ testKeys("/etc") ++ [_]Key{.enter} ++ [_]Key{ .backspace, .backspace, .backspace } ++ testKeys("home") ++
+        [_]Key{ .enter, .enter, .enter, .enter } ++
+        [_]Key{ .down, .enter } ++ testKeys("noatime") ++ [_]Key{.enter} ++ [_]Key{ .up, .up, .enter };
+    var ui = try testUi(gpa, arena, &keys);
+    defer ui.screen.deinit(gpa);
+    try std.testing.expect(try screenMounts(&ui, p, &d));
+    try std.testing.expectEqual(keys.len, ui.script_i);
+    try std.testing.expectEqual(@as(usize, 1), d.mounts.len);
+    try std.testing.expectEqualStrings("/home", d.mounts[0].at);
+    try std.testing.expectEqualStrings("/dev/sda3", d.mounts[0].device);
+    try std.testing.expect(d.mounts[0].format and d.mounts[0].options == null);
+    try std.testing.expectEqualStrings("noatime", d.root_options.?);
+    // Choosing that partition as the root afterwards drops its mount point.
+    d.root = disk.partitions[2];
+    var again = try testUi(gpa, arena, &[_]Key{.enter});
+    defer again.screen.deinit(gpa);
+    try std.testing.expect(try screenMounts(&again, p, &d));
+    try std.testing.expectEqual(@as(usize, 0), d.mounts.len);
+}
+
+test "another root filesystem drops the options typed for the old one" {
+    var d: Draft = .{ .root_fs = .btrfs, .root_options = "compress=zstd" };
+    setRootFs(&d, .btrfs);
+    try std.testing.expectEqualStrings("compress=zstd", d.root_options.?);
+    setRootFs(&d, .ext4);
+    try std.testing.expect(d.root_options == null);
 }
 
 test "not root is fatal on the checks screen" {
@@ -2195,11 +2482,11 @@ test "full flow with services, ssh and network screens: manual network, key past
     defer st.deinit();
     const arena = st.allocator();
     const p = try loadFixture(arena, "uefi-services.json");
-    // checks, disk, auto, hostname, domain "lab.test", root pw x2, user, user pw x2, timezone, keymap,
+    // checks, boot mode, disk, auto, hostname, domain "lab.test", root pw x2, user, user pw x2, timezone, keymap,
     // network: Manual (nothing) = 3rd item (Guided, Copy, Manual), then the services list: the
     // cursor starts on sshd (the first that can be switched), Enter ticks it, Done is last;
     // ssh: Set up SSH, root no, password yes, no key; SELinux as the image has it; summary; confirm.
-    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter } ++ testKeys("lab.test") ++ [_]Key{.enter} ++
+    const keys = [_]Key{ .enter, .enter, .enter, .enter, .enter, .enter, .enter } ++ testKeys("lab.test") ++ [_]Key{.enter} ++
         testKeys("rootpw") ++ [_]Key{.enter} ++ testKeys("rootpw") ++ [_]Key{.enter} ++
         testKeys("dakota") ++ [_]Key{.enter} ++
         testKeys("userpw") ++ [_]Key{.enter} ++ testKeys("userpw") ++ [_]Key{.enter} ++

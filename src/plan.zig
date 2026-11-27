@@ -8,6 +8,7 @@ const probe_mod = @import("probe.zig");
 const answers_mod = @import("answers.zig");
 const files = @import("files.zig");
 const fs_mod = @import("fs.zig");
+const mounts_mod = @import("mounts.zig");
 const bl_mod = @import("bootloader.zig");
 
 const Probe = probe_mod.Probe;
@@ -97,6 +98,21 @@ pub const Step = struct {
     soft: bool = false,
 };
 
+/// A partition mounted besides the root and the ESP (SPEC.md 5.3.5).
+pub const Extra = struct {
+    dev: []const u8,
+    at: []const u8,
+    /// FAT has no owners or SELinux labels.
+    fat: bool = false,
+    /// Not formatted: what is on it stays, so the copy and the labelling leave it alone.
+    kept: bool = false,
+    /// The options that were asked for; the install mounts it with them too (`subvol=` decides what is seen).
+    options: ?[]const u8 = null,
+};
+
+/// Added to asked-for options when the installer mounts with them: it has to write there, whatever fstab will say.
+pub const install_mount_flags = ",rw,exec,suid,dev";
+
 /// The ordered steps, and every program they run.
 pub const Plan = struct {
     steps: []const Step,
@@ -105,9 +121,15 @@ pub const Plan = struct {
     /// What the install mounts at `target`, so the final screen can mount it
     /// again for a shell in the installed system.
     root_dev: []const u8 = "",
+    root_options: ?[]const u8 = null,
     esp_dev: ?[]const u8 = null,
     /// Where the new system mounts the ESP: /boot/efi, or /boot under systemd-boot.
     esp_at: []const u8 = "/boot/efi",
+
+    /// The other partitions mounted there, in mounting order (before the ESP).
+    mounts: []const Extra = &.{},
+    /// Partitions on other disks than the target that are formatted.
+    other_formats: []const []const u8 = &.{},
 
     /// Prints the plan as `--dry-run` and the summary screen show it.
     pub fn writeDryRun(self: Plan, w: *Io.Writer) Io.Writer.Error!void {
@@ -197,7 +219,151 @@ const Layout = struct {
     esp_uuid: ?[]const u8 = null,
     /// ESP will be (re)formatted, so it has no BOOTX64.EFI.
     esp_fresh: bool = false,
+    /// Further partitions, parents first.
+    extra: []const PlannedMount = &.{},
 };
+
+const PlannedMount = struct {
+    mount: Extra,
+    fstab: files.FstabEntry,
+    /// The options to try out before anything is copied (null: nothing was asked for).
+    asked_options: ?[]const u8,
+    format: ?[]const []const u8,
+    /// The partition number on the target disk, or null on another disk.
+    number: ?u32,
+};
+
+/// The filesystem UUID for a partition that will be formatted: made from this run's random root
+/// UUID and the device, so the plan stays pure.
+fn extraUuid(arena: Allocator, ids: files.Ids, dev: []const u8) ![]u8 {
+    var hash: [32]u8 = undefined;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(ids.root_fs_uuid);
+    h.update(dev);
+    h.final(&hash);
+    return files.uuidFromBytes(arena, hash[0..16]);
+}
+
+/// Checks the extra mounts (SPEC.md 5.3.5) and says how each is made and mounted.
+fn planMounts(b: *Builder, p: Probe, target_disk: Disk, a: Answers, ids: files.Ids, taken: []const ?[]const u8) BuildError![]const PlannedMount {
+    const arena = b.arena;
+    const sorted = try arena.dupe(mounts_mod.Mount, a.mounts);
+    std.mem.sort(mounts_mod.Mount, sorted, {}, mounts_mod.before);
+    var out: std.ArrayList(PlannedMount) = .empty;
+    for (sorted) |m| {
+        if (mounts_mod.pathError(m.at)) |why| return b.refuse("mount point {s}: {s}", .{ m.at, why });
+        // The live user's directory is removed with its contents, and `useradd` leaves a directory that is already
+        // there as it is: without the skeleton files and, when the installer made it, owned by root.
+        for ([_][]const u8{ p.live_user, a.user }) |name| {
+            if (name.len > 0 and mounts_mod.within(m.at, try b.fmt("/home/{s}", .{name})))
+                return b.refuse("{s} can't be a mount point: it is in the home directory of the {s}. Mount /home instead", .{ m.at, if (std.mem.eql(u8, name, a.user)) "new user" else "live disc's user" });
+        }
+        var found: ?Partition = null;
+        var on: Disk = undefined;
+        for (p.disks) |d| if (d.findPartition(m.device)) |q| {
+            found = q;
+            on = d;
+        };
+        const q = found orelse return b.refuse("{s} (for {s}) is not a partition on any disk", .{ m.device, m.at });
+        if (!std.mem.eql(u8, on.kind, "disk") or p.holdsLiveMedium(on)) return b.refuse("{s} (for {s}) is on the live medium or not on a disk", .{ q.path, m.at });
+        if (q.mounted) return b.refuse("{s} (for {s}) is mounted or in use", .{ q.path, m.at });
+        if (on.read_only) return b.refuse("{s} (for {s}) is on a read-only disk", .{ q.path, m.at });
+        for (taken) |t| if (t) |used| if (std.mem.eql(u8, used, q.path)) return b.refuse("{s} (for {s}) is already the root, the ESP or the BIOS boot partition", .{ q.path, m.at });
+        for (out.items) |o| {
+            if (std.mem.eql(u8, o.mount.dev, q.path)) return b.refuse("{s} is given two mount points", .{q.path});
+            if (std.mem.eql(u8, o.mount.at, m.at)) return b.refuse("two partitions are mounted at {s}", .{m.at});
+        }
+        const same_disk = std.mem.eql(u8, on.path, target_disk.path);
+        const boot = std.mem.eql(u8, m.at, "/boot");
+        if (boot) {
+            if (a.bootloader == .@"systemd-boot") return b.refuse("with systemd-boot, /boot is the EFI System Partition: no other partition can be mounted there", .{});
+            if (!same_disk) return b.refuse("/boot must be on the disk being installed to ({s}), where the boot loader looks", .{target_disk.path});
+            if (q.size < 256 * MiB) return b.refuse("/boot partition {s} is smaller than 256 MiB", .{q.path});
+        }
+        const options = m.options;
+        if (options) |o| {
+            if (mounts_mod.optionsError(o)) |why| return b.refuse("options for {s}: {s}", .{ m.at, why });
+            if (std.mem.eql(u8, m.at, "/var") or boot) if (mounts_mod.hasOption(o, "noauto") or mounts_mod.hasOption(o, "ro")) return b.refuse("{s} can't be mounted with noauto or ro: the system needs to use it", .{m.at});
+        }
+        var entry: files.FstabEntry = undefined;
+        var format: ?[]const []const u8 = null;
+        if (m.format) {
+            if (isEspType(q.parttype) or isBiosBootType(q.parttype)) return b.refuse("{s} is an EFI System or BIOS boot partition; it is not formatted for {s}", .{ q.path, m.at });
+            const check: fs_mod.BootCheck = .{ .readable = !boot or bl_mod.canReadRoot(a.bootloader, m.fs), .loader = bl_mod.info(a.bootloader).name };
+            switch (try fs_mod.availability(arena, m.fs, p.tools, p.kernel_builtin, check)) {
+                .ok => {},
+                .unusable => |why| return b.refuse("{s} can't be used for {s}: {s}", .{ fs_mod.info(m.fs).name, m.at, why }),
+            }
+            const fi = fs_mod.info(m.fs);
+            const uuid = try extraUuid(arena, ids, q.path);
+            format = try fs_mod.mkfsArgv(arena, m.fs, if (boot) "dkboot" else "dkdata", uuid, q.path, true, boot and a.bootloader == .grub);
+            entry = .{ .uuid = uuid, .at = m.at, .fstype = fi.fstab_type, .options = options orelse fi.fstab_options, .pass = if (fi.fsck_pass == 0) 0 else 2 };
+        } else {
+            if (!mounts_mod.mayKeep(m.at)) return b.refuse("{s} must be formatted: the install puts the new system's files there", .{m.at});
+            const fstype = q.fstype orelse return b.refuse("{s} (for {s}) has no filesystem: format it", .{ q.path, m.at });
+            if (!mounts_mod.keepableFs(fstype)) return b.refuse("{s} (for {s}) holds {s}, which can't be mounted by the installer", .{ q.path, m.at, fstype });
+            const fat = std.mem.eql(u8, fstype, "vfat");
+            if (fat and std.mem.eql(u8, m.at, "/home")) return b.refuse("/home can't be on FAT, which has no file owners", .{});
+            const uuid = q.uuid orelse return b.refuse("{s} (for {s}) has no filesystem UUID", .{ q.path, m.at });
+            const ext = std.mem.startsWith(u8, fstype, "ext");
+            entry = .{ .uuid = uuid, .at = m.at, .fstype = fstype, .options = options orelse "defaults", .pass = if (ext or fat) 2 else 0 };
+        }
+        try out.append(arena, .{
+            .mount = .{ .dev = q.path, .at = m.at, .fat = std.mem.eql(u8, entry.fstype, "vfat"), .kept = !m.format, .options = options },
+            .fstab = entry,
+            .asked_options = options,
+            .format = format,
+            .number = if (same_disk) q.number else null,
+        });
+    }
+    return out.items;
+}
+
+/// Looks at a /home that is going to be kept, mounted read-only with its options. It may not hold a directory named
+/// like the live user (that user is removed, directory and all), nor, when an ssh key is to be set up, a .ssh
+/// directory of the new user (its keys would be written over).
+fn checkKeptHome(b: *Builder, p: Probe, a: Answers, x: PlannedMount) !void {
+    const ssh_keys = if (a.ssh) |s| s.authorized_key != null or s.generate_key else false;
+    const live: []const u8 = p.live_user;
+    const dot_ssh: []const u8 = if (ssh_keys) try b.fmt("{s}/.ssh", .{a.user}) else "";
+    if (live.len == 0 and dot_ssh.len == 0) return;
+    var what: std.ArrayList(u8) = .empty;
+    if (live.len > 0) try what.appendSlice(b.arena, try b.fmt("no directory \"{s}\"", .{live}));
+    if (dot_ssh.len > 0) try what.appendSlice(b.arena, try b.fmt("{s}no {s} (an ssh key is to be set up there)", .{ if (live.len > 0) " and " else "", dot_ssh }));
+    try b.cmd(try b.fmt("Check the kept /home before anything is changed: it must have {s}", .{what.items}), &.{
+        "sh",        "-c",
+        \\d=/run/dkrescue-install/optcheck
+        \\mkdir -p "$d" && mount -o "$1" "$2" "$d" || exit 1
+        \\r=0
+        \\for name in "$3" "$4"; do
+        \\    if [ -n "$name" ] && { [ -e "$d/$name" ] || [ -L "$d/$name" ]; }; then
+        \\        echo "the kept /home already has $name: nothing has been changed" >&2
+        \\        r=1
+        \\    fi
+        \\done
+        \\umount "$d"
+        \\exit $r
+        ,
+        "sh",        if (x.asked_options) |o| try b.fmt("{s},ro", .{o}) else "ro",
+        x.mount.dev, live,
+        dot_ssh,
+    });
+}
+
+/// `mount`, with the asked-for options if there are any.
+fn mountCmd(b: *Builder, desc: []const u8, dev: []const u8, at: []const u8, options: ?[]const u8) !void {
+    if (options) |o| return b.cmd(desc, &.{ "mount", "-o", try b.fmt("{s}" ++ install_mount_flags, .{o}), dev, at });
+    try b.cmd(desc, &.{ "mount", dev, at });
+}
+
+/// Mounts `dev` once with the options fstab will give it. A line `mount -a` rejects stops the
+/// new system's boot, so a mistake has to show now.
+fn tryOptions(b: *Builder, dev: []const u8, at: []const u8, options: []const u8) !void {
+    const dir = "/run/dkrescue-install/optcheck";
+    try b.cmd("Create a directory to try mount options on", &.{ "mkdir", "-p", dir });
+    try b.cmd(try b.fmt("Try the mount options for {s}", .{at}), &.{ "mount", "-o", options, dev, dir });
+    try b.cmd("Unmount it again", &.{ "umount", dir });
+}
 
 const Builder = struct {
     arena: Allocator,
@@ -206,6 +372,9 @@ const Builder = struct {
     root_dev: []const u8 = "",
     esp_dev: ?[]const u8 = null,
     esp_at: []const u8 = "/boot/efi",
+    mounts: []const Extra = &.{},
+    other_formats: []const []const u8 = &.{},
+    root_options: ?[]const u8 = null,
 
     fn refuse(self: *Builder, comptime f: []const u8, args: anytype) error{Refused} {
         self.refusal = std.fmt.allocPrint(self.arena, f, args) catch "out of memory";
@@ -279,13 +448,18 @@ pub fn userTaken(p: Probe, name: []const u8) bool {
 /// `ids` supplies the UUIDs for filesystems and partitions that don't exist yet.
 pub fn build(arena: Allocator, p: Probe, a: Answers, ids: files.Ids) Allocator.Error!Result {
     var b: Builder = .{ .arena = arena };
-    if (buildSteps(&b, p, a, ids)) |_| {
+    var machine = p;
+    if (a.firmware == .bios) machine.firmware = .bios;
+    if (buildSteps(&b, machine, a, ids)) |_| {
         return .{ .plan = .{
             .steps = b.steps.items,
             .programs = try collectPrograms(arena, b.steps.items),
             .root_dev = b.root_dev,
             .esp_dev = b.esp_dev,
             .esp_at = b.esp_at,
+            .mounts = b.mounts,
+            .root_options = b.root_options,
+            .other_formats = b.other_formats,
         } };
     } else |err| switch (err) {
         error.Refused => return .{ .refused = b.refusal.? },
@@ -345,21 +519,54 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
 
     b.root_dev = layout.root_dev;
     b.esp_dev = layout.esp_dev;
+    if (a.root_options) |o| {
+        if (mounts_mod.optionsError(o)) |why| return b.refuse("options for /: {s}", .{why});
+        if (mounts_mod.hasOption(o, "ro") or mounts_mod.hasOption(o, "noauto")) return b.refuse("/ can't be mounted with ro or noauto", .{});
+        try tryOptions(b, layout.root_dev, "/", o);
+    }
+    for (layout.extra) |x| if (x.asked_options) |o| try tryOptions(b, x.mount.dev, x.mount.at, o);
+
     // 2. Mount
     try b.cmd("Create the mount point", &.{ "mkdir", "-p", target });
-    try b.cmd("Mount the root filesystem", &.{ "mount", layout.root_dev, target });
+    try mountCmd(b, "Mount the root filesystem", layout.root_dev, target, a.root_options);
+    b.root_options = a.root_options;
     // systemd-boot reads only the ESP, so the kernels live on it: it is /boot. The others
     // keep /boot on the root and mount the ESP at /boot/efi.
     const esp_at: []const u8 = if (loader == .@"systemd-boot") "/boot" else "/boot/efi";
     b.esp_at = esp_at;
     const esp_mnt: []const u8 = if (loader == .@"systemd-boot") target ++ "/boot" else target ++ "/boot/efi";
+    var extra: std.ArrayList(Extra) = .empty;
+    var other_formats: std.ArrayList([]const u8) = .empty;
+    // The image's `filesystems` service, which mounts /etc/fstab at boot, logs to /var/log: without that directory on
+    // the root itself it never starts and nothing gets mounted. Its log is moved to /run below; this stays in case
+    // an image words that line differently.
+    for (layout.extra) |x| if (std.mem.eql(u8, x.mount.at, "/var"))
+        try b.cmd("Create /var/log on the root, under the separate /var", &.{ "mkdir", "-p", target ++ "/var/log" });
+    for (layout.extra) |x| {
+        const at = try b.fmt("{s}{s}", .{ target, x.mount.at });
+        try b.cmd(try b.fmt("Create {s}", .{x.mount.at}), &.{ "mkdir", "-p", at });
+        try mountCmd(b, try b.fmt("Mount {s}", .{x.mount.at}), x.mount.dev, at, x.mount.options);
+        try extra.append(arena, x.mount);
+        if (x.format != null and x.number == null) try other_formats.append(arena, x.mount.dev);
+    }
+    b.mounts = extra.items;
+    b.other_formats = other_formats.items;
     if (layout.esp_dev) |esp| if (loader != .@"systemd-boot") {
         try b.cmd("Create /boot/efi", &.{ "mkdir", "-p", target ++ "/boot/efi" });
         try b.cmd("Mount the EFI System Partition", &.{ "mount", esp, target ++ "/boot/efi" });
     };
 
     // 3. Copy the system
-    try b.cmd("Copy the system from the disc image", &.{ "unsquashfs", "-percentage", "-f", "-d", target, rootfs_sfs });
+    // Kept partitions are left out: `unsquashfs` would give their top directory the image's owner and permissions and
+    // write over files of the same name.
+    var copy: std.ArrayList([]const u8) = .empty;
+    try copy.appendSlice(arena, &.{ "unsquashfs", "-percentage", "-f", "-d", target });
+    var left_out: std.ArrayList([]const u8) = .empty;
+    for (b.mounts) |m| if (m.kept) try left_out.append(arena, m.at[1..]);
+    if (left_out.items.len > 0) try copy.append(arena, "-excludes");
+    try copy.append(arena, rootfs_sfs);
+    try copy.appendSlice(arena, left_out.items);
+    try b.cmd("Copy the system from the disc image", copy.items);
     if (loader == .@"systemd-boot") {
         // /boot came in on the root; move what is there onto the ESP, which then covers it. (A copy
         // straight to FAT would fail to set owners and modes, so the files are copied without them.)
@@ -370,7 +577,9 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     }
 
     // 4. fstab
-    try b.file("Write fstab", target ++ "/etc/fstab", try files.fstabAt(arena, a.root_fs, layout.root_uuid, layout.esp_uuid, esp_at), 0o644);
+    var lines: std.ArrayList(files.FstabEntry) = .empty;
+    for (layout.extra) |x| try lines.append(arena, x.fstab);
+    try b.file("Write fstab", target ++ "/etc/fstab", try files.fstabWith(arena, a.root_fs, layout.root_uuid, a.root_options, lines.items, layout.esp_uuid, esp_at), 0o644);
 
     // 5. Identity
     try b.file("Set the hostname", target ++ "/etc/hostname", try files.hostnameFile(arena, a.hostname), 0o644);
@@ -401,6 +610,17 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     });
 
     try planGreetd(b);
+
+    // The log of the `filesystems` service is opened before it mounts anything: with a separate /var or /var/log it
+    // would stay on the root, hidden under that mount. In /run (like rootrw's) it can be read when a mount fails.
+    for (layout.extra) |x| if (std.mem.eql(u8, x.mount.at, "/var") or std.mem.eql(u8, x.mount.at, "/var/log")) {
+        try b.steps.append(arena, .{
+            .desc = "Log the boot's mounting to /run, where a separate /var can't hide it",
+            .action = .{ .command = .{ .argv = try arena.dupe([]const u8, &.{ "sed", "-i", "s|^logfile = /var/log/dinit-filesystems.log$|logfile = /run/dinit-filesystems.log|", target ++ "/etc/dinit.d/filesystems" }) } },
+            .when = .{ .exists = &.{target ++ "/etc/dinit.d/filesystems"} },
+        });
+        break;
+    };
 
     // 7. sudo
     const sudo_new = target ++ "/etc/sudoers.d/00-wheel.new";
@@ -433,12 +653,18 @@ fn buildSteps(b: *Builder, p: Probe, a: Answers, ids: files.Ids) BuildError!void
     }
 
     // 9. Finish
-    try planSelinux(b, a, layout.esp_dev != null, esp_at);
+    try planSelinux(b, a, layout.esp_dev != null, esp_at, b.mounts);
     // After everything that can warn, so the copy holds it. (The copy itself is not labelled
     // by the `setfiles` run above.)
     try b.cmd("Copy the install log to the new system", &.{ "cp", log_path, target_log });
     try b.cmd("Flush to disk", &.{"sync"});
     if (layout.esp_dev != null) try b.cmd("Unmount the EFI System Partition", &.{ "umount", esp_mnt });
+    var i = layout.extra.len;
+    while (i > 0) {
+        i -= 1;
+        const at = layout.extra[i].mount.at;
+        try b.cmd(try b.fmt("Unmount {s}", .{at}), &.{ "umount", try b.fmt("{s}{s}", .{ target, at }) });
+    }
     try b.cmd("Unmount the root filesystem", &.{ "umount", target });
 }
 
@@ -495,7 +721,11 @@ fn unbindMounts(b: *Builder) !void {
 fn planDklilo(b: *Builder, p: Probe, a: Answers, layout: Layout, disk: Disk, kernel: []const u8) BuildError!void {
     const arena = b.arena;
     _ = a;
-    try b.file("Write dklilo.conf", target ++ "/boot/dklilo.conf", try files.dkliloConf(arena, kernel, layout.root_partuuid), 0o644);
+    var boot_part: ?PlannedMount = null;
+    for (layout.extra) |x| if (std.mem.eql(u8, x.mount.at, "/boot")) {
+        boot_part = x;
+    };
+    try b.file("Write dklilo.conf", target ++ "/boot/dklilo.conf", try files.dkliloConf(arena, kernel, layout.root_partuuid, boot_part != null), 0o644);
     switch (p.firmware) {
         .uefi => {
             const esp = layout.esp_dev.?;
@@ -511,7 +741,12 @@ fn planDklilo(b: *Builder, p: Probe, a: Answers, layout: Layout, disk: Disk, ker
                 return b.refuse("efivars is not writable and the ESP already has \\EFI\\BOOT\\BOOTX64.EFI (or could not be checked for it), which is never replaced: nothing to install", .{});
             }
         },
-        .bios => try b.cmd("Install dklilo (BIOS)", &.{ "dklilo", "install-bios", "--yes", disk.path }),
+        // With a separate /boot, say which partition has dklilo.conf: dklilo's own guess looks
+        // at what the live system has mounted at /boot.
+        .bios => if (boot_part) |x|
+            try b.cmd("Install dklilo (BIOS)", &.{ "dklilo", "install-bios", "--yes", "--config-partition", try b.fmt("{d}", .{x.number.?}), disk.path })
+        else
+            try b.cmd("Install dklilo (BIOS)", &.{ "dklilo", "install-bios", "--yes", disk.path }),
     }
     try b.cmd("Check dklilo.conf", &.{ "dklilo", "check", target ++ "/boot/dklilo.conf" });
 }
@@ -592,7 +827,7 @@ pub const selinux_file_contexts = target ++ "/etc/selinux/targeted/contexts/file
 /// /etc/selinux/config), so a failure is a warning. The kernel command line
 /// is left alone: SELinux is the kernel's default security module and
 /// /etc/selinux/config decides the mode.
-fn planSelinux(b: *Builder, a: Answers, esp_mounted: bool, esp_at: []const u8) !void {
+fn planSelinux(b: *Builder, a: Answers, esp_mounted: bool, esp_at: []const u8, extra: []const Extra) !void {
     if (a.selinux) |mode| {
         try b.steps.append(b.arena, .{
             .desc = try b.fmt("SELinux mode: {s} (/etc/selinux/config)", .{@tagName(mode)}),
@@ -611,6 +846,8 @@ fn planSelinux(b: *Builder, a: Answers, esp_mounted: bool, esp_at: []const u8) !
     const skip = [_][]const u8{ "/proc", "/sys", "/dev", "/run", "/tmp" };
     for (skip) |d| try argv.appendSlice(b.arena, &.{ "-e", try b.fmt("{s}{s}", .{ target, d }) });
     if (esp_mounted) try argv.appendSlice(b.arena, &.{ "-e", try b.fmt("{s}{s}", .{ target, esp_at }) });
+    // A kept partition's labels are its owner's business; /home is labelled, so that this system can use it.
+    for (extra) |x| if (x.fat or (x.kept and !std.mem.eql(u8, x.at, "/home"))) try argv.appendSlice(b.arena, &.{ "-e", try b.fmt("{s}{s}", .{ target, x.at }) });
     try argv.appendSlice(b.arena, &.{ selinux_file_contexts, target });
     try b.steps.append(b.arena, .{
         .desc = "SELinux: label the new system (only when its policy is installed)",
@@ -1122,6 +1359,7 @@ fn planExisting(b: *Builder, p: Probe, disk: Disk, a: Answers, ids: files.Ids) B
     }
 
     // BIOS boot partition (GPT + BIOS firmware only).
+    var bios_boot_dev: ?[]const u8 = null;
     if (p.firmware == .bios and gpt) {
         var found: ?Partition = null;
         for (disk.partitions) |q| if (isBiosBootType(q.parttype) and q.size >= MiB) {
@@ -1129,12 +1367,14 @@ fn planExisting(b: *Builder, p: Probe, disk: Disk, a: Answers, ids: files.Ids) B
             if (std.mem.eql(u8, q.path, root.path)) continue;
             if (esp_part) |e| if (std.mem.eql(u8, q.path, e.path)) continue;
             found = q;
+            bios_boot_dev = q.path;
             break;
         };
         if (found == null) {
             const name = a.bios_boot orelse return b.refuse("BIOS boot on a GPT disk needs a BIOS boot partition (1 MiB or more); none found", .{});
             const q = disk.findPartition(name) orelse return b.refuse("BIOS boot partition {s} is not on {s}", .{ name, disk.path });
             if (std.mem.eql(u8, q.path, root.path)) return b.refuse("root and the BIOS boot partition are the same partition", .{});
+            bios_boot_dev = q.path;
             if (esp_part) |e| if (std.mem.eql(u8, q.path, e.path)) return b.refuse("the ESP and the BIOS boot partition are the same partition", .{});
             if (q.size < MiB) return b.refuse("BIOS boot partition {s} is smaller than 1 MiB", .{q.path});
             if (!isBiosBootType(q.parttype) and !biosBootCandidate(q)) return b.refuse("{s} can't become the BIOS boot partition: it must be at most {d} MiB with no filesystem, because its contents are overwritten", .{ q.path, bios_boot_max_size / MiB });
@@ -1148,13 +1388,20 @@ fn planExisting(b: *Builder, p: Probe, disk: Disk, a: Answers, ids: files.Ids) B
         }
     }
 
+    const extra = try planMounts(b, p, disk, a, ids, &.{ root.path, esp_dev, bios_boot_dev });
+
+    // While nothing has been changed yet.
+    for (extra) |x| if (x.mount.kept and std.mem.eql(u8, x.mount.at, "/home")) try checkKeptHome(b, p, a, x);
+
     try b.steps.appendSlice(arena, type_fixes.items);
     try b.cmd(try b.fmt("Format the root filesystem ({s})", .{fs_mod.info(a.root_fs).name}), try fs_mod.mkfsArgv(arena, a.root_fs, "dkrescue", ids.root_fs_uuid, root.path, true, a.bootloader == .grub));
     if (esp_fresh) {
         try b.cmd("Format the EFI System Partition", &.{ "mkfs.vfat", "-F", "32", "-n", "ESP", "-i", ids.esp_vol_id, esp_dev.? });
     }
+    for (extra) |x| if (x.format) |argv| try b.cmd(try b.fmt("Format {s} for {s} ({s})", .{ x.mount.dev, x.mount.at, x.fstab.fstype }), argv);
 
     return .{
+        .extra = extra,
         .root_dev = root.path,
         .root_partuuid = root_partuuid,
         .root_uuid = ids.root_fs_uuid,
@@ -1486,6 +1733,195 @@ test "existing partitions: root too small is refused" {
     a.esp = "sda2";
     const r = try build(arena, p, a, test_ids);
     try std.testing.expect(contains(r.refused, "at least"));
+}
+
+test "firmware = bios on a UEFI boot gives the BIOS install" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try loadFixture(arena, "uefi-nvme-blank.json");
+    var a = testAnswers("nvme0n1", .auto);
+    a.firmware = .bios;
+    const out = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    try std.testing.expect(contains(out, "dklilo install-bios --yes /dev/nvme0n1\n"));
+    try std.testing.expect(!contains(out, "install-uefi"));
+    a.bootloader = .@"systemd-boot";
+    const sd = try build(arena, p, a, test_ids);
+    try std.testing.expect(std.mem.indexOf(u8, sd.refused, "boots UEFI machines only") != null);
+}
+
+/// The SATA fixture with a second disk (/dev/sdb: a kept ext4, an unformatted one, a small one)
+/// and a spare partition on the target disk for /boot.
+fn twoDisks(arena: Allocator) !Probe {
+    var p = try loadFixture(arena, "uefi-sata-fdisk.json");
+    var first = p.findDisk("sda").?;
+    var on_first: std.ArrayList(Partition) = .empty;
+    try on_first.appendSlice(arena, first.partitions);
+    try on_first.append(arena, .{ .name = "sda3", .path = "/dev/sda3", .number = 3, .size = 1024 * MiB, .partuuid = "cccc-3" });
+    first.partitions = on_first.items;
+    const second: Disk = .{ .name = "sdb", .path = "/dev/sdb", .kind = "disk", .size = 100 * 1024 * MiB, .table = "gpt", .partitions = try arena.dupe(Partition, &.{
+        .{ .name = "sdb1", .path = "/dev/sdb1", .number = 1, .size = 40 * 1024 * MiB, .fstype = "ext4", .uuid = "kept-home-uuid" },
+        .{ .name = "sdb2", .path = "/dev/sdb2", .number = 2, .size = 40 * 1024 * MiB },
+        .{ .name = "sdb3", .path = "/dev/sdb3", .number = 3, .size = 100 * MiB, .fstype = "vfat", .uuid = "AAAA-BBBB" },
+    }) };
+    p.disks = try arena.dupe(Disk, &.{ first, second });
+    return p;
+}
+
+fn mountAnswers(mounts: []const mounts_mod.Mount) Answers {
+    var a = testAnswers("sda", .existing);
+    a.root = "sda2";
+    a.esp = "sda1";
+    a.set_esp_type = true;
+    a.mounts = mounts;
+    return a;
+}
+
+test "extra mounts on two disks: formatted or kept, in fstab, mounted before the copy" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try twoDisks(arena);
+    // Given out of order: /var/log has to be mounted inside /var.
+    var a = mountAnswers(&.{
+        .{ .device = "sdb2", .at = "/var/log", .format = true },
+        .{ .device = "sda3", .at = "/var", .format = true, .fs = .ext4 },
+        .{ .device = "/dev/sdb1", .at = "/home", .options = "defaults,noatime,nofail" },
+    });
+    a.root_options = "noatime";
+    const plan = (try build(arena, p, a, test_ids)).plan;
+    const out = try dryRun(arena, plan);
+    try std.testing.expect(!contains(out, "mkfs.ext4 -F -L dkdata -U kept-home-uuid"));
+    try std.testing.expect(!contains(out, "/dev/sdb1 kept"));
+    try std.testing.expect(contains(out, "UUID=kept-home-uuid  /home  ext4  defaults,noatime,nofail  0 2\n"));
+    try std.testing.expect(contains(out, "  /          ext4  noatime"));
+    try std.testing.expect(contains(out, "mount -o defaults,noatime,nofail /dev/sdb1 /run/dkrescue-install/optcheck"));
+    const var_at = std.mem.indexOf(u8, out, "mount /dev/sda3 /run/dkrescue-install/target/var\n").?;
+    // Asked-for options are used for the install's own mounts too, writable.
+    try std.testing.expect(contains(out, "mount -o 'defaults,noatime,nofail,rw,exec,suid,dev' /dev/sdb1 /run/dkrescue-install/target/home\n") or
+        contains(out, "mount -o defaults,noatime,nofail,rw,exec,suid,dev /dev/sdb1 /run/dkrescue-install/target/home\n"));
+    try std.testing.expect(contains(out, "noatime,rw,exec,suid,dev"));
+    try std.testing.expectEqualStrings("noatime", plan.root_options.?);
+    const log_at = std.mem.indexOf(u8, out, "mount /dev/sdb2 /run/dkrescue-install/target/var/log\n").?;
+    const copy = std.mem.indexOf(u8, out, "unsquashfs").?;
+    try std.testing.expect(var_at < log_at and log_at < copy);
+    // The root's own /var/log is made before /var hides it: the boot's mount service logs there.
+    try std.testing.expect(std.mem.indexOf(u8, out, "mkdir -p /run/dkrescue-install/target/var/log\n").? < var_at);
+    try std.testing.expect(std.mem.indexOf(u8, out, "optcheck").? < copy);
+    try std.testing.expect(std.mem.indexOf(u8, out, "umount /run/dkrescue-install/target/var/log").? < std.mem.indexOf(u8, out, "umount /run/dkrescue-install/target/var\n").?);
+    // The boot's mount log moves to /run, once, after the copy that brings the service file.
+    const relog = std.mem.indexOf(u8, out, "logfile = /run/dinit-filesystems.log").?;
+    try std.testing.expect(relog > copy);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "logfile = /run/dinit-filesystems.log"));
+    // The kept /home is looked at before anything is formatted, and the copy leaves it out.
+    try std.testing.expect(std.mem.indexOf(u8, out, "the kept /home already has").? < std.mem.indexOf(u8, out, "mkfs").?);
+    const line = out[copy..std.mem.indexOfScalarPos(u8, out, copy, '\n').?];
+    try std.testing.expect(contains(line, "-excludes ") and std.mem.endsWith(u8, line, " home"));
+    try std.testing.expectEqual(@as(usize, 3), plan.mounts.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.other_formats.len);
+    try std.testing.expectEqualStrings("/dev/sdb2", plan.other_formats[0]);
+}
+
+test "a separate /boot: before /boot/efi, and dklilo's paths are relative to it" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try twoDisks(arena);
+    const a = mountAnswers(&.{.{ .device = "sda3", .at = "/boot", .format = true }});
+    const out = try dryRun(arena, (try build(arena, p, a, test_ids)).plan);
+    // Without a separate /var the image's log file stays where it is.
+    try std.testing.expect(!contains(out, "dinit-filesystems.log"));
+    try std.testing.expect(contains(out, "image = /vmlinuz-"));
+    try std.testing.expect(!contains(out, "image = /boot/"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "target/boot\n").? < std.mem.indexOf(u8, out, "target/boot/efi\n").?);
+    try std.testing.expect(std.mem.indexOf(u8, out, "  /boot  ext4").? < std.mem.indexOf(u8, out, "  /boot/efi  vfat").?);
+    // On BIOS dklilo is told which partition has its configuration.
+    var bios = a;
+    bios.firmware = .bios;
+    const disks = try arena.dupe(Disk, p.disks);
+    disks[0].table = "dos";
+    p.disks = disks;
+    const b = try dryRun(arena, (try build(arena, p, bios, test_ids)).plan);
+    try std.testing.expect(contains(b, "dklilo install-bios --yes --config-partition 3 /dev/sda\n"));
+}
+
+test "kept partitions are left out of the copy and, but for /home, of the labelling" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try twoDisks(arena);
+    const data = try dryRun(arena, (try build(arena, p, mountAnswers(&.{.{ .device = "sdb1", .at = "/srv/data" }}), test_ids)).plan);
+    const copy = std.mem.indexOf(u8, data, "unsquashfs -percentage").?;
+    const line = data[copy..std.mem.indexOfScalarPos(u8, data, copy, '\n').?];
+    try std.testing.expect(contains(line, "-excludes ") and std.mem.endsWith(u8, line, " srv/data"));
+    try std.testing.expect(contains(data, "-e /run/dkrescue-install/target/srv/data"));
+    // Not about /home: no look at it beforehand.
+    try std.testing.expect(!contains(data, "the kept /home already has"));
+
+    const home = try dryRun(arena, (try build(arena, p, mountAnswers(&.{.{ .device = "sdb1", .at = "/home" }}), test_ids)).plan);
+    try std.testing.expect(!contains(home, "-e /run/dkrescue-install/target/home"));
+    // A formatted partition takes the image's files like the root does.
+    const fresh = try dryRun(arena, (try build(arena, p, mountAnswers(&.{.{ .device = "sdb2", .at = "/srv", .format = true }}), test_ids)).plan);
+    try std.testing.expect(!contains(fresh, "-excludes"));
+    try std.testing.expect(!contains(fresh, "-e /run/dkrescue-install/target/srv"));
+}
+
+test "a kept /home with an ssh key to set up: an old .ssh there is looked for first" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    var p = try twoDisks(arena);
+    p.services = (try loadFixture(arena, "uefi-services.json")).services;
+    var a = mountAnswers(&.{.{ .device = "sdb1", .at = "/home" }});
+    a.ssh = .{ .generate_key = true, .password_auth = true };
+    const r = try build(arena, p, a, test_ids);
+    const out = try dryRun(arena, r.plan);
+    const dot_ssh = try std.fmt.allocPrint(arena, "no {s}/.ssh", .{a.user});
+    try std.testing.expect(std.mem.indexOf(u8, out, dot_ssh).? < std.mem.indexOf(u8, out, "mkfs").?);
+}
+
+test "nothing is mounted inside the live user's or the new user's home" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try twoDisks(arena);
+    for ([_][]const u8{ p.live_user, testAnswers("sda", .existing).user }) |name| {
+        for ([_][]const u8{ "", "/data" }) |below| {
+            const at = try std.fmt.allocPrint(arena, "/home/{s}{s}", .{ name, below });
+            const r = try build(arena, p, mountAnswers(&.{.{ .device = "sdb2", .at = at, .format = true }}), test_ids);
+            try std.testing.expect(r == .refused and contains(r.refused, "home directory of the"));
+        }
+    }
+    const other = try build(arena, p, mountAnswers(&.{.{ .device = "sdb2", .at = "/home/shared", .format = true }}), test_ids);
+    try std.testing.expect(other == .plan);
+}
+
+test "extra mounts that are refused" {
+    var st = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer st.deinit();
+    const arena = st.allocator();
+    const p = try twoDisks(arena);
+    const cases = [_]struct { m: []const mounts_mod.Mount, why: []const u8 }{
+        .{ .m = &.{.{ .device = "sdb2", .at = "/usr", .format = true }}, .why = "must stay on the root" },
+        .{ .m = &.{.{ .device = "sdb1", .at = "/var" }}, .why = "must be formatted" },
+        .{ .m = &.{.{ .device = "sdb2", .at = "/data" }}, .why = "has no filesystem" },
+        .{ .m = &.{.{ .device = "sdb3", .at = "/home" }}, .why = "can't be on FAT" },
+        .{ .m = &.{.{ .device = "sda2", .at = "/home", .format = true }}, .why = "already the root" },
+        .{ .m = &.{.{ .device = "sda1", .at = "/home", .format = true }}, .why = "already the root, the ESP" },
+        .{ .m = &.{ .{ .device = "sdb1", .at = "/a" }, .{ .device = "sdb1", .at = "/b" } }, .why = "two mount points" },
+        .{ .m = &.{ .{ .device = "sdb1", .at = "/a" }, .{ .device = "sdb2", .at = "/a", .format = true } }, .why = "two partitions" },
+        .{ .m = &.{.{ .device = "sdb2", .at = "/boot", .format = true }}, .why = "must be on the disk being installed to" },
+        .{ .m = &.{.{ .device = "sda3", .at = "/boot", .format = true, .fs = .xfs }}, .why = "can't be used for /boot" },
+        .{ .m = &.{.{ .device = "sdz1", .at = "/a" }}, .why = "not a partition" },
+        .{ .m = &.{.{ .device = "sdb1", .at = "/a", .options = "x y" }}, .why = "options for /a" },
+    };
+    for (cases) |c| {
+        const r = try build(arena, p, mountAnswers(c.m), test_ids);
+        std.testing.expect(r == .refused and contains(r.refused, c.why)) catch |e| {
+            std.debug.print("wanted '{s}', got {s}\n", .{ c.why, if (r == .refused) r.refused else "a plan" });
+            return e;
+        };
+    }
 }
 
 test "existing partitions on BIOS/MBR installs without an ESP" {
